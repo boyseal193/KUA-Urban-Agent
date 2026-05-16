@@ -1,0 +1,13 @@
+# Caddy reverse proxy — terminates TLS and forwards to the FastAPI container.
+# Set ``SERVER_NAME`` to your public hostname (e.g. api.klaveurban.com).
+# For local HTTP only, leave SERVER_NAME=localhost and browse http://localhost
+
+{$SERVER_NAME:localhost} {
+    encode gzip
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "no-referrer"
+    }
+    reverse_proxy api:8000
+}

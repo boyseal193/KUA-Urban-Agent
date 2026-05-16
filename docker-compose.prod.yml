@@ -1,0 +1,94 @@
+# Production-style stack: PostgreSQL + Redis + Gunicorn API + ARQ worker + Caddy TLS termination.
+# Usage from repository root:
+#   export JWT_SECRET=... OPERATOR_PASSWORD_HASH=...   # see backend/.env.example
+#   docker compose -f docker-compose.prod.yml up --build
+#
+# First-time DB:
+#   docker compose -f docker-compose.prod.yml run --rm api alembic -c alembic.ini upgrade head
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: kua
+      POSTGRES_PASSWORD: kua
+      POSTGRES_DB: kua
+    volumes:
+      - kua_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kua -d kua"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [kua]
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [kua]
+
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    working_dir: /app/backend
+    environment:
+      ENV: production
+      DATABASE_URL: postgresql+asyncpg://kua:kua@postgres:5432/kua
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: ${JWT_SECRET:-CHANGE_ME_IN_PRODUCTION_MIN_32_CHARS______}
+      OPERATOR_USERNAME: ${OPERATOR_USERNAME:-operator}
+      OPERATOR_PASSWORD_HASH: ${OPERATOR_PASSWORD_HASH:-}
+      FRONTEND_ORIGINS: ${FRONTEND_ORIGINS:-http://localhost:3000}
+      TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost,127.0.0.1,api,caddy}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    expose:
+      - "8000"
+    restart: unless-stopped
+    networks: [kua]
+
+  worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    working_dir: /app/backend
+    command: ["arq", "app.workers.settings.WorkerSettings"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://kua:kua@postgres:5432/kua
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks: [kua]
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      SERVER_NAME: ${SERVER_NAME:-localhost}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      - api
+    networks: [kua]
+
+volumes:
+  kua_pg:
+
+networks:
+  kua:
+    driver: bridge

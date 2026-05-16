@@ -1,0 +1,38 @@
+version: "3.9"
+
+# K.U.A. local stack — frontend + backend wired together with a private network.
+# `docker compose up --build` will:
+#   • build the FastAPI backend image (Dockerfile in this dir)
+#   • build the Next.js frontend image (kua-frontend/Dockerfile)
+#   • expose only the frontend publicly on :3000
+#   • keep the FastAPI service reachable to the frontend over the internal
+#     network at http://backend:8000, never to the host.
+
+services:
+  backend:
+    build: .
+    container_name: kua-backend
+    env_file: .env
+    environment:
+      FRONTEND_ORIGINS: "http://localhost:3000"
+    expose:
+      - "8000"
+    restart: unless-stopped
+    networks: [kua]
+
+  frontend:
+    build: ./kua-frontend
+    container_name: kua-frontend
+    env_file: ./kua-frontend/.env.local
+    environment:
+      BACKEND_API_URL: "http://backend:8000"
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    restart: unless-stopped
+    networks: [kua]
+
+networks:
+  kua:
+    driver: bridge

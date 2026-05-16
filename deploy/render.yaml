@@ -1,0 +1,30 @@
+# Render Blueprint sketch — adjust plans/names to your workspace.
+# Database URL on Render is often ``postgresql://…`` — convert to
+# ``postgresql+asyncpg://`` for this application or set DATABASE_URL explicitly.
+
+services:
+  - type: web
+    name: kua-backend
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: .
+    healthCheckPath: /health/ready
+    envVars:
+      - key: ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: OPERATOR_USERNAME
+        value: operator
+      - key: OPERATOR_PASSWORD_HASH
+        sync: false
+      - key: FRONTEND_ORIGINS
+        sync: false
+      - key: COOKIE_SECURE
+        value: "true"
+      - key: TRUSTED_HOSTS
+        sync: false

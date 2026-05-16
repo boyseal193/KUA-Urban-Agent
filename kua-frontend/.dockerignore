@@ -1,0 +1,10 @@
+node_modules
+.next
+.git
+.env*
+Dockerfile
+.dockerignore
+README.md
+*.log
+.vercel
+.DS_Store

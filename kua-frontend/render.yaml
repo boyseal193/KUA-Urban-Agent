@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: kua-frontend
+    runtime: docker
+    region: frankfurt
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/auth/session
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: BACKEND_API_URL
+        sync: false
+      - key: AUTH_SECRET
+        generateValue: true
+      - key: AUTH_OPERATOR_USERNAME
+        sync: false
+      - key: AUTH_OPERATOR_PASSWORD_HASH
+        sync: false
+      - key: AUTH_OPERATOR_DISPLAY_NAME
+        sync: false
+      - key: AUTH_OPERATOR_CLEARANCE
+        value: tier-1

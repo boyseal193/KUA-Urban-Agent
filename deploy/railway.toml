@@ -1,0 +1,10 @@
+# https://docs.railway.app/reference/config-as-code
+[build]
+builder = "dockerfile"
+dockerfilePath = "backend/Dockerfile"
+
+[deploy]
+startCommand = "sh -c 'alembic -c alembic.ini upgrade head && gunicorn app.main:app -k uvicorn.workers.UvicornWorker -w ${WEB_CONCURRENCY:-2} -b 0.0.0.0:${PORT:-8000} --timeout 180'"
+healthcheckPath = "/health/ready"
+healthcheckTimeout = 120
+restartPolicyType = "on_failure"
