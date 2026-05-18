@@ -4,8 +4,8 @@ import os
 
 router = APIRouter()
 
-USERNAME = os.getenv("AUTH_USERNAME") or os.getenv("OPERATOR_USERNAME") or "admin"
-PASSWORD = os.getenv("AUTH_PASSWORD") or os.getenv("OPERATOR_PASSWORD") or "admin"
+USERNAME = os.getenv("AUTH_USERNAME", "admin")
+PASSWORD = os.getenv("AUTH_PASSWORD", "admin")
 
 
 class LoginRequest(BaseModel):
@@ -19,9 +19,7 @@ def login(data: LoginRequest):
         return {
             "success": True,
             "message": "Authenticated",
-            "username": USERNAME,
-            "access_token": "kua-local-session-token",
-            "token_type": "bearer"
+            "username": USERNAME
         }
 
     raise HTTPException(
@@ -41,6 +39,5 @@ def me():
 @router.post("/logout")
 def logout():
     return {
-        "success": True,
-        "message": "Logged out"
+        "success": True
     }
