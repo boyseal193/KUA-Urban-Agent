@@ -19,7 +19,9 @@ def login(data: LoginRequest):
         return {
             "success": True,
             "message": "Authenticated",
-            "username": USERNAME
+            "username": USERNAME,
+            "access_token": "kua-session-token",
+            "token_type": "bearer"
         }
 
     raise HTTPException(
