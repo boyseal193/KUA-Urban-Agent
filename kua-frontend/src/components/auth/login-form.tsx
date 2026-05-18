@@ -37,7 +37,9 @@ export function LoginForm() {
 
   async function onSubmit(values: FormValues) {
     setError(null);
-    const res = await fetch("/api/auth/login", {
+    const res = await fetch(
+      "https://kua-urban-agent-production.up.railway.app/auth/login",
+      {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
