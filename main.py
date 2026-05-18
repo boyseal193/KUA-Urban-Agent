@@ -4,6 +4,7 @@ import re
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from kua_auth import router as auth_router
 from database import supabase
 from scraper import scrape_listing_text, scrape_idealista_search_urls
 from extractor import extract_property_from_text
@@ -44,6 +45,8 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["*"],
 )
+
+app.include_router(auth_router, prefix="/auth", tags=["auth"])
 
 
 @app.get("/")
