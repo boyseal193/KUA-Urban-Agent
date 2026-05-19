@@ -3,10 +3,11 @@
  *
  * The browser hits /api/proxy/<anything> with the user's session cookie.
  * This handler:
- *   1. validates the session
+ *   1. validates the session JWT
  *   2. rewrites the URL to BACKEND_API_URL + /<anything>
  *   3. forwards method, headers, body, query
- *   4. streams the response back
+ *   4. injects the operator identity + (if present) the FastAPI bearer token
+ *   5. streams the response back
  *
  * Why we do this:
  *   • the FastAPI URL stays server-side (security + portability)
@@ -15,7 +16,8 @@
  *   • we can layer rate-limits / audit logging in a single place
  */
 import { NextResponse } from "next/server";
-import { getSession } from "@/lib/auth/session";
+import { getSessionInternal } from "@/lib/auth/session";
+import { authConfig } from "@/lib/auth/config";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -31,18 +33,19 @@ const HOP_HEADERS = new Set([
   "upgrade",
   "host",
   "content-length",
+  "accept-encoding",
 ]);
 
 async function forward(
   req: Request,
   ctx: { params: Promise<{ path: string[] }> }
 ) {
-  const session = await getSession();
+  const session = await getSessionInternal();
   if (!session) {
     return NextResponse.json({ error: "UNAUTHORIZED" }, { status: 401 });
   }
 
-  const base = process.env.BACKEND_API_URL;
+  const base = authConfig.backendApiUrl;
   if (!base) {
     return NextResponse.json(
       { error: "BACKEND_API_URL not configured" },
@@ -53,7 +56,7 @@ async function forward(
   const { path } = await ctx.params;
   const url = new URL(req.url);
   const target =
-    base.replace(/\/$/, "") +
+    base +
     "/" +
     path.map(encodeURIComponent).join("/") +
     url.search;
@@ -64,19 +67,32 @@ async function forward(
   }
   headers.set("x-kua-user", session.username);
   headers.set("x-kua-clearance", session.clearance);
+  if (session.backendToken && !headers.has("authorization")) {
+    headers.set("Authorization", `Bearer ${session.backendToken}`);
+  }
 
+  const method = req.method.toUpperCase();
   const init: RequestInit = {
-    method: req.method,
+    method,
     headers,
     body:
-      req.method === "GET" || req.method === "HEAD"
+      method === "GET" || method === "HEAD"
         ? undefined
         : await req.arrayBuffer(),
     redirect: "manual",
     cache: "no-store",
   };
 
-  const upstream = await fetch(target, init);
+  let upstream: Response;
+  try {
+    upstream = await fetch(target, init);
+  } catch (err) {
+    console.error("[proxy] upstream error", err);
+    return NextResponse.json(
+      { error: "Upstream service unreachable" },
+      { status: 502 }
+    );
+  }
 
   const responseHeaders = new Headers();
   for (const [k, v] of upstream.headers.entries()) {

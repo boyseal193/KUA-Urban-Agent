@@ -2,41 +2,96 @@ import "server-only";
 
 import { cookies } from "next/headers";
 import bcrypt from "bcryptjs";
-import { authConfig, SESSION_COOKIE } from "./config";
+import { authConfig, SESSION_COOKIE, isProd } from "./config";
 import { signSession, verifySession } from "./jwt";
 import type { AuthSessionUser } from "@/lib/api/types";
 
-const isProd = process.env.NODE_ENV === "production";
+/**
+ * Server-side session helpers.
+ *
+ * These run in the Node.js runtime (route handlers, server components) and
+ * have access to bcrypt, `next/headers` cookies(), etc. The Edge middleware
+ * must NOT import from this file — it uses `verifySession` from ./jwt
+ * directly.
+ */
 
-export async function getSession(): Promise<AuthSessionUser | null> {
-  const store = await cookies();
-  const token = store.get(SESSION_COOKIE)?.value;
-  if (!token) return null;
+export interface SessionInternal extends AuthSessionUser {
+  /** Backend bearer token (FastAPI access_token). */
+  backendToken?: string;
+}
 
-  const payload = await verifySession(token);
-  if (!payload) return null;
-
+function payloadToUser(payload: {
+  sub: unknown;
+  name?: unknown;
+  clr?: unknown;
+  iat?: unknown;
+  exp?: unknown;
+  bt?: unknown;
+}): SessionInternal {
   return {
-    username: String(payload.sub),
-    displayName: String(payload.name),
-    clearance: String(payload.clr),
+    username: String(payload.sub ?? ""),
+    displayName: String(payload.name ?? payload.sub ?? ""),
+    clearance: String(payload.clr ?? "operator"),
     issuedAt: Number(payload.iat ?? 0),
     expiresAt: Number(payload.exp ?? 0),
+    backendToken:
+      typeof payload.bt === "string" && payload.bt.length > 0
+        ? payload.bt
+        : undefined,
   };
 }
 
-export async function requireSession() {
+/**
+ * Returns the current session (for layouts, RSC, route handlers).
+ * The returned object includes the backend token for SERVER-SIDE use only.
+ */
+export async function getSessionInternal(): Promise<SessionInternal | null> {
+  const store = await cookies();
+  const token = store.get(SESSION_COOKIE)?.value;
+  if (!token) return null;
+  const payload = await verifySession(token);
+  if (!payload) return null;
+  return payloadToUser(payload);
+}
+
+/**
+ * Public-facing session (no secrets). Safe to pass to client components.
+ */
+export async function getSession(): Promise<AuthSessionUser | null> {
+  const session = await getSessionInternal();
+  if (!session) return null;
+  const { backendToken: _backendToken, ...publicUser } = session;
+  void _backendToken;
+  return publicUser;
+}
+
+export async function requireSession(): Promise<AuthSessionUser> {
   const session = await getSession();
   if (!session) throw new Error("UNAUTHORIZED");
   return session;
 }
 
-export async function createLoginSession(input: {
+/** Convenience: return only the FastAPI bearer token, server-side only. */
+export async function getBackendToken(): Promise<string | null> {
+  const session = await getSessionInternal();
+  return session?.backendToken ?? null;
+}
+
+export interface CreateLoginInput {
   username: string;
   displayName: string;
   clearance: string;
-}) {
-  const { token, expiresAt } = await signSession(input);
+  backendToken?: string;
+}
+
+/**
+ * Sign a new session JWT and set the HttpOnly cookie on the response.
+ * MUST be called from a route handler / server action.
+ */
+export async function createLoginSession(
+  input: CreateLoginInput
+): Promise<AuthSessionUser> {
+  const { token, issuedAt, expiresAt } = await signSession(input);
   const store = await cookies();
   store.set(SESSION_COOKIE, token, {
     httpOnly: true,
@@ -45,9 +100,16 @@ export async function createLoginSession(input: {
     path: "/",
     expires: new Date(expiresAt * 1000),
   });
+  return {
+    username: input.username,
+    displayName: input.displayName,
+    clearance: input.clearance,
+    issuedAt,
+    expiresAt,
+  };
 }
 
-export async function destroySession() {
+export async function destroySession(): Promise<void> {
   const store = await cookies();
   store.set(SESSION_COOKIE, "", {
     httpOnly: true,
@@ -55,14 +117,14 @@ export async function destroySession() {
     sameSite: "lax",
     path: "/",
     maxAge: 0,
+    expires: new Date(0),
   });
 }
 
 /**
- * Validate credentials against the configured operator account.
- *
- * In production swap this for a call to your FastAPI auth router (see
- * `kua_auth_example.py` in the backend). The interface stays the same.
+ * Local break-glass credential check (DEV / fallback only).
+ * In production the /api/auth/login route should always be configured to
+ * proxy to FastAPI; this is only used when no backend URL is configured.
  */
 export async function validateCredentials(input: {
   username: string;

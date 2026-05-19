@@ -1,17 +1,21 @@
 "use client";
 
 import * as React from "react";
-import { useRouter } from "next/navigation";
 import type { AuthSessionUser } from "@/lib/api/types";
 
 interface AuthContextValue {
   user: AuthSessionUser | null;
   isLoading: boolean;
-  refresh: () => Promise<void>;
+  refresh: () => Promise<AuthSessionUser | null>;
   logout: () => Promise<void>;
 }
 
 const AuthContext = React.createContext<AuthContextValue | null>(null);
+
+interface SessionResponse {
+  authenticated: boolean;
+  user: AuthSessionUser | null;
+}
 
 export function AuthProvider({
   children,
@@ -22,31 +26,47 @@ export function AuthProvider({
 }) {
   const [user, setUser] = React.useState<AuthSessionUser | null>(initialUser);
   const [isLoading, setLoading] = React.useState(false);
-  const router = useRouter();
 
-  const refresh = React.useCallback(async () => {
+  const refresh = React.useCallback(async (): Promise<AuthSessionUser | null> => {
     setLoading(true);
     try {
-      const res = await fetch("/api/auth/session", { cache: "no-store" });
-      if (res.ok) {
-        const data = await res.json();
-        setUser(data.user ?? null);
-      } else {
+      const res = await fetch("/api/auth/session", {
+        cache: "no-store",
+        credentials: "include",
+      });
+      if (!res.ok) {
         setUser(null);
+        return null;
       }
+      const data = (await res.json()) as SessionResponse;
+      const next = data.authenticated ? data.user : null;
+      setUser(next);
+      return next;
+    } catch {
+      setUser(null);
+      return null;
     } finally {
       setLoading(false);
     }
   }, []);
 
   const logout = React.useCallback(async () => {
-    await fetch("/api/auth/logout", { method: "POST" });
+    try {
+      await fetch("/api/auth/logout", {
+        method: "POST",
+        credentials: "include",
+        cache: "no-store",
+      });
+    } catch {
+      // ignore — we'll still wipe local state and bounce to /login
+    }
     setUser(null);
-    router.replace("/login");
-    router.refresh();
-  }, [router]);
+    // Hard navigation guarantees the cleared cookie is what the next
+    // request carries; router.replace can race the Set-Cookie write.
+    window.location.assign("/login");
+  }, []);
 
-  const value = React.useMemo(
+  const value = React.useMemo<AuthContextValue>(
     () => ({ user, isLoading, refresh, logout }),
     [user, isLoading, refresh, logout]
   );
@@ -54,7 +74,7 @@ export function AuthProvider({
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }
 
-export function useAuth() {
+export function useAuth(): AuthContextValue {
   const ctx = React.useContext(AuthContext);
   if (!ctx) throw new Error("useAuth must be used inside <AuthProvider>");
   return ctx;

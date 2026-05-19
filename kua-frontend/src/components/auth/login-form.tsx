@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import { useSearchParams } from "next/navigation";
 import { motion } from "framer-motion";
 import { Eye, EyeOff, Fingerprint, Loader2, ShieldCheck } from "lucide-react";
 import { useForm } from "react-hook-form";
@@ -18,10 +19,18 @@ const schema = z.object({
 
 type FormValues = z.infer<typeof schema>;
 
+function safeNext(value: string | null): string {
+  if (!value) return "/dashboard";
+  if (!value.startsWith("/") || value.startsWith("//")) return "/dashboard";
+  return value;
+}
+
 export function LoginForm() {
   const [show, setShow] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const [loading, setLoading] = React.useState(false);
+  const params = useSearchParams();
+  const next = safeNext(params.get("next"));
 
   const {
     register,
@@ -44,24 +53,38 @@ export function LoginForm() {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
+          Accept: "application/json",
         },
         body: JSON.stringify({
           username: values.username,
           password: values.password,
         }),
+        credentials: "include",
+        cache: "no-store",
       });
 
-      const data = await res.json().catch(() => null);
+      const data = (await res.json().catch(() => null)) as
+        | { ok?: boolean; error?: string; detail?: string }
+        | null;
 
-      if (!res.ok) {
-        setError(data?.detail ?? data?.error ?? "Invalid username or password");
+      if (!res.ok || !data?.ok) {
+        const message =
+          data?.error ??
+          data?.detail ??
+          (res.status === 401
+            ? "Invalid username or password"
+            : "Authentication failed");
+        setError(message);
         setLoading(false);
         return;
       }
 
-      window.location.href = "/dashboard";
+      // Hard navigation so the new Set-Cookie is committed before the
+      // browser fetches the protected route. router.push() can race the
+      // cookie write in some standalone deployments.
+      window.location.assign(next);
     } catch (err) {
-      console.error(err);
+      console.error("[login] network error", err);
       setError("Authentication service unavailable.");
       setLoading(false);
     }
@@ -78,6 +101,7 @@ export function LoginForm() {
         delay: 0.1,
       }}
       className="space-y-5"
+      noValidate
     >
       <div className="space-y-1.5">
         <Label htmlFor="username">Operator ID</Label>
@@ -88,6 +112,7 @@ export function LoginForm() {
             autoComplete="username"
             placeholder="operator"
             className="pl-9 font-mono tracking-wider"
+            disabled={loading}
             {...register("username")}
           />
 
@@ -111,6 +136,7 @@ export function LoginForm() {
             autoComplete="current-password"
             placeholder="••••••••••••"
             className="pl-9 pr-10 font-mono tracking-widest"
+            disabled={loading}
             {...register("password")}
           />
 
@@ -120,6 +146,7 @@ export function LoginForm() {
             type="button"
             onClick={() => setShow((s) => !s)}
             className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-1 text-muted-foreground hover:text-foreground"
+            aria-label={show ? "Hide password" : "Show password"}
           >
             {show ? (
               <EyeOff className="h-3.5 w-3.5" />
@@ -140,6 +167,7 @@ export function LoginForm() {
         <motion.div
           initial={{ opacity: 0, x: -8 }}
           animate={{ opacity: 1, x: 0 }}
+          role="alert"
           className="flex items-center gap-2 rounded-md border border-destructive/30 bg-destructive/[0.06] px-3 py-2 font-mono text-[11px] uppercase tracking-[0.15em] text-destructive"
         >
           <span className="badge-dot bg-destructive shadow-glow-rose" />

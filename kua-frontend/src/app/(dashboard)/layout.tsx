@@ -5,6 +5,18 @@ import { Topbar } from "@/components/layout/topbar";
 import { StatusTicker } from "@/components/layout/status-ticker";
 import { AuthGuard } from "@/components/auth/auth-guard";
 
+/**
+ * Server-rendered dashboard shell.
+ *
+ * Auth enforcement order:
+ *   1. middleware.ts checks the cookie + JWT on every request (Edge runtime)
+ *   2. THIS layout double-checks server-side via getSession()
+ *   3. <AuthGuard> is a passive client-side render guard
+ *
+ * Layers 1 + 2 are independent; layer 3 only hides UI after an explicit
+ * client-side logout. There is no client-side redirect anywhere in the
+ * dashboard tree.
+ */
 export default async function DashboardLayout({
   children,
 }: {
