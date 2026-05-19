@@ -23,48 +23,67 @@ export function LoginForm() {
   const router = useRouter();
   const params = useSearchParams();
   const next = params.get("next") ?? "/dashboard";
+
   const [show, setShow] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+  const [loading, setLoading] = React.useState(false);
 
   const {
     register,
     handleSubmit,
-    formState: { isSubmitting, errors },
+    formState: { errors },
   } = useForm<FormValues>({
     resolver: zodResolver(schema),
-    defaultValues: { username: "", password: "" },
+    defaultValues: {
+      username: "",
+      password: "",
+    },
   });
 
   async function onSubmit(values: FormValues) {
     setError(null);
-    const res = await fetch(
-      "https://kua-urban-agent-production.up.railway.app/auth/login",
-      {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      
-      body: JSON.stringify({
-        username: values.username,
-        password: values.password,
-      }),
-    });
+    setLoading(true);
 
-    if (!res.ok) {
+    try {
+      const res = await fetch(
+        "https://kua-urban-agent-production.up.railway.app/auth/login",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            username: values.username,
+            password: values.password,
+          }),
+        }
+      );
+
       const data = await res.json().catch(() => null);
-      setError(data?.error ?? "Access denied");
-      return;
-    }
 
-    router.replace(next);
-    router.refresh();
+      if (!res.ok) {
+        setError(data?.detail ?? data?.error ?? "Invalid username or password");
+        setLoading(false);
+        return;
+      }
+
+      if (typeof window !== "undefined") {
+        localStorage.setItem("kua_authenticated", "true");
+        localStorage.setItem("kua_username", data?.username ?? values.username);
+        localStorage.setItem("kua_token", data?.access_token ?? "kua-session");
+      }
+
+      router.push(next);
+      router.refresh();
+    } catch (err) {
+      setError("Connection blocked. Check backend URL or CORS.");
+      setLoading(false);
+    }
   }
 
   return (
     <motion.form
-    onSubmit={(e) => {
-      e.preventDefault();
-      handleSubmit(onSubmit)(e);
-    }}
+      onSubmit={handleSubmit(onSubmit)}
       initial={{ opacity: 0, y: 14 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.6, ease: [0.16, 1, 0.3, 1], delay: 0.1 }}
@@ -82,6 +101,7 @@ export function LoginForm() {
           />
           <Fingerprint className="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
         </div>
+
         {errors.username && (
           <p className="text-[11px] text-destructive">
             {errors.username.message}
@@ -100,15 +120,22 @@ export function LoginForm() {
             className="pl-9 pr-10 font-mono tracking-widest"
             {...register("password")}
           />
+
           <ShieldCheck className="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+
           <button
             type="button"
             onClick={() => setShow((s) => !s)}
             className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-1 text-muted-foreground hover:text-foreground"
           >
-            {show ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+            {show ? (
+              <EyeOff className="h-3.5 w-3.5" />
+            ) : (
+              <Eye className="h-3.5 w-3.5" />
+            )}
           </button>
         </div>
+
         {errors.password && (
           <p className="text-[11px] text-destructive">
             {errors.password.message}
@@ -131,10 +158,10 @@ export function LoginForm() {
         type="submit"
         variant="default"
         size="lg"
-        disabled={isSubmitting}
+        disabled={loading}
         className="w-full font-mono uppercase tracking-[0.2em] text-[12px]"
       >
-        {isSubmitting ? (
+        {loading ? (
           <>
             <Loader2 className="h-3.5 w-3.5 animate-spin" />
             Authenticating
