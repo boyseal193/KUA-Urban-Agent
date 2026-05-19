@@ -1,17 +1,16 @@
 /**
  * POST /api/auth/login
  *
- * Authenticates an operator. Strategy:
- *   1. If a FastAPI auth URL is configured (the production path), proxy the
- *      credentials there, capture the bearer token, mint a Next.js JWT
- *      session cookie, and return the public user object.
- *   2. Otherwise (dev/local), fall back to bcrypt-checking a local
- *      operator account configured via env vars.
+ * Browser → this route → FastAPI /auth/login → JWT cookie issued here.
  *
- * On success: 200 { ok: true, user }
- * On bad payload: 400 { error }
- * On bad credentials: 401 { error }
- * On upstream / config failure: 502 { error }
+ * Responses:
+ *   200 { ok: true, user }                       success
+ *   400 { error: "Invalid credentials payload" } bad request body
+ *   401 { error: <upstream detail or default> }  bad credentials
+ *   502 { error: <upstream detail or default> }  upstream / network failure
+ *
+ * Every response is structured JSON; the frontend reads `error` to render
+ * the message in the login form.
  */
 import { NextResponse } from "next/server";
 import { z } from "zod";
@@ -98,7 +97,11 @@ export async function POST(req: Request) {
       });
     } catch (err) {
       clearTimeout(timer);
-      console.error("[auth/login] Backend unreachable:", err);
+      console.error(
+        "[auth/login] FastAPI unreachable",
+        { backendAuthUrl: authConfig.backendAuthUrl },
+        err
+      );
       return NextResponse.json(
         { error: "Authentication service unreachable" },
         { status: 502 }
@@ -117,9 +120,17 @@ export async function POST(req: Request) {
     }
 
     if (!upstream.ok) {
-      const detail = extractDetail(data) ?? "Invalid username or password";
-      // 401 if backend says so, 502 for anything else (5xx / weirdness)
-      const status = upstream.status === 401 || upstream.status === 403 ? 401 : 502;
+      const detail =
+        extractDetail(data) ??
+        (upstream.status === 401 || upstream.status === 403
+          ? "Invalid username or password"
+          : `Upstream error (${upstream.status})`);
+      console.warn("[auth/login] upstream rejected", {
+        status: upstream.status,
+        detail,
+      });
+      const status =
+        upstream.status === 401 || upstream.status === 403 ? 401 : 502;
       return NextResponse.json({ error: detail }, { status });
     }
 
@@ -143,10 +154,15 @@ export async function POST(req: Request) {
       backendToken,
     });
 
+    console.info("[auth/login] success", { username });
     return NextResponse.json({ ok: true, user });
   }
 
   // ---- Fallback path: local bcrypt operator (dev / break-glass) -------------
+  console.warn(
+    "[auth/login] No backendAuthUrl configured — using local bcrypt fallback. " +
+      "Set NEXT_PUBLIC_API_URL in Railway → Variables."
+  );
   const session = await validateCredentials(parsed.data);
   if (!session) {
     return NextResponse.json(
@@ -154,7 +170,6 @@ export async function POST(req: Request) {
       { status: 401 }
     );
   }
-
   const user = await createLoginSession({
     username: session.username,
     displayName: session.displayName,

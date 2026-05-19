@@ -5,13 +5,14 @@
  * Rules:
  *   • Public paths (always allow): /login, /api/auth/*, /api/healthz,
  *     static assets, common metadata files.
- *   • Any other path requires a valid JWT in the SESSION_COOKIE cookie.
+ *   • Any other path requires a valid JWT in the SESSION_COOKIE cookie
+ *     (default name: kua_session).
  *   • Unauthenticated browser navigation → redirect to /login?next=<orig>.
  *   • Unauthenticated API call → 401 JSON.
  *   • Authenticated user hitting /login → bounce to /dashboard (or ?next=).
  *
- * This runs on the Edge runtime so it MUST NOT import bcrypt, next/headers,
- * or anything from `server-only`.
+ * Runs on the Edge runtime — MUST NOT import bcrypt, next/headers, or
+ * anything from `server-only`.
  */
 import { NextResponse, type NextRequest } from "next/server";
 import { verifySession } from "@/lib/auth/jwt";
@@ -22,6 +23,7 @@ const PUBLIC_EXACT = new Set<string>([
   "/api/auth/login",
   "/api/auth/logout",
   "/api/auth/session",
+  "/api/auth/debug",
   "/api/healthz",
   "/favicon.ico",
   "/manifest.json",
@@ -52,7 +54,6 @@ function isApiPath(pathname: string): boolean {
 
 function isSafeNext(value: string | null): value is string {
   if (!value) return false;
-  // must be a same-origin absolute path, not a protocol-relative URL
   return value.startsWith("/") && !value.startsWith("//");
 }
 
@@ -63,7 +64,6 @@ export async function middleware(req: NextRequest) {
   const payload = token ? await verifySession(token) : null;
   const authed = Boolean(payload);
 
-  // Already on /login? Redirect away if already authed; otherwise let it render.
   if (pathname === "/login") {
     if (authed) {
       const url = req.nextUrl.clone();
@@ -75,12 +75,10 @@ export async function middleware(req: NextRequest) {
     return NextResponse.next();
   }
 
-  // Everything else under the public allowlist passes through.
   if (isPublic(pathname)) {
     return NextResponse.next();
   }
 
-  // Protected path — require a valid session.
   if (!authed) {
     if (isApiPath(pathname)) {
       return NextResponse.json({ error: "UNAUTHORIZED" }, { status: 401 });
@@ -95,10 +93,6 @@ export async function middleware(req: NextRequest) {
   return NextResponse.next();
 }
 
-/**
- * Skip the middleware for Next.js internals and well-known static files.
- * Everything else flows through the handler above.
- */
 export const config = {
   matcher: [
     "/((?!_next/static|_next/image|_next/data|favicon.ico|robots.txt|sitemap.xml|manifest.json).*)",

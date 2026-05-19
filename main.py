@@ -16,30 +16,50 @@ from location import geocode_address
 from excel_exporter import export_scan_to_excel
 
 
-app = FastAPI(title="TruTrastero AI Backend / K.U.A.")
+app = FastAPI(
+    title="TruTrastero AI Backend / K.U.A.",
+    description="FastAPI backend for the K.U.A. (Klave Urban Agent) "
+    "acquisitions intelligence platform.",
+    version="1.0.0",
+)
 
 # -----------------------------------------------------------------------------
-# CORS — required for the K.U.A. Next.js frontend.
+# CORS
 #
 # In production the Next.js Route Handlers proxy every browser request through
 # /api/proxy/*, so the browser never calls FastAPI directly and CORS is
 # technically optional. We still enable it so the API can be exercised from
-# local tooling (Postman, curl, Insomnia) and from any future first-party
-# frontends.
+# local tooling (Postman, curl, Insomnia, Swagger /docs) and any future
+# first-party frontends.
 #
-# Configure the allowed origins via FRONTEND_ORIGINS env var, comma-separated.
-# Default whitelists Next.js dev + a wildcard for previews.
+# Allowed origins are loaded from FRONTEND_ORIGINS (comma-separated).
+# The defaults ALREADY include the known K.U.A. Railway frontend URLs so
+# things keep working even if FRONTEND_ORIGINS is missing.
 # -----------------------------------------------------------------------------
-_default_origins = "http://localhost:3000,http://127.0.0.1:3000"
+_DEFAULT_ORIGINS = ",".join(
+    [
+        "https://honest-trust-production-fcdb.up.railway.app",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
+)
+
 _origins = [
     o.strip()
-    for o in os.environ.get("FRONTEND_ORIGINS", _default_origins).split(",")
+    for o in os.environ.get("FRONTEND_ORIGINS", _DEFAULT_ORIGINS).split(",")
     if o.strip()
 ]
+
+# Allow Railway preview deployments (anything matching honest-trust-* /
+# kua-frontend-*) without manual reconfiguration on every push.
+_origin_regex = (
+    r"^https://(honest-trust|kua-frontend)[a-z0-9-]*\.up\.railway\.app$"
+)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_origins,
+    allow_origin_regex=_origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

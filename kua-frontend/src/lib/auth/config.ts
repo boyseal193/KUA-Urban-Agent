@@ -1,26 +1,29 @@
 /**
- * Runtime auth configuration.
+ * Runtime auth configuration for K.U.A. frontend.
  *
- * All values are pulled from environment variables. This module is imported
- * by both Node.js route handlers and the Edge-runtime middleware, so it MUST
- * stay free of Node-only APIs and must NEVER throw at module-evaluation time
- * (a throw here will take the whole app down on Railway / Vercel boot).
+ * Imported by both the Edge middleware and the Node.js route handlers, so it
+ * MUST stay free of Node-only APIs and must NEVER throw at module-evaluation
+ * time (a throw here takes the whole app down on Railway boot).
  *
- * Required in production (set in Railway → Variables):
- *   AUTH_SECRET           — 48+ random bytes (HS256 signing key).
- *   BACKEND_API_URL       — FastAPI base URL, e.g.
- *                            https://kua-urban-agent-production.up.railway.app
+ * Backend URL resolution priority (first non-empty wins):
+ *   1. BACKEND_AUTH_URL          (explicit, full URL to /auth/login)
+ *   2. NEXT_PUBLIC_API_URL       (preferred — what we tell operators to set)
+ *   3. BACKEND_API_URL           (legacy server-only name, still supported)
+ *   4. PRODUCTION_BACKEND_FALLBACK (hard-coded last-resort)
  *
- * Optional:
- *   AUTH_COOKIE_NAME           — default "kua_session"
- *   AUTH_SESSION_TTL_SECONDS   — default 43200 (12h)
- *   BACKEND_AUTH_URL           — full URL to FastAPI login endpoint.
- *                                Defaults to `${BACKEND_API_URL}/auth/login`.
- *   AUTH_OPERATOR_USERNAME     — local fallback operator (dev only)
- *   AUTH_OPERATOR_PASSWORD_HASH — bcrypt hash for the local operator
- *   AUTH_OPERATOR_DISPLAY_NAME — default "Acquisitions Operator"
- *   AUTH_OPERATOR_CLEARANCE    — default "tier-1"
+ * Why a hard-coded fallback?
+ *   If Railway forgets a variable, login MUST still work. The fallback points
+ *   at the canonical K.U.A. FastAPI service. Override it by setting one of
+ *   the env vars above in Railway → Variables.
+ *
+ * Required vars for production hardening (set in Railway):
+ *   AUTH_SECRET           — 48+ random bytes used to sign session JWTs.
+ *   NEXT_PUBLIC_API_URL   — FastAPI base URL (recommended).
  */
+
+/** Canonical production backend URL — hard fallback. */
+const PRODUCTION_BACKEND_FALLBACK =
+  "https://kua-urban-agent-production.up.railway.app";
 
 const env = (key: string, fallback = ""): string => {
   const v = process.env[key];
@@ -35,21 +38,29 @@ const num = (key: string, fallback: number): number => {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 };
 
-const trimSlash = (s: string) => s.replace(/\/+$/, "");
+const trimSlash = (s: string): string => s.replace(/\/+$/, "");
 
-const BACKEND_API_URL = trimSlash(env("BACKEND_API_URL"));
+function firstNonEmpty(...candidates: string[]): string {
+  for (const c of candidates) {
+    if (c && c.trim().length > 0) return c.trim();
+  }
+  return "";
+}
 
-const DERIVED_LOGIN_URL = BACKEND_API_URL ? `${BACKEND_API_URL}/auth/login` : "";
+const RESOLVED_API_URL = trimSlash(
+  firstNonEmpty(
+    env("NEXT_PUBLIC_API_URL"),
+    env("BACKEND_API_URL"),
+    PRODUCTION_BACKEND_FALLBACK
+  )
+);
+
+const RESOLVED_AUTH_URL = firstNonEmpty(
+  trimSlash(env("BACKEND_AUTH_URL")),
+  RESOLVED_API_URL ? `${RESOLVED_API_URL}/auth/login` : ""
+);
 
 const SECRET_FALLBACK = "dev-only-insecure-secret-CHANGE-ME-32+bytes-min";
-
-/**
- * In production we WARN on a missing AUTH_SECRET but do not throw — throwing
- * here would crash Edge middleware on every request before anything could be
- * logged. The signed JWT will simply use the fallback, which is still a
- * fixed secret per deployment (cryptographically safe enough to boot, but
- * operators MUST set a real secret).
- */
 const rawSecret = env("AUTH_SECRET", SECRET_FALLBACK);
 if (rawSecret === SECRET_FALLBACK && process.env.NODE_ENV === "production") {
   console.warn(
@@ -59,17 +70,22 @@ if (rawSecret === SECRET_FALLBACK && process.env.NODE_ENV === "production") {
 }
 
 export const authConfig = {
+  /** Cookie name used by route handlers AND middleware. */
   cookieName: env("AUTH_COOKIE_NAME", "kua_session"),
+
+  /** Session TTL in seconds. */
   ttlSeconds: num("AUTH_SESSION_TTL_SECONDS", 43200),
+
+  /** HS256 signing secret. */
   secret: rawSecret,
 
-  /** FastAPI login endpoint. Auto-derived from BACKEND_API_URL if not set. */
-  backendAuthUrl: trimSlash(env("BACKEND_AUTH_URL", DERIVED_LOGIN_URL)),
+  /** Effective FastAPI login URL. Always populated in this build. */
+  backendAuthUrl: RESOLVED_AUTH_URL,
 
-  /** Base FastAPI URL for the proxy route. */
-  backendApiUrl: BACKEND_API_URL,
+  /** Effective FastAPI base URL (used by the /api/proxy route). */
+  backendApiUrl: RESOLVED_API_URL,
 
-  /** Optional local operator (dev / break-glass account). */
+  /** Optional local break-glass operator (dev only). */
   operator: {
     username: env("AUTH_OPERATOR_USERNAME"),
     passwordHash: env("AUTH_OPERATOR_PASSWORD_HASH"),
@@ -78,6 +94,18 @@ export const authConfig = {
   },
 } as const;
 
-export const SESSION_COOKIE = authConfig.cookieName;
+/** Diagnostic — exposed only by /api/auth/debug, never user-facing. */
+export const authDebug = {
+  resolvedFrom: env("NEXT_PUBLIC_API_URL")
+    ? "NEXT_PUBLIC_API_URL"
+    : env("BACKEND_API_URL")
+    ? "BACKEND_API_URL"
+    : env("BACKEND_AUTH_URL")
+    ? "BACKEND_AUTH_URL"
+    : "PRODUCTION_BACKEND_FALLBACK",
+  hasAuthSecret: rawSecret !== SECRET_FALLBACK,
+  nodeEnv: process.env.NODE_ENV ?? "unknown",
+};
 
+export const SESSION_COOKIE = authConfig.cookieName;
 export const isProd = process.env.NODE_ENV === "production";
