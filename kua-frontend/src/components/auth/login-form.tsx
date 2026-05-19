@@ -40,19 +40,16 @@ export function LoginForm() {
     setLoading(true);
 
     try {
-      const res = await fetch(
-        "https://kua-urban-agent-production.up.railway.app/auth/login",
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            username: values.username,
-            password: values.password,
-          }),
-        }
-      );
+      const res = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          username: values.username,
+          password: values.password,
+        }),
+      });
 
       const data = await res.json().catch(() => null);
 
@@ -62,17 +59,10 @@ export function LoginForm() {
         return;
       }
 
-      localStorage.setItem("kua_authenticated", "true");
-      localStorage.setItem("kua_username", values.username);
-      localStorage.setItem(
-        "kua_token",
-        data?.access_token ?? "kua-session"
-      );
-
       window.location.href = "/dashboard";
     } catch (err) {
       console.error(err);
-      setError("Connection blocked. Check backend URL or CORS.");
+      setError("Authentication service unavailable.");
       setLoading(false);
     }
   }
