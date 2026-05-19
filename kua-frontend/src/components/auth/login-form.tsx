@@ -1,7 +1,6 @@
 "use client";
 
 import * as React from "react";
-import { useRouter, useSearchParams } from "next/navigation";
 import { motion } from "framer-motion";
 import { Eye, EyeOff, Fingerprint, Loader2, ShieldCheck } from "lucide-react";
 import { useForm } from "react-hook-form";
@@ -20,10 +19,6 @@ const schema = z.object({
 type FormValues = z.infer<typeof schema>;
 
 export function LoginForm() {
-  const router = useRouter();
-  const params = useSearchParams();
-  const next = params.get("next") ?? "/dashboard";
-
   const [show, setShow] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const [loading, setLoading] = React.useState(false);
@@ -67,15 +62,16 @@ export function LoginForm() {
         return;
       }
 
-      if (typeof window !== "undefined") {
-        localStorage.setItem("kua_authenticated", "true");
-        localStorage.setItem("kua_username", data?.username ?? values.username);
-        localStorage.setItem("kua_token", data?.access_token ?? "kua-session");
-      }
+      localStorage.setItem("kua_authenticated", "true");
+      localStorage.setItem("kua_username", values.username);
+      localStorage.setItem(
+        "kua_token",
+        data?.access_token ?? "kua-session"
+      );
 
-      router.push(next);
-      router.refresh();
+      window.location.href = "/dashboard";
     } catch (err) {
+      console.error(err);
       setError("Connection blocked. Check backend URL or CORS.");
       setLoading(false);
     }
@@ -86,11 +82,16 @@ export function LoginForm() {
       onSubmit={handleSubmit(onSubmit)}
       initial={{ opacity: 0, y: 14 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.6, ease: [0.16, 1, 0.3, 1], delay: 0.1 }}
+      transition={{
+        duration: 0.6,
+        ease: [0.16, 1, 0.3, 1],
+        delay: 0.1,
+      }}
       className="space-y-5"
     >
       <div className="space-y-1.5">
         <Label htmlFor="username">Operator ID</Label>
+
         <div className="relative">
           <Input
             id="username"
@@ -99,6 +100,7 @@ export function LoginForm() {
             className="pl-9 font-mono tracking-wider"
             {...register("username")}
           />
+
           <Fingerprint className="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
         </div>
 
@@ -111,6 +113,7 @@ export function LoginForm() {
 
       <div className="space-y-1.5">
         <Label htmlFor="password">Authorization Key</Label>
+
         <div className="relative">
           <Input
             id="password"
@@ -167,7 +170,7 @@ export function LoginForm() {
             Authenticating
           </>
         ) : (
-          <>Establish secure session</>
+          <>Establish Secure Session</>
         )}
       </Button>
 
