@@ -42,6 +42,7 @@ export function LoginForm() {
       {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      
       body: JSON.stringify({
         username: values.username,
         password: values.password,
@@ -60,7 +61,10 @@ export function LoginForm() {
 
   return (
     <motion.form
-      onSubmit={handleSubmit(onSubmit)}
+    onSubmit={(e) => {
+      e.preventDefault();
+      handleSubmit(onSubmit)(e);
+    }}
       initial={{ opacity: 0, y: 14 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.6, ease: [0.16, 1, 0.3, 1], delay: 0.1 }}
