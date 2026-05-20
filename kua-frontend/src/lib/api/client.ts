@@ -30,6 +30,7 @@ export interface ApiErrorPayload {
   error?: string;
   detail?: unknown;
   missing_tables?: string[];
+  missing_columns?: Record<string, string[]>;
   setup_required?: boolean;
   retryable?: boolean;
   request_id?: string;
@@ -40,6 +41,7 @@ export class ApiError extends Error {
   payload: ApiErrorPayload | null;
   errorType?: string;
   missingTables?: string[];
+  missingColumns?: Record<string, string[]>;
   setupRequired: boolean;
   retryable: boolean;
   requestId?: string;
@@ -59,6 +61,7 @@ export class ApiError extends Error {
     this.payload = payload ?? null;
     this.errorType = payload?.error_type;
     this.missingTables = payload?.missing_tables;
+    this.missingColumns = payload?.missing_columns;
     this.setupRequired = Boolean(payload?.setup_required);
     this.retryable = Boolean(payload?.retryable);
     this.requestId = payload?.request_id;
@@ -96,10 +99,24 @@ export function formatApiErrorMessage(
   fallback = "Request failed"
 ): string {
   if (data?.error_type === "DatabaseSetupError") {
-    const tables = data.missing_tables?.length
+    const tableList = data.missing_tables?.length
       ? data.missing_tables.join(", ")
-      : "scan_jobs";
-    return `Database setup incomplete: missing ${tables} table(s). Run jobs/schema.sql in Supabase SQL Editor.`;
+      : null;
+    const colList = data.missing_columns
+      ? Object.entries(data.missing_columns)
+          .map(([t, cols]) => `${t}(${(cols ?? []).join(", ")})`)
+          .join("; ")
+      : null;
+
+    const segments: string[] = [];
+    if (tableList) segments.push(`missing ${tableList} table(s)`);
+    if (colList) segments.push(`missing columns: ${colList}`);
+    if (!segments.length) segments.push("missing scan_jobs table");
+
+    return (
+      `Database setup incomplete: ${segments.join(" · ")}. ` +
+      "Run jobs/schema.sql in Supabase SQL Editor."
+    );
   }
 
   const detail =
