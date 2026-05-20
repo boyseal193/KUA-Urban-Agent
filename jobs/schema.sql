@@ -417,6 +417,79 @@ CREATE INDEX IF NOT EXISTS idx_generated_memos_created ON public.generated_memos
 
 
 -- =============================================================================
+-- export_jobs
+-- Tracks every export artifact generated for a scan job (excel, csv, json,
+-- memo, zip). One row per (job_id, export_type). Artifacts may be cached in
+-- Supabase Storage (file_path = "bucket/path") or regenerated on demand.
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS public.export_jobs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid()
+);
+
+ALTER TABLE public.export_jobs ADD COLUMN IF NOT EXISTS job_id          UUID;
+ALTER TABLE public.export_jobs ADD COLUMN IF NOT EXISTS export_type     TEXT NOT NULL DEFAULT 'excel';
+ALTER TABLE public.export_jobs ADD COLUMN IF NOT EXISTS file_path       TEXT;
+ALTER TABLE public.export_jobs ADD COLUMN IF NOT EXISTS file_name       TEXT;
+ALTER TABLE public.export_jobs ADD COLUMN IF NOT EXISTS mime_type       TEXT;
+ALTER TABLE public.export_jobs ADD COLUMN IF NOT EXISTS size_bytes      BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE public.export_jobs ADD COLUMN IF NOT EXISTS status          TEXT NOT NULL DEFAULT 'pending';
+ALTER TABLE public.export_jobs ADD COLUMN IF NOT EXISTS error_message   TEXT;
+ALTER TABLE public.export_jobs ADD COLUMN IF NOT EXISTS download_count  INT NOT NULL DEFAULT 0;
+ALTER TABLE public.export_jobs ADD COLUMN IF NOT EXISTS created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE public.export_jobs ADD COLUMN IF NOT EXISTS updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.table_constraints
+         WHERE constraint_schema='public' AND table_name='export_jobs'
+           AND constraint_name='export_jobs_job_id_fkey'
+    ) THEN
+        BEGIN
+            ALTER TABLE public.export_jobs
+              ADD CONSTRAINT export_jobs_job_id_fkey
+              FOREIGN KEY (job_id) REFERENCES public.scan_jobs(id) ON DELETE CASCADE;
+        EXCEPTION WHEN others THEN
+            RAISE NOTICE 'Skipped export_jobs_job_id_fkey: %', SQLERRM;
+        END;
+    END IF;
+END$$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.table_constraints
+         WHERE constraint_schema='public' AND table_name='export_jobs'
+           AND constraint_name='export_jobs_job_id_type_uniq'
+    ) THEN
+        BEGIN
+            ALTER TABLE public.export_jobs
+              ADD CONSTRAINT export_jobs_job_id_type_uniq UNIQUE (job_id, export_type);
+        EXCEPTION WHEN others THEN
+            RAISE NOTICE 'Skipped export_jobs_job_id_type_uniq: %', SQLERRM;
+        END;
+    END IF;
+END$$;
+
+CREATE INDEX IF NOT EXISTS idx_export_jobs_job_id     ON public.export_jobs(job_id);
+CREATE INDEX IF NOT EXISTS idx_export_jobs_created_at ON public.export_jobs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_export_jobs_status     ON public.export_jobs(status);
+
+CREATE OR REPLACE FUNCTION public.touch_export_jobs_updated_at()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_export_jobs_updated_at ON public.export_jobs;
+CREATE TRIGGER trg_export_jobs_updated_at
+BEFORE UPDATE ON public.export_jobs
+FOR EACH ROW EXECUTE FUNCTION public.touch_export_jobs_updated_at();
+
+
+-- =============================================================================
 -- Permissions for the Supabase service role used by the backend
 -- =============================================================================
 GRANT USAGE ON SCHEMA public TO postgres, anon, authenticated, service_role;

@@ -5,6 +5,7 @@ import { Radar } from "lucide-react";
 import { PageHeader } from "@/components/common/page-header";
 import { ScanLauncher } from "@/components/scan/scan-launcher";
 import { LiveScanFeed } from "@/components/scan/live-scan-feed";
+import { ScanHistory } from "@/components/scan/scan-history";
 import { StatusPill } from "@/components/common/status-pill";
 import { ErrorBoundary } from "@/components/error-boundary";
 import type { AnalysisResult, ScanResponse } from "@/lib/api/types";
@@ -73,18 +74,22 @@ export default function ScanPage() {
         </ErrorBoundary>
       </div>
 
+      <ErrorBoundary>
+        <ScanHistory limit={8} />
+      </ErrorBoundary>
+
       <div className="flex items-center gap-2 rounded-md border border-border/60 bg-card/40 px-4 py-3 backdrop-blur-xl">
         <Radar className="h-3.5 w-3.5 text-primary" />
         <p className="text-xs text-muted-foreground">
           {summary?.excel_export_generated ? (
             <>
-              Excel underwriting workbook exported ·{" "}
+              Underwriting workbook exported ·{" "}
               <span className="font-mono text-foreground">
                 {summary.excel_export_path}
               </span>
             </>
           ) : (
-            <>Scans run asynchronously — no frontend timeout. Worker must be deployed on Railway.</>
+            <>Scans run asynchronously — exports download below as soon as a scan completes.</>
           )}
         </p>
       </div>

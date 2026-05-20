@@ -38,8 +38,8 @@ const HOP_HEADERS = new Set([
 ]);
 
 const DEFAULT_TIMEOUT_MS = 60_000;
-const LONG_TIMEOUT_PREFIXES = ["scan/", "analyse"];
-const LONG_TIMEOUT_MS = 600_000; // 10 min — enqueue path
+const LONG_TIMEOUT_PREFIXES = ["scan/", "analyse", "exports/"];
+const LONG_TIMEOUT_MS = 600_000; // 10 min — enqueue path + large export builds
 
 function pickTimeout(path: string[]): number {
   const joined = path.join("/");

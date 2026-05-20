@@ -468,27 +468,51 @@ def run_job(job_id: str) -> dict:
             except StoreError:
                 pass
 
+        # ----------------------------------------------------------------
+        # Export artifacts (Excel, CSV, JSON, IC memo, ZIP) — non-fatal.
+        # A failed export NEVER fails the scan. We log the failure and
+        # continue so the user still gets a successful scan + UI cues that
+        # they can retry the export from the frontend.
+        # ----------------------------------------------------------------
         excel_path = None
         if generate_excel and results:
+            from jobs.exports_service import generate_all_exports
+
             def export_step():
-                successful = [r for r in results if r.get("property_id") and r.get("score")]
-                if not successful:
-                    return {"excel_path": None}
-                path = export_scan_to_excel(
-                    results=successful,
-                    search_url=search_url,
-                    filters_used=filters_used,
-                )
-                return {"excel_path": path}
+                outcome = generate_all_exports(job_id)
+                # Bubble up storage path of the canonical Excel export if any.
+                row = None
+                try:
+                    from jobs import exports_store
+                    row = exports_store.get_export(job_id, "excel")
+                except Exception:
+                    row = None
+                return {
+                    "outcome": outcome,
+                    "excel_path": (row or {}).get("file_path") if row else None,
+                }
 
             try:
-                export_out = _run_with_retry(job_id, "export_artifacts", export_step)
-                excel_path = export_out.get("excel_path") if isinstance(export_out, dict) else None
-            except Exception as exc:
-                log.warning("Excel export failed: %s", exc)
-                store.record_error(
-                    job_id, error_type="ExportError", message=str(exc), traceback=format_traceback(exc)
+                export_out = _run_with_retry(
+                    job_id,
+                    "export_artifacts",
+                    export_step,
+                    max_attempts=1,  # Don't retry: we already retry per-format internally.
                 )
+                if isinstance(export_out, dict):
+                    excel_path = export_out.get("excel_path")
+            except Exception as exc:
+                log.warning("Export artifacts step failed (non-fatal): %s", exc)
+                try:
+                    store.record_error(
+                        job_id,
+                        error_type="ExportError",
+                        message=str(exc)[:1000],
+                        traceback=format_traceback(exc),
+                        retryable=True,
+                    )
+                except Exception:
+                    pass
 
         def notify():
             return {"notified": True, "listings": len(results)}

@@ -23,6 +23,7 @@ import type {
   ScanLogRecord,
   ScanStepRecord,
 } from "@/lib/api/types";
+import { ExportButtons } from "./export-buttons";
 
 interface ScanProgressProps {
   phase: ScanPhase;
@@ -218,6 +219,7 @@ export function ScanProgress({
       <AnimatePresence>
         {phase === "complete" && (
           <motion.div
+            key="complete-banner"
             initial={{ opacity: 0, y: 6 }}
             animate={{ opacity: 1, y: 0 }}
             className="mt-4 flex items-center gap-2 rounded-md border border-accent/30 bg-accent/[0.06] px-3 py-2 text-xs text-accent"
@@ -226,6 +228,17 @@ export function ScanProgress({
             Scan complete — {scannedCount ?? job?.listings_done ?? "—"}{" "}
             properties ingested, {approvedCount ?? job?.approved_count ?? "—"}{" "}
             approved for due diligence.
+          </motion.div>
+        )}
+        {phase === "complete" && job?.id && (
+          <motion.div
+            key="complete-exports"
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: 0.05 }}
+            className="mt-4 rounded-md border border-border/60 bg-card/40 p-3"
+          >
+            <ExportButtons jobId={job.id} />
           </motion.div>
         )}
         {isTerminalError && (

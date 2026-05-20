@@ -21,6 +21,8 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from fastapi.responses import StreamingResponse
+
 from kua_auth import router as auth_router
 from database import supabase
 from scraper import scrape_listing_text, scrape_idealista_search_urls
@@ -808,3 +810,141 @@ def cleanup_dead_jobs():
         return _setup_error_response(exc)
     except StoreError as exc:
         return _store_error_response(exc)
+
+
+# ---------------------------------------------------------------------------
+# Export endpoints
+#
+# Every endpoint:
+#   * authenticates via the proxy → x-kua-user / x-kua-clearance / Bearer
+#     (the proxy refuses to forward without a session, so by the time we
+#     are reached, the request is already authenticated)
+#   * regenerates from the database on cache miss — works even if the
+#     Supabase storage bucket is not configured
+#   * streams the artifact with the correct Content-Type + Content-Disposition
+#   * returns a structured JSON error envelope on any failure
+# ---------------------------------------------------------------------------
+_EXPORT_FORMATS = ("excel", "csv", "json", "memo", "zip")
+
+
+def _export_not_found_response(job_id: str, fmt: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=404,
+        content={
+            "success": False,
+            "error_type": "NotFound",
+            "message": f"Export not available for job {job_id} (format={fmt}).",
+            "retryable": True,
+        },
+    )
+
+
+def _export_error_response(exc: Exception) -> JSONResponse:
+    return JSONResponse(
+        status_code=500,
+        content={
+            "success": False,
+            "error_type": type(exc).__name__,
+            "message": str(exc)[:500] or "Export generation failed.",
+            "retryable": True,
+        },
+    )
+
+
+def _stream_export(job_id: str, fmt: str):
+    """Build a StreamingResponse for one job/format pair."""
+    from jobs.exports_service import get_or_generate
+    from jobs.errors import DatabaseSetupError, StoreError
+
+    if fmt not in _EXPORT_FORMATS:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "error_type": "BadRequest",
+                "message": f"Unknown export format: {fmt!r}. Allowed: {list(_EXPORT_FORMATS)}.",
+            },
+        )
+    try:
+        result = get_or_generate(job_id, fmt)
+    except DatabaseSetupError as exc:
+        return _setup_error_response(exc)
+    except StoreError as exc:
+        return _store_error_response(exc)
+    except KeyError:
+        return _export_not_found_response(job_id, fmt)
+    except Exception as exc:
+        get_logger(job_id, "exports").exception("Export generation crash: %s", exc)
+        return _export_error_response(exc)
+
+    if result is None:
+        return _export_not_found_response(job_id, fmt)
+
+    data, mime, filename = result
+
+    def _iter():
+        # Chunk so even a 50MB zip streams politely.
+        view = memoryview(data)
+        chunk = 64 * 1024
+        for i in range(0, len(view), chunk):
+            yield bytes(view[i : i + chunk])
+
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Content-Length": str(len(data)),
+        "X-Export-Format": fmt,
+        "Cache-Control": "private, no-store",
+    }
+    return StreamingResponse(_iter(), media_type=mime, headers=headers)
+
+
+@app.get("/exports/{job_id}")
+def list_exports_for_job(job_id: str):
+    """List every export artifact known for a job (cached + missing)."""
+    from jobs import exports_store
+
+    try:
+        rows = exports_store.list_exports(job_id)
+    except Exception:
+        rows = []
+    # Always advertise all 5 supported formats so the UI can render every button.
+    by_type = {r.get("export_type"): r for r in rows if isinstance(r, dict)}
+    out = []
+    for fmt in _EXPORT_FORMATS:
+        row = by_type.get(fmt) or {}
+        out.append(
+            {
+                "format": fmt,
+                "status": row.get("status") or "on_demand",
+                "size_bytes": row.get("size_bytes") or 0,
+                "file_name": row.get("file_name"),
+                "mime_type": row.get("mime_type"),
+                "download_count": row.get("download_count") or 0,
+                "created_at": row.get("created_at"),
+                "updated_at": row.get("updated_at"),
+                "url": f"/exports/{job_id}/{fmt}",
+            }
+        )
+    return {"success": True, "job_id": job_id, "exports": out}
+
+
+@app.post("/exports/{job_id}/regenerate")
+def regenerate_exports(job_id: str):
+    """Force a fresh regeneration of all export artifacts for a job.
+
+    Useful when a previous auto-generation failed or the user wants the
+    latest data after a re-scan.
+    """
+    from jobs.exports_service import generate_all_exports
+
+    try:
+        outcome = generate_all_exports(job_id)
+        return {"success": True, "job_id": job_id, "outcome": outcome}
+    except Exception as exc:
+        return _export_error_response(exc)
+
+
+@app.get("/exports/{job_id}/{fmt}")
+def download_export(job_id: str, fmt: str):
+    """Stream the requested export. Always works (cache or on-demand)."""
+    return _stream_export(job_id, fmt.lower())
