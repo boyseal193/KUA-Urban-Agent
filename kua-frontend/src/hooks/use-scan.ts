@@ -3,6 +3,7 @@
 import * as React from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { jobsApi } from "@/lib/api/jobs";
+import { ApiError } from "@/lib/api/client";
 import { dealKeys } from "./use-deals";
 import type {
   AnalysisResult,
@@ -127,7 +128,12 @@ export function useAutoScan() {
     isPending: startMutation.isPending || (Boolean(jobId) && !TERMINAL.includes(jobQuery.data?.job.status as ScanJobStatus)),
     isLoading: startMutation.isPending,
     isPolling: Boolean(jobId) && !TERMINAL.includes(jobQuery.data?.job.status as ScanJobStatus),
-    error: startMutation.error ?? (jobQuery.data?.job.status === "failed" ? new Error(jobQuery.data.job.error_message ?? "Scan failed") : null),
+    error:
+      startMutation.error instanceof ApiError
+        ? startMutation.error
+        : jobQuery.data?.job.status === "failed"
+        ? new Error(jobQuery.data.job.error_message ?? "Scan failed")
+        : startMutation.error ?? null,
     data: summary,
     job: jobQuery.data?.job ?? null,
     jobId,

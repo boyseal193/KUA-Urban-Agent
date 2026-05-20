@@ -3,6 +3,7 @@ import re
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from kua_auth import router as auth_router
 from database import supabase
@@ -372,6 +373,32 @@ def split_scan_results(results: list):
     }
 
 
+def _setup_error_response(exc) -> JSONResponse:
+    from jobs.errors import DatabaseSetupError
+
+    if isinstance(exc, DatabaseSetupError):
+        return JSONResponse(
+            status_code=503,
+            content={
+                "success": False,
+                "error_type": "DatabaseSetupError",
+                "message": str(exc),
+                "missing_tables": exc.missing_tables,
+                "retryable": False,
+                "setup_required": True,
+            },
+        )
+    return JSONResponse(
+        status_code=500,
+        content={
+            "success": False,
+            "error_type": type(exc).__name__,
+            "message": str(exc),
+            "retryable": False,
+        },
+    )
+
+
 def _enqueue_scan_job(
     *,
     job_type: str,
@@ -380,18 +407,33 @@ def _enqueue_scan_job(
     limit: int,
     generate_excel: bool,
     created_by: str | None = None,
-) -> dict:
+):
     """Create an async scan job and return immediately with job_id."""
     from jobs import store
+    from jobs.errors import DatabaseSetupError, StoreError
 
-    job = store.create_job(
-        job_type=job_type,
-        search_url=search_url,
-        filters=filters,
-        listing_limit=limit,
-        generate_excel=generate_excel,
-        created_by=created_by,
-    )
+    try:
+        job = store.create_job(
+            job_type=job_type,
+            search_url=search_url,
+            filters=filters,
+            listing_limit=limit,
+            generate_excel=generate_excel,
+            created_by=created_by,
+        )
+    except DatabaseSetupError as exc:
+        return _setup_error_response(exc)
+    except StoreError as exc:
+        return JSONResponse(
+            status_code=502,
+            content={
+                "success": False,
+                "error_type": "StoreError",
+                "message": str(exc),
+                "retryable": exc.retryable,
+            },
+        )
+
     return {
         "success": True,
         "async": True,
@@ -650,25 +692,45 @@ def health_full():
     return full_health()
 
 
+@app.get("/health/database")
+def health_database():
+    from jobs.db_health import database_health
+    result = database_health(force=True)
+    status_code = 200 if result.get("success") else 503
+    return JSONResponse(status_code=status_code, content=result)
+
+
 @app.get("/jobs")
 def list_scan_jobs(limit: int = 20):
     from jobs import store
-    jobs = store.list_jobs(limit=limit)
-    return {"success": True, "jobs": jobs}
+    from jobs.errors import DatabaseSetupError
+
+    try:
+        jobs = store.list_jobs(limit=limit)
+        return {"success": True, "jobs": jobs}
+    except DatabaseSetupError as exc:
+        return _setup_error_response(exc)
 
 
 @app.get("/jobs/{job_id}")
 def get_scan_job(job_id: str):
     from jobs import store
+    from jobs.errors import DatabaseSetupError
+
     try:
         return store.build_job_response(job_id)
+    except DatabaseSetupError as exc:
+        return _setup_error_response(exc)
     except KeyError:
-        return {
-            "success": False,
-            "error_type": "NotFound",
-            "message": f"Job not found: {job_id}",
-            "retryable": False,
-        }
+        return JSONResponse(
+            status_code=404,
+            content={
+                "success": False,
+                "error_type": "NotFound",
+                "message": f"Job not found: {job_id}",
+                "retryable": False,
+            },
+        )
 
 
 @app.post("/jobs/{job_id}/cancel")

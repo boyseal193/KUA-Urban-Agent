@@ -3,24 +3,9 @@
 from __future__ import annotations
 
 import os
-import time
 from typing import Any, Dict
 
-import requests
-
-
-def check_supabase() -> Dict[str, Any]:
-    started = time.monotonic()
-    try:
-        from database import supabase
-        res = supabase.table("scan_jobs").select("id").limit(1).execute()
-        return {
-            "ok": True,
-            "latency_ms": int((time.monotonic() - started) * 1000),
-            "sample": bool(res.data is not None),
-        }
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)}
+from jobs.db_health import database_health
 
 
 def check_openai() -> Dict[str, Any]:
@@ -44,27 +29,17 @@ def check_scraper() -> Dict[str, Any]:
     return {"ok": True, "configured": True}
 
 
-def check_backend_reachable(url: str) -> Dict[str, Any]:
-    started = time.monotonic()
-    try:
-        r = requests.get(url.rstrip("/") + "/", timeout=10)
-        return {
-            "ok": r.status_code < 500,
-            "status": r.status_code,
-            "latency_ms": int((time.monotonic() - started) * 1000),
-        }
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)}
-
-
 def full_health() -> Dict[str, Any]:
+    db = database_health(force=True)
+    checks = {
+        "database": db,
+        "openai": check_openai(),
+        "anthropic": check_anthropic(),
+        "scraper": check_scraper(),
+    }
+    all_ok = db.get("success") and all(c.get("ok") for c in checks.values() if c is not db)
     return {
-        "ok": True,
+        "ok": all_ok,
         "service": "kua-backend",
-        "checks": {
-            "supabase": check_supabase(),
-            "openai": check_openai(),
-            "anthropic": check_anthropic(),
-            "scraper": check_scraper(),
-        },
+        "checks": checks,
     }

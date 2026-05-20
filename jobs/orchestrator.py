@@ -46,6 +46,8 @@ def _run_with_retry(
     listing_url: Optional[str] = None,
     max_attempts: int = 3,
 ) -> Any:
+    if listing_index is None:
+        listing_index = store.JOB_LEVEL_INDEX
     log = get_logger(job_id, step_key)
     last_exc: Optional[Exception] = None
 
@@ -77,6 +79,7 @@ def _run_with_retry(
                 status=STEP_FAILED,
                 error_type=error_type,
                 error_message=str(exc),
+                traceback=tb,
                 retryable=retryable,
                 duration_ms=duration_ms,
             )

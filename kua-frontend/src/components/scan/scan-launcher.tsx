@@ -16,6 +16,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 
 import { useAutoScan } from "@/hooks/use-scan";
 import { PROPERTY_TYPES } from "@/lib/constants";
+import { ApiError } from "@/lib/api/client";
 import { ScanProgress } from "./scan-progress";
 import type { AutoScanFilters } from "@/lib/api/types";
 
@@ -75,8 +76,16 @@ export function ScanLauncher({ onLiveResults, onSummary }: ScanLauncherProps) {
         description: "Pipeline running in background — live updates below.",
       });
     } catch (e: unknown) {
-      const message = e instanceof Error ? e.message : "Unknown error";
-      toast.error("Failed to start scan", { description: message });
+      const message =
+        e instanceof ApiError
+          ? e.message
+          : e instanceof Error
+          ? e.message
+          : "Unknown error";
+      toast.error("Failed to start scan", {
+        description: message,
+        duration: e instanceof ApiError && e.setupRequired ? 12000 : 5000,
+      });
     }
   };
 

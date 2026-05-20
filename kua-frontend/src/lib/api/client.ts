@@ -6,12 +6,6 @@
  *   1. Validates the session cookie via `getSession()`
  *   2. Forwards the request to `BACKEND_API_URL` (server-only env var)
  *   3. Returns the JSON / stream back to the browser
- *
- * This means:
- *   • the backend URL is never leaked to the browser
- *   • CORS becomes a non-issue
- *   • the same auth model works whether FastAPI lives on Render, Railway,
- *     Fly, a private VPC, or right next door on the same host
  */
 
 export type FetchOptions = Omit<RequestInit, "body"> & {
@@ -20,15 +14,33 @@ export type FetchOptions = Omit<RequestInit, "body"> & {
   signal?: AbortSignal;
 };
 
+export interface ApiErrorPayload {
+  success?: boolean;
+  error_type?: string;
+  message?: string;
+  error?: string;
+  missing_tables?: string[];
+  setup_required?: boolean;
+  retryable?: boolean;
+}
+
 export class ApiError extends Error {
   status: number;
-  payload: unknown;
+  payload: ApiErrorPayload | null;
+  errorType?: string;
+  missingTables?: string[];
+  setupRequired: boolean;
+  retryable: boolean;
 
-  constructor(message: string, status: number, payload?: unknown) {
+  constructor(message: string, status: number, payload?: ApiErrorPayload | null) {
     super(message);
     this.name = "ApiError";
     this.status = status;
-    this.payload = payload;
+    this.payload = payload ?? null;
+    this.errorType = payload?.error_type;
+    this.missingTables = payload?.missing_tables;
+    this.setupRequired = Boolean(payload?.setup_required);
+    this.retryable = Boolean(payload?.retryable);
   }
 }
 
@@ -43,10 +55,33 @@ function buildQuery(query?: FetchOptions["query"]) {
   return str ? `?${str}` : "";
 }
 
-/**
- * Public client used inside React components and hooks.
- * Hits the Next.js proxy at `/api/proxy/*` which then talks to FastAPI.
- */
+export function formatApiErrorMessage(
+  data: ApiErrorPayload | null,
+  status: number,
+  fallback = "Request failed"
+): string {
+  if (data?.error_type === "DatabaseSetupError") {
+    const tables = data.missing_tables?.length
+      ? data.missing_tables.join(", ")
+      : "scan_jobs";
+    return `Database setup incomplete: missing ${tables} table(s). Run jobs/schema.sql in Supabase SQL Editor.`;
+  }
+
+  if (typeof data?.message === "string" && data.message.trim()) {
+    return data.message;
+  }
+
+  if (typeof data?.error === "string" && data.error.trim()) {
+    return data.error;
+  }
+
+  if (status === 503) {
+    return "Backend service unavailable. Check database setup and worker deployment.";
+  }
+
+  return fallback;
+}
+
 export async function api<T = unknown>(
   path: string,
   opts: FetchOptions = {}
@@ -71,22 +106,17 @@ export async function api<T = unknown>(
 
   const text = await res.text();
   const data = text ? safeJson(text) : null;
+  const payload =
+    data && typeof data === "object" ? (data as ApiErrorPayload) : null;
 
   if (!res.ok) {
-    const message =
-      (data && typeof data === "object" && "error" in (data as any)
-        ? String((data as any).error)
-        : null) ?? res.statusText;
-    throw new ApiError(message || "Request failed", res.status, data);
+    const message = formatApiErrorMessage(payload, res.status, res.statusText);
+    throw new ApiError(message, res.status, payload);
   }
 
   return data as T;
 }
 
-/**
- * Server-only fetch used inside Route Handlers / Server Components.
- * Talks directly to the FastAPI backend over the private network.
- */
 export async function serverApi<T = unknown>(
   path: string,
   opts: FetchOptions = {}
@@ -118,13 +148,16 @@ export async function serverApi<T = unknown>(
 
   const text = await res.text();
   const data = text ? safeJson(text) : null;
+  const payload =
+    data && typeof data === "object" ? (data as ApiErrorPayload) : null;
 
   if (!res.ok) {
-    throw new ApiError(
-      `Backend responded ${res.status}`,
+    const message = formatApiErrorMessage(
+      payload,
       res.status,
-      data
+      `Backend responded ${res.status}`
     );
+    throw new ApiError(message, res.status, payload);
   }
 
   return data as T;
