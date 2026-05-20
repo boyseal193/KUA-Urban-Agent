@@ -27,7 +27,7 @@ def get_users():
     return [
         {
             "username": os.getenv("AUTH_USERNAME", "admin"),
-            "password": os.getenv("AUTH_PASSWORD", "admin"),
+            "password": os.getenv("AUTH_PASSWORD", "KUA2026secure"),
         }
     ]
 

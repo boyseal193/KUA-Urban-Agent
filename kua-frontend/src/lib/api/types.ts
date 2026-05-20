@@ -180,6 +180,123 @@ export interface AutoScanFilters {
   generate_excel?: boolean;
 }
 
+/** POST /scan/idealista/auto — async job started */
+export interface ScanJobStarted {
+  success: boolean;
+  async: boolean;
+  job_id: string;
+  status: string;
+  message: string;
+  poll_url: string;
+}
+
+export type ScanJobStatus =
+  | "pending"
+  | "queued"
+  | "running"
+  | "retrying"
+  | "success"
+  | "failed"
+  | "cancelled"
+  | "timeout";
+
+export type ScanStepStatus =
+  | "pending"
+  | "running"
+  | "success"
+  | "failed"
+  | "skipped"
+  | "retrying";
+
+export interface ScanJobRecord {
+  id: string;
+  job_type: string;
+  status: ScanJobStatus;
+  created_by?: string | null;
+  search_url?: string | null;
+  filters?: Record<string, unknown>;
+  listing_limit: number;
+  generate_excel: boolean;
+  progress_pct: number;
+  current_step?: string | null;
+  listings_total: number;
+  listings_done: number;
+  listings_failed: number;
+  approved_count: number;
+  manual_review_count: number;
+  rejected_count: number;
+  excel_path?: string | null;
+  error_message?: string | null;
+  retry_count: number;
+  started_at?: string | null;
+  finished_at?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ScanStepRecord {
+  id: string;
+  job_id: string;
+  listing_index?: number | null;
+  listing_url?: string | null;
+  step_key: string;
+  step_order: number;
+  status: ScanStepStatus;
+  attempt: number;
+  max_attempts: number;
+  error_type?: string | null;
+  error_message?: string | null;
+  retryable: boolean;
+  duration_ms?: number | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+}
+
+export interface ScanLogRecord {
+  id: string;
+  job_id: string;
+  level: string;
+  message: string;
+  context?: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface ScanErrorRecord {
+  id: string;
+  job_id: string;
+  error_type: string;
+  message: string;
+  traceback?: string | null;
+  retryable: boolean;
+  attempt: number;
+  listing_url?: string | null;
+  created_at: string;
+}
+
+export interface ScanListingResult {
+  id: string;
+  job_id: string;
+  listing_index: number;
+  listing_url?: string | null;
+  status: string;
+  property_id?: string | null;
+  deal_status?: string | null;
+  score?: number | null;
+  verdict?: string | null;
+  result?: AnalysisResult | null;
+  error_message?: string | null;
+}
+
+export interface ScanJobResponse {
+  success: boolean;
+  job: ScanJobRecord;
+  steps: ScanStepRecord[];
+  listings: ScanListingResult[];
+  logs: ScanLogRecord[];
+  errors: ScanErrorRecord[];
+  summary: ScanResponse;
+}
+
 /** Auth */
 export interface AuthSessionUser {
   username: string;

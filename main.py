@@ -372,87 +372,71 @@ def split_scan_results(results: list):
     }
 
 
+def _enqueue_scan_job(
+    *,
+    job_type: str,
+    search_url: str,
+    filters: dict,
+    limit: int,
+    generate_excel: bool,
+    created_by: str | None = None,
+) -> dict:
+    """Create an async scan job and return immediately with job_id."""
+    from jobs import store
+
+    job = store.create_job(
+        job_type=job_type,
+        search_url=search_url,
+        filters=filters,
+        listing_limit=limit,
+        generate_excel=generate_excel,
+        created_by=created_by,
+    )
+    return {
+        "success": True,
+        "async": True,
+        "job_id": job["id"],
+        "status": job["status"],
+        "message": "Scan job queued. Poll GET /jobs/{job_id} for live progress.",
+        "poll_url": f"/jobs/{job['id']}",
+    }
+
+
 @app.post("/scan/idealista")
 def scan_idealista(payload: dict):
+    """
+    Enqueue an Idealista batch scan. Returns job_id immediately.
+    Long-running work is processed by the background worker.
+    """
     search_url = payload.get("search_url")
     limit = int(payload.get("limit", 10))
     generate_excel = payload.get("generate_excel", True)
     filters_used = payload.get("filters_used", payload)
+    created_by = payload.get("created_by")
 
     if not search_url:
-        return {"success": False, "error": "search_url is required"}
+        return {
+            "success": False,
+            "error_type": "ValidationError",
+            "message": "search_url is required",
+            "retryable": False,
+        }
 
-    scraped_urls = scrape_idealista_search_urls(search_url, limit=limit)
-
-    if not scraped_urls.get("success"):
-        return scraped_urls
-
-    results = []
-
-    for url in scraped_urls.get("urls", []):
-        try:
-            result = analyse({"url": url})
-
-            if isinstance(result, dict):
-                result["source_url"] = url
-
-            results.append(result)
-
-        except Exception as e:
-            results.append({
-                "url": url,
-                "success": False,
-                "error": str(e),
-            })
-
-    grouped = split_scan_results(results)
-
-    response = {
-        "success": True,
-        "search_url_used": search_url,
-        "scanned_count": len(results),
-
-        "approved_candidates_count": len(grouped["approved_candidates"]),
-        "manual_review_count": len(grouped["manual_review_deals"]),
-        "top_deals_count": len(grouped["top_deals"]),
-        "rejected_count": len(grouped["rejected_history"]),
-
-        "approved_candidates": grouped["approved_candidates"],
-        "manual_review_deals": grouped["manual_review_deals"],
-        "top_deals": grouped["top_deals"],
-        "rejected_history": grouped["rejected_history"],
-        "all_results": results,
-
-        "excel_export_generated": False,
-        "filters_used": filters_used,
-    }
-
-    if generate_excel:
-        try:
-            excel_path = export_scan_to_excel(
-                results=grouped["successful_results"],
-                search_url=search_url,
-                filters_used=filters_used,
-            )
-            response["excel_export_generated"] = True
-            response["excel_export_path"] = excel_path
-        except TypeError:
-            try:
-                excel_path = export_scan_to_excel(grouped["successful_results"])
-                response["excel_export_generated"] = True
-                response["excel_export_path"] = excel_path
-            except Exception as e:
-                response["excel_export_generated"] = False
-                response["excel_export_error"] = str(e)
-        except Exception as e:
-            response["excel_export_generated"] = False
-            response["excel_export_error"] = str(e)
-
-    return response
+    return _enqueue_scan_job(
+        job_type="idealista_url",
+        search_url=search_url,
+        filters=filters_used if isinstance(filters_used, dict) else {},
+        limit=limit,
+        generate_excel=bool(generate_excel),
+        created_by=created_by,
+    )
 
 
 @app.post("/scan/idealista/auto")
 def scan_idealista_auto(payload: dict):
+    """
+    Enqueue an auto-filter Idealista scan. Returns job_id immediately.
+    """
     city_slug = payload.get("city_slug", "barcelona-barcelona")
     max_price = int(payload.get("max_price", 1000000))
     min_m2 = int(payload.get("min_m2", 200))
@@ -462,26 +446,22 @@ def scan_idealista_auto(payload: dict):
     sale_only = payload.get("sale_only", True)
     limit = int(payload.get("limit", 10))
     generate_excel = payload.get("generate_excel", True)
+    created_by = payload.get("created_by")
 
     filter_parts = [
         f"con-precio-hasta_{max_price}",
         f"metros-cuadrados-mas-de_{min_m2}",
         f"metros-cuadrados-menos-de_{max_m2}",
     ]
-
     filter_parts.extend(property_types)
-
     if ground_floor_only:
         filter_parts.append("en-planta-calle")
-
     if sale_only:
         filter_parts.append("venta-solo-inmueble")
 
-    filters_string = ",".join(filter_parts)
-
     search_url = (
         f"https://www.idealista.com/en/venta-locales/"
-        f"{city_slug}/{filters_string}/"
+        f"{city_slug}/{','.join(filter_parts)}/"
     )
 
     filters_used = {
@@ -495,12 +475,14 @@ def scan_idealista_auto(payload: dict):
         "limit": limit,
     }
 
-    return scan_idealista({
-        "search_url": search_url,
-        "limit": limit,
-        "generate_excel": generate_excel,
-        "filters_used": filters_used,
-    })
+    return _enqueue_scan_job(
+        job_type="idealista_auto",
+        search_url=search_url,
+        filters=filters_used,
+        limit=limit,
+        generate_excel=bool(generate_excel),
+        created_by=created_by,
+    )
 
 
 @app.post("/property/from-url")
@@ -656,3 +638,56 @@ def generate_memo(property_id: str):
         "property_id": property_id,
         "ic_memo": memo_text,
     }
+
+
+# =============================================================================
+# Async job API — poll these endpoints from the frontend
+# =============================================================================
+
+@app.get("/health/full")
+def health_full():
+    from jobs.health import full_health
+    return full_health()
+
+
+@app.get("/jobs")
+def list_scan_jobs(limit: int = 20):
+    from jobs import store
+    jobs = store.list_jobs(limit=limit)
+    return {"success": True, "jobs": jobs}
+
+
+@app.get("/jobs/{job_id}")
+def get_scan_job(job_id: str):
+    from jobs import store
+    try:
+        return store.build_job_response(job_id)
+    except KeyError:
+        return {
+            "success": False,
+            "error_type": "NotFound",
+            "message": f"Job not found: {job_id}",
+            "retryable": False,
+        }
+
+
+@app.post("/jobs/{job_id}/cancel")
+def cancel_scan_job(job_id: str):
+    from jobs import store
+    from jobs.constants import JOB_CANCELLED
+
+    try:
+        job = store.get_job(job_id)
+    except KeyError:
+        return {
+            "success": False,
+            "error_type": "NotFound",
+            "message": f"Job not found: {job_id}",
+            "retryable": False,
+        }
+
+    if job.get("status") in ("success", "failed", "cancelled"):
+        return {"success": True, "job": job, "message": "Job already terminal"}
+
+    updated = store.update_job(job_id, status=JOB_CANCELLED, finished_at=store._now())
+    return {"success": True, "job": updated}
