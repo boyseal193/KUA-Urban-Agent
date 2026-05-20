@@ -18,7 +18,7 @@ import { useAutoScan } from "@/hooks/use-scan";
 import { PROPERTY_TYPES } from "@/lib/constants";
 import { ApiError } from "@/lib/api/client";
 import { ScanProgress } from "./scan-progress";
-import type { AutoScanFilters } from "@/lib/api/types";
+import type { AnalysisResult, AutoScanFilters, ScanResponse } from "@/lib/api/types";
 
 const schema = z.object({
   city_slug: z.string().default("barcelona-barcelona"),
@@ -47,8 +47,8 @@ const defaults: FormValues = {
 };
 
 interface ScanLauncherProps {
-  onLiveResults?: (results: ReturnType<typeof useAutoScan>["liveResults"]) => void;
-  onSummary?: (summary: ReturnType<typeof useAutoScan>["data"]) => void;
+  onLiveResults?: (results: AnalysisResult[]) => void;
+  onSummary?: (summary: ScanResponse | null) => void;
 }
 
 export function ScanLauncher({ onLiveResults, onSummary }: ScanLauncherProps) {
@@ -60,12 +60,22 @@ export function ScanLauncher({ onLiveResults, onSummary }: ScanLauncherProps) {
 
   const values = watch();
 
+  // Track last-emitted reference so we don't fire identity-equal setStates.
+  const lastResultsRef = React.useRef<AnalysisResult[] | null>(null);
   React.useEffect(() => {
-    onLiveResults?.(scan.liveResults);
+    if (!onLiveResults) return;
+    if (scan.liveResults === lastResultsRef.current) return;
+    lastResultsRef.current = scan.liveResults;
+    onLiveResults(scan.liveResults);
   }, [scan.liveResults, onLiveResults]);
 
+  const lastSummaryRef = React.useRef<ScanResponse | null>(null);
   React.useEffect(() => {
-    if (scan.data) onSummary?.(scan.data);
+    if (!onSummary) return;
+    const next = (scan.data as ScanResponse | null) ?? null;
+    if (next === lastSummaryRef.current) return;
+    lastSummaryRef.current = next;
+    onSummary(next);
   }, [scan.data, onSummary]);
 
   const onSubmit = async (v: FormValues) => {
@@ -84,10 +94,25 @@ export function ScanLauncher({ onLiveResults, onSummary }: ScanLauncherProps) {
           : "Unknown error";
       toast.error("Failed to start scan", {
         description: message,
-        duration: e instanceof ApiError && e.setupRequired ? 12000 : 5000,
+        duration: e instanceof ApiError && e.setupRequired ? 12_000 : 5_000,
       });
     }
   };
+
+  const handleRetry = React.useCallback(async () => {
+    try {
+      await scan.retry();
+      toast.success("Scan re-queued", { description: "Worker will pick it up shortly." });
+    } catch (e: unknown) {
+      const message =
+        e instanceof ApiError
+          ? e.message
+          : e instanceof Error
+          ? e.message
+          : "Retry failed";
+      toast.error("Retry failed", { description: message });
+    }
+  }, [scan]);
 
   return (
     <div className="grid gap-4 lg:grid-cols-[1fr_360px]">
@@ -113,7 +138,11 @@ export function ScanLauncher({ onLiveResults, onSummary }: ScanLauncherProps) {
 
         <div className="grid grid-cols-1 gap-5 md:grid-cols-2">
           <Field label="City slug">
-            <Input {...register("city_slug")} placeholder="barcelona-barcelona" className="font-mono" />
+            <Input
+              {...register("city_slug")}
+              placeholder="barcelona-barcelona"
+              className="font-mono"
+            />
           </Field>
 
           <Field label={`Limit · ${values.limit}`}>
@@ -121,22 +150,38 @@ export function ScanLauncher({ onLiveResults, onSummary }: ScanLauncherProps) {
               control={control}
               name="limit"
               render={({ field }) => (
-                <Slider min={1} max={50} step={1} value={[field.value]} onValueChange={(v) => field.onChange(v[0])} />
+                <Slider
+                  min={1}
+                  max={50}
+                  step={1}
+                  value={[field.value]}
+                  onValueChange={(v) => field.onChange(v[0])}
+                />
               )}
             />
           </Field>
 
-          <Field label={`Max price · €${values.max_price.toLocaleString("en-EU")}`}>
+          <Field
+            label={`Max price · €${values.max_price.toLocaleString("en-EU")}`}
+          >
             <Controller
               control={control}
               name="max_price"
               render={({ field }) => (
-                <Slider min={100_000} max={5_000_000} step={50_000} value={[field.value]} onValueChange={(v) => field.onChange(v[0])} />
+                <Slider
+                  min={100_000}
+                  max={5_000_000}
+                  step={50_000}
+                  value={[field.value]}
+                  onValueChange={(v) => field.onChange(v[0])}
+                />
               )}
             />
           </Field>
 
-          <Field label={`GBA range · ${values.min_m2} – ${values.max_m2} m²`}>
+          <Field
+            label={`GBA range · ${values.min_m2} – ${values.max_m2} m²`}
+          >
             <Controller
               control={control}
               name="min_m2"
@@ -195,20 +240,38 @@ export function ScanLauncher({ onLiveResults, onSummary }: ScanLauncherProps) {
 
           <div className="space-y-3">
             <Field label="Constraints" />
-            <ToggleRow label="Ground floor only" hint="Eliminates upper-floor logistics overhead">
-              <Controller control={control} name="ground_floor_only" render={({ field }) => (
-                <Switch checked={field.value} onCheckedChange={field.onChange} />
-              )} />
+            <ToggleRow
+              label="Ground floor only"
+              hint="Eliminates upper-floor logistics overhead"
+            >
+              <Controller
+                control={control}
+                name="ground_floor_only"
+                render={({ field }) => (
+                  <Switch checked={field.value} onCheckedChange={field.onChange} />
+                )}
+              />
             </ToggleRow>
             <ToggleRow label="Sale only" hint="Exclude lease/rent-only listings">
-              <Controller control={control} name="sale_only" render={({ field }) => (
-                <Switch checked={field.value} onCheckedChange={field.onChange} />
-              )} />
+              <Controller
+                control={control}
+                name="sale_only"
+                render={({ field }) => (
+                  <Switch checked={field.value} onCheckedChange={field.onChange} />
+                )}
+              />
             </ToggleRow>
-            <ToggleRow label="Generate Excel" hint="Auto-export full underwriting workbook">
-              <Controller control={control} name="generate_excel" render={({ field }) => (
-                <Switch checked={field.value} onCheckedChange={field.onChange} />
-              )} />
+            <ToggleRow
+              label="Generate Excel"
+              hint="Auto-export full underwriting workbook"
+            >
+              <Controller
+                control={control}
+                name="generate_excel"
+                render={({ field }) => (
+                  <Switch checked={field.value} onCheckedChange={field.onChange} />
+                )}
+              />
             </ToggleRow>
           </div>
         </div>
@@ -243,8 +306,10 @@ export function ScanLauncher({ onLiveResults, onSummary }: ScanLauncherProps) {
           errors={scan.errors}
           scannedCount={scan.data?.scanned_count}
           approvedCount={scan.data?.approved_candidates_count}
-          error={scan.error?.message}
+          error={scan.error?.message ?? null}
           onCancel={scan.cancel}
+          onRetry={handleRetry}
+          onReset={scan.reset}
           isPolling={scan.isPolling}
         />
       </div>
@@ -252,7 +317,13 @@ export function ScanLauncher({ onLiveResults, onSummary }: ScanLauncherProps) {
   );
 }
 
-function Field({ label, children }: { label: React.ReactNode; children?: React.ReactNode }) {
+function Field({
+  label,
+  children,
+}: {
+  label: React.ReactNode;
+  children?: React.ReactNode;
+}) {
   return (
     <div className="space-y-2">
       <Label>{label}</Label>
@@ -261,7 +332,15 @@ function Field({ label, children }: { label: React.ReactNode; children?: React.R
   );
 }
 
-function ToggleRow({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
+function ToggleRow({
+  label,
+  hint,
+  children,
+}: {
+  label: string;
+  hint?: string;
+  children: React.ReactNode;
+}) {
   return (
     <div className="flex items-center justify-between rounded-md border border-border/60 bg-card/30 px-3 py-2">
       <div className="space-y-0.5">

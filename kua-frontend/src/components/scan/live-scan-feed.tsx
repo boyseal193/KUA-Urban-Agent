@@ -15,7 +15,7 @@ import { cn } from "@/lib/utils";
 import type { AnalysisResult } from "@/lib/api/types";
 
 interface LiveScanFeedProps {
-  results: AnalysisResult[];
+  results?: AnalysisResult[] | null;
   className?: string;
   emptyHint?: string;
   title?: string;
@@ -27,9 +27,12 @@ export function LiveScanFeed({
   emptyHint = "Awaiting scan output. Launch an acquisition sweep above.",
   title = "Live Acquisition Feed",
 }: LiveScanFeedProps) {
-  const list = results
-    .filter((r) => r.property_id)
-    .slice(0, 20);
+  const list = React.useMemo(() => {
+    if (!Array.isArray(results)) return [];
+    return results
+      .filter((r): r is AnalysisResult => Boolean(r && r.property_id))
+      .slice(0, 20);
+  }, [results]);
 
   return (
     <div className={cn("panel relative overflow-hidden p-5", className)}>
@@ -52,7 +55,6 @@ export function LiveScanFeed({
         </div>
       ) : (
         <ul className="relative space-y-2">
-          {/* tracer line */}
           <span className="pointer-events-none absolute inset-y-0 left-[15px] w-px bg-gradient-to-b from-primary/40 via-primary/10 to-transparent" />
           <AnimatePresence initial>
             {list.map((r, idx) => {
@@ -78,9 +80,7 @@ export function LiveScanFeed({
                     <div className="min-w-0 flex-1 space-y-1">
                       <div className="flex flex-wrap items-center gap-1.5">
                         <DealStatusIndicator status={r.deal_status} />
-                        <Badge className={verdict.chipClass}>
-                          {verdict.label}
-                        </Badge>
+                        <Badge className={verdict.chipClass}>{verdict.label}</Badge>
                         <span className="ml-auto font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
                           {new Date().toLocaleTimeString("en-EU", {
                             hour: "2-digit",
@@ -93,9 +93,7 @@ export function LiveScanFeed({
                         href={`/deals/${r.property_id}`}
                         className="block truncate text-sm font-medium text-foreground hover:text-primary"
                       >
-                        {ex.address ||
-                          ex.neighbourhood ||
-                          "Untitled listing"}
+                        {ex.address || ex.neighbourhood || "Untitled listing"}
                       </Link>
                       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
                         <span className="inline-flex items-center gap-1">

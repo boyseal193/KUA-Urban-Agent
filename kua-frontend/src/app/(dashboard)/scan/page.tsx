@@ -6,21 +6,39 @@ import { PageHeader } from "@/components/common/page-header";
 import { ScanLauncher } from "@/components/scan/scan-launcher";
 import { LiveScanFeed } from "@/components/scan/live-scan-feed";
 import { StatusPill } from "@/components/common/status-pill";
+import { ErrorBoundary } from "@/components/error-boundary";
 import type { AnalysisResult, ScanResponse } from "@/lib/api/types";
 
 export default function ScanPage() {
   const [liveResults, setLiveResults] = React.useState<AnalysisResult[]>([]);
   const [summary, setSummary] = React.useState<ScanResponse | null>(null);
 
-  const topDeals = summary?.top_deals?.length
-    ? summary.top_deals
-    : liveResults.filter(
-        (r) => r.deal_status === "approved_candidate" || r.deal_status === "manual_review"
-      );
+  // Stable callbacks — passed to a child that wraps them in useEffect.
+  // Without these, every render would create a new function reference,
+  // forcing the child's useEffect to re-run and re-emit (root cause of
+  // the historic React #185 maximum-update-depth crash).
+  const handleLiveResults = React.useCallback((r: AnalysisResult[]) => {
+    setLiveResults((prev) => (prev === r ? prev : r));
+  }, []);
+  const handleSummary = React.useCallback((s: ScanResponse | null) => {
+    setSummary((prev) => (prev === s ? prev : s));
+  }, []);
 
-  const rejected = summary?.rejected_history?.length
-    ? summary.rejected_history
-    : liveResults.filter((r) => r.deal_status === "rejected" || r.success === false);
+  const topDeals = React.useMemo(() => {
+    if (summary?.top_deals?.length) return summary.top_deals;
+    return liveResults.filter(
+      (r) =>
+        r?.deal_status === "approved_candidate" ||
+        r?.deal_status === "manual_review"
+    );
+  }, [summary, liveResults]);
+
+  const rejected = React.useMemo(() => {
+    if (summary?.rejected_history?.length) return summary.rejected_history;
+    return liveResults.filter(
+      (r) => r?.deal_status === "rejected" || r?.success === false
+    );
+  }, [summary, liveResults]);
 
   return (
     <div className="space-y-6">
@@ -31,22 +49,28 @@ export default function ScanPage() {
         rightSlot={<StatusPill label="ASYNC ENGINE" color="#38E1FF" />}
       />
 
-      <ScanLauncher
-        onLiveResults={setLiveResults}
-        onSummary={(s) => setSummary(s ?? null)}
-      />
+      <ErrorBoundary>
+        <ScanLauncher
+          onLiveResults={handleLiveResults}
+          onSummary={handleSummary}
+        />
+      </ErrorBoundary>
 
       <div className="grid gap-4 lg:grid-cols-[1.4fr_1fr]">
-        <LiveScanFeed
-          results={topDeals}
-          title="Approved + Manual Review · Live"
-          emptyHint="Run a sweep — listings appear here as each completes."
-        />
-        <LiveScanFeed
-          results={rejected}
-          title="Rejected / Failed · Live"
-          emptyHint="Failed or rejected listings surface here during the scan."
-        />
+        <ErrorBoundary>
+          <LiveScanFeed
+            results={topDeals}
+            title="Approved + Manual Review · Live"
+            emptyHint="Run a sweep — listings appear here as each completes."
+          />
+        </ErrorBoundary>
+        <ErrorBoundary>
+          <LiveScanFeed
+            results={rejected}
+            title="Rejected / Failed · Live"
+            emptyHint="Failed or rejected listings surface here during the scan."
+          />
+        </ErrorBoundary>
       </div>
 
       <div className="flex items-center gap-2 rounded-md border border-border/60 bg-card/40 px-4 py-3 backdrop-blur-xl">
@@ -55,7 +79,9 @@ export default function ScanPage() {
           {summary?.excel_export_generated ? (
             <>
               Excel underwriting workbook exported ·{" "}
-              <span className="font-mono text-foreground">{summary.excel_export_path}</span>
+              <span className="font-mono text-foreground">
+                {summary.excel_export_path}
+              </span>
             </>
           ) : (
             <>Scans run asynchronously — no frontend timeout. Worker must be deployed on Railway.</>

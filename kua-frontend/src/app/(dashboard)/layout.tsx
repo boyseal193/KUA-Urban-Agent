@@ -4,6 +4,7 @@ import { Sidebar } from "@/components/layout/sidebar";
 import { Topbar } from "@/components/layout/topbar";
 import { StatusTicker } from "@/components/layout/status-ticker";
 import { AuthGuard } from "@/components/auth/auth-guard";
+import { ErrorBoundary } from "@/components/error-boundary";
 
 /**
  * Server-rendered dashboard shell.
@@ -12,10 +13,8 @@ import { AuthGuard } from "@/components/auth/auth-guard";
  *   1. middleware.ts checks the cookie + JWT on every request (Edge runtime)
  *   2. THIS layout double-checks server-side via getSession()
  *   3. <AuthGuard> is a passive client-side render guard
- *
- * Layers 1 + 2 are independent; layer 3 only hides UI after an explicit
- * client-side logout. There is no client-side redirect anywhere in the
- * dashboard tree.
+ *   4. <ErrorBoundary> catches any client render errors so a single bad
+ *      component never white-screens the whole dashboard.
  */
 export default async function DashboardLayout({
   children,
@@ -34,7 +33,7 @@ export default async function DashboardLayout({
           <StatusTicker />
           <main className="relative flex-1 overflow-x-hidden">
             <div className="mx-auto w-full max-w-[1600px] px-4 py-6 sm:px-6 lg:px-8 lg:py-8">
-              {children}
+              <ErrorBoundary>{children}</ErrorBoundary>
             </div>
           </main>
         </div>
