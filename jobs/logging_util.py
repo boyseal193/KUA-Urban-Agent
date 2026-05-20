@@ -1,28 +1,44 @@
 """Structured logging for K.U.A. pipeline jobs.
 
-Production-safe design
-----------------------
-* The root formatter only uses fields that ALWAYS exist on a LogRecord:
-  ``%(asctime)s | %(levelname)s | %(name)s | %(message)s``
-  This means a log line emitted by a third-party library (uvicorn, httpx,
-  postgrest, supabase, urllib3, ...) can never crash the worker by missing
-  a custom field like ``%(job_id)s``.
+Production hardening — multi-layer defense
+------------------------------------------
+Even though our own formatter only references stdlib fields, third-party
+libraries (supabase, postgrest, httpx, uvicorn, …) sometimes install their
+own handlers/formatters at import time. To make the worker truly bulletproof
+against ``ValueError: Formatting field not found in record: 'job_id'`` (and
+every other variant), we apply **five** layers of defense:
 
-* :class:`JobLogAdapter` prepends ``[job=X step=Y]`` to the message text
-  itself, so we keep the contextual prefix without depending on custom
-  formatter fields. The same context is still attached to the LogRecord
-  via ``extra=`` so downstream handlers (Datadog, JSON shippers, etc.)
-  can still read it.
+1. **Universal formatter** — our handlers use a formatter that references
+   only stdlib LogRecord fields::
 
-* :class:`_SafeDefaultsFilter` injects safe defaults for any custom field
-  a future operator might add to ``LOG_FORMAT`` via env override. This is
-  belt-and-suspenders: even if someone reintroduces ``%(job_id)s`` later,
-  the worker still does not crash.
+       "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 
-* ``logging.raiseExceptions = False`` guarantees that even if a brand new
-  formatter mistake slips in, Python's logging module will swallow the
-  error instead of propagating it up the call stack and killing the
-  worker loop.
+2. **Safe LogRecord factory** — :func:`logging.setLogRecordFactory` installs
+   a factory that injects safe default values for *every* custom field
+   anyone might reference (``job_id``, ``step_key``, ``scan_id``,
+   ``worker_id``, ``request_id``, ``user_id``, ``trace_id``,
+   ``correlation_id``). This means **every** LogRecord — including ones
+   created by third-party libraries — already carries those attributes.
+
+3. **SafeFormatter subclass** — any handler whose formatter we control is
+   wrapped in :class:`SafeFormatter`, which catches any ``KeyError`` /
+   ``ValueError`` / ``TypeError`` raised during formatting and falls back
+   to a minimal safe representation. A bug in ANY formatter string cannot
+   crash the worker.
+
+4. **Aggressive handler sweep** — :func:`configure_logging` walks every
+   existing logger in ``logging.Logger.manager.loggerDict``, removes any
+   pre-existing handlers, and wraps every remaining formatter on every
+   handler in :class:`SafeFormatter`.
+
+5. **``logging.raiseExceptions = False``** — final belt-and-suspenders so
+   that even if some new code path bypasses every other guard, the stdlib
+   logging module will swallow formatter errors instead of propagating
+   them up the call stack and killing the worker.
+
+:class:`JobLogAdapter` still prepends ``[job=X step=Y]`` to the message
+text itself, so the contextual prefix appears in logs without depending on
+formatter custom fields.
 """
 
 from __future__ import annotations
@@ -35,89 +51,251 @@ import traceback
 from datetime import datetime, timezone
 from typing import Any
 
-# Universal, crash-proof formatter. Only references fields guaranteed by
-# the stdlib LogRecord. Override with $LOG_FORMAT only if you know what
-# you're doing — and even then the SafeDefaultsFilter below protects us.
+# ---------------------------------------------------------------------------
+# Formatter & safe defaults
+# ---------------------------------------------------------------------------
 DEFAULT_LOG_FORMAT = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 LOG_FORMAT = os.getenv("LOG_FORMAT", DEFAULT_LOG_FORMAT)
 
-# Fields that legacy/future formatters might reference. We pre-populate
-# every LogRecord with these defaults so formatting can never KeyError.
-_SAFE_DEFAULTS = {
+# Fields the SafeFormatter injects right before formatting, as a final
+# safety net for records that somehow bypassed every earlier guard. This
+# is the full superset of custom fields any formatter might reference.
+_FORMATTER_DEFAULTS = {
     "job_id": "-",
     "step_key": "-",
     "scan_id": "-",
     "worker_id": "-",
     "request_id": "-",
+    "user_id": "-",
+    "trace_id": "-",
+    "correlation_id": "-",
 }
 
+# Fields the global LogRecord factory injects on every record at creation
+# time. We must NOT include ``job_id`` or ``step_key`` here, because the
+# stdlib :meth:`Logger.makeRecord` raises ``KeyError`` if an ``extra``
+# argument tries to overwrite a key that already exists on the record. Our
+# :class:`JobLogAdapter` passes ``job_id``/``step_key`` via ``extra=``, so
+# pre-populating them on the factory would crash the adapter.
+#
+# The SafeFormatter below still injects ``job_id``/``step_key`` at format
+# time as a default, so third-party records (which never go through the
+# adapter and never set ``extra={"job_id": ...}``) still cannot crash any
+# formatter that references those fields.
+_FACTORY_DEFAULTS = {
+    k: v
+    for k, v in _FORMATTER_DEFAULTS.items()
+    if k not in ("job_id", "step_key")
+}
+
+# Back-compat alias.
+_SAFE_DEFAULTS = _FORMATTER_DEFAULTS
+
 _configured = False
+_record_factory_installed = False
 
 
-class _SafeDefaultsFilter(logging.Filter):
-    """Inject default values for any custom extras a formatter may reference.
+class SafeFormatter(logging.Formatter):
+    """A :class:`logging.Formatter` that can never raise.
 
-    This is defense-in-depth. Our default formatter does not reference any
-    of these fields, but if someone overrides ``$LOG_FORMAT`` (or attaches
-    a custom handler with an unsafe formatter), this filter guarantees the
-    fields are always present on every LogRecord.
+    If the wrapped format string references a field that is not on the
+    record (or any other error occurs during formatting), we fall back to
+    a minimal representation so the record is still emitted and the
+    process keeps running.
     """
 
-    def filter(self, record: logging.LogRecord) -> bool:
-        for key, val in _SAFE_DEFAULTS.items():
+    def format(self, record: logging.LogRecord) -> str:
+        # Inject the full superset of defaults right before formatting —
+        # final safety net for records that bypassed every earlier guard,
+        # including records that did NOT go through JobLogAdapter (and
+        # therefore never had ``job_id`` / ``step_key`` set via extra=).
+        for key, val in _FORMATTER_DEFAULTS.items():
             if not hasattr(record, key):
-                setattr(record, key, val)
-        return True
+                try:
+                    setattr(record, key, val)
+                except Exception:
+                    pass
+        try:
+            return super().format(record)
+        except (KeyError, ValueError, TypeError, AttributeError):
+            try:
+                ts = self.formatTime(record, self.datefmt)
+                msg = record.getMessage()
+            except Exception:
+                ts = "-"
+                msg = str(getattr(record, "msg", ""))
+            return f"{ts} | {record.levelname} | {record.name} | {msg}"
 
 
+def _safe_record_factory(original_factory):
+    """Wrap a LogRecord factory to inject safe defaults on every record."""
+
+    def factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
+        try:
+            record = original_factory(*args, **kwargs)
+        except Exception:
+            # If even the original factory fails, fall back to bare LogRecord.
+            record = logging.LogRecord(
+                "kua.unknown", logging.INFO, "?", 0, "logging-record-failed", None, None
+            )
+        # Only inject fields that do NOT collide with ``extra=`` keys used
+        # by JobLogAdapter (see :data:`_FACTORY_DEFAULTS` for rationale).
+        # SafeFormatter handles ``job_id`` / ``step_key`` at format time.
+        for key, val in _FACTORY_DEFAULTS.items():
+            if not hasattr(record, key):
+                try:
+                    setattr(record, key, val)
+                except Exception:
+                    pass
+        return record
+
+    return factory
+
+
+def _install_safe_log_record_factory() -> None:
+    """Globally install our safe LogRecord factory exactly once."""
+    global _record_factory_installed
+    if _record_factory_installed:
+        return
+    _record_factory_installed = True
+    try:
+        current = logging.getLogRecordFactory()
+        logging.setLogRecordFactory(_safe_record_factory(current))
+    except Exception:
+        # If even installing the factory fails, the layered SafeFormatter
+        # below still protects us. Never let logging setup crash the import.
+        pass
+
+
+# Install the factory at module import time so EVERY LogRecord ever created
+# during this Python process — including ones generated by third-party
+# libraries before configure_logging() is called — already has the safe
+# defaults attached.
+_install_safe_log_record_factory()
+
+
+# ---------------------------------------------------------------------------
+# Job-aware adapter
+# ---------------------------------------------------------------------------
 class JobLogAdapter(logging.LoggerAdapter):
-    """Logger adapter that prefixes ``[job=X step=Y]`` to every message.
+    """Adapter that prefixes ``[job=X step=Y]`` to every message.
 
-    The prefix is added to the **message text** (not via formatter fields),
-    so it works regardless of which formatter the root logger ends up with.
-    The job/step context is also attached to the LogRecord via ``extra=`` so
-    structured log shippers can read it programmatically.
+    The prefix is added to the **message text** rather than via formatter
+    fields, so it works regardless of which formatter is active.
     """
 
     def process(self, msg: Any, kwargs: Any):
-        job_id = (self.extra or {}).get("job_id", "-") if self.extra else "-"
-        step_key = (self.extra or {}).get("step_key", "-") if self.extra else "-"
+        job_id = "-"
+        step_key = "-"
+        try:
+            if self.extra:
+                job_id = str(self.extra.get("job_id", "-") or "-")
+                step_key = str(self.extra.get("step_key", "-") or "-")
+        except Exception:
+            pass
 
         # Keep extras for downstream structured handlers.
-        extra = kwargs.setdefault("extra", {})
-        extra.setdefault("job_id", job_id)
-        extra.setdefault("step_key", step_key)
-
-        # Prepend a human-readable prefix to the message text itself.
-        # Preserve %-formatting placeholders in `msg` (e.g. "%s") so the
-        # caller's args still interpolate correctly downstream.
         try:
-            prefix = f"[job={job_id} step={step_key}] "
-            return prefix + str(msg), kwargs
+            extra = kwargs.setdefault("extra", {})
+            extra.setdefault("job_id", job_id)
+            extra.setdefault("step_key", step_key)
         except Exception:
-            # As a last resort, never let prefix generation break logging.
+            pass
+
+        try:
+            return f"[job={job_id} step={step_key}] " + str(msg), kwargs
+        except Exception:
             return msg, kwargs
+
+
+# ---------------------------------------------------------------------------
+# Global logging configuration
+# ---------------------------------------------------------------------------
+_NOISY_LIBRARIES = (
+    "httpx",
+    "httpcore",
+    "urllib3",
+    "hpack",
+    "websockets",
+    "asyncio",
+    "supabase",
+    "postgrest",
+    "gotrue",
+    "storage3",
+    "realtime",
+)
+
+
+def _wrap_handler_formatter(handler: logging.Handler) -> None:
+    """Wrap a handler's formatter in :class:`SafeFormatter` (idempotent)."""
+    try:
+        existing = handler.formatter
+        if isinstance(existing, SafeFormatter):
+            return
+        if existing is None:
+            handler.setFormatter(SafeFormatter(LOG_FORMAT))
+            return
+        # Re-use the existing format string but route formatting through
+        # SafeFormatter so it can never raise.
+        fmt = getattr(existing, "_fmt", None) or DEFAULT_LOG_FORMAT
+        datefmt = getattr(existing, "datefmt", None)
+        try:
+            handler.setFormatter(SafeFormatter(fmt, datefmt=datefmt))
+        except Exception:
+            handler.setFormatter(SafeFormatter(DEFAULT_LOG_FORMAT))
+    except Exception:
+        pass
+
+
+def _sweep_existing_loggers() -> None:
+    """Walk every existing logger and make its handlers safe.
+
+    Some third-party libraries attach their own handlers/formatters at
+    import time. We don't trust them — every handler's formatter is
+    replaced with a :class:`SafeFormatter`, and ``propagate=True`` so
+    records still flow up to the root logger.
+    """
+    try:
+        for name in list(logging.Logger.manager.loggerDict.keys()):
+            try:
+                lg = logging.getLogger(name)
+            except Exception:
+                continue
+            try:
+                lg.propagate = True
+            except Exception:
+                pass
+            try:
+                for h in list(getattr(lg, "handlers", [])):
+                    _wrap_handler_formatter(h)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 
 def configure_logging(level: str = "INFO") -> None:
     """Configure the root logger exactly once. Safe to call repeatedly.
 
-    Idempotent: subsequent calls are no-ops. Replaces any pre-existing
-    handlers so a library that attached an unsafe handler at import time
-    cannot crash us later.
+    Idempotent and aggressive: replaces all root handlers, wraps every
+    existing handler's formatter on every existing logger, and installs
+    our safe LogRecord factory if not already installed.
     """
     global _configured
     if _configured:
         return
     _configured = True
 
-    # Never let a logging formatter mistake propagate into the host process.
+    # Belt-and-suspenders: even if a brand-new formatter mistake slips in,
+    # the stdlib logging module will swallow it instead of crashing.
     logging.raiseExceptions = False
+
+    # Guarantee the safe factory is installed (no-op if already done).
+    _install_safe_log_record_factory()
 
     root = logging.getLogger()
 
-    # Drop any handlers attached by libraries at import time so we control
-    # the formatter for every record that flows through the root logger.
+    # Drop pre-existing handlers — we want full control over the root.
     for handler in list(root.handlers):
         try:
             root.removeHandler(handler)
@@ -126,24 +304,38 @@ def configure_logging(level: str = "INFO") -> None:
 
     handler = logging.StreamHandler(sys.stdout)
     try:
-        handler.setFormatter(logging.Formatter(LOG_FORMAT))
+        handler.setFormatter(SafeFormatter(LOG_FORMAT))
     except Exception:
-        # If an operator passed an invalid $LOG_FORMAT, fall back silently.
-        handler.setFormatter(logging.Formatter(DEFAULT_LOG_FORMAT))
-    handler.addFilter(_SafeDefaultsFilter())
+        handler.setFormatter(SafeFormatter(DEFAULT_LOG_FORMAT))
 
     root.addHandler(handler)
-    root.setLevel(getattr(logging, str(level).upper(), logging.INFO))
+    try:
+        root.setLevel(getattr(logging, str(level).upper(), logging.INFO))
+    except Exception:
+        root.setLevel(logging.INFO)
 
-    # Quiet down a few notoriously chatty libraries so production logs stay
-    # readable. They still emit warnings/errors.
-    for noisy in ("httpx", "httpcore", "urllib3", "hpack", "websockets"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
+    # Sweep every existing logger and harden their formatters too. Libraries
+    # that ship their own handler (e.g. uvicorn) get the SafeFormatter
+    # wrapper applied to whatever format string they configured.
+    _sweep_existing_loggers()
+
+    # Quiet down a few notoriously chatty libraries. They still emit warnings.
+    for noisy in _NOISY_LIBRARIES:
+        try:
+            logging.getLogger(noisy).setLevel(logging.WARNING)
+        except Exception:
+            pass
 
 
+# ---------------------------------------------------------------------------
+# Public helpers
+# ---------------------------------------------------------------------------
 def get_logger(job_id: str = "-", step_key: str = "-") -> JobLogAdapter:
     """Return a job-aware logger adapter. Safe to call from anywhere."""
-    configure_logging()
+    try:
+        configure_logging()
+    except Exception:
+        pass
     base = logging.getLogger("kua.jobs")
     return JobLogAdapter(base, {"job_id": str(job_id or "-"), "step_key": str(step_key or "-")})
 
@@ -161,14 +353,20 @@ def safe_json(data: Any) -> Any:
 
 
 def format_traceback(exc: BaseException) -> str:
-    return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    try:
+        return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    except Exception:
+        return f"<could not format traceback for {type(exc).__name__}>"
 
 
 def classify_error(exc: BaseException) -> tuple[str, bool]:
     """Return ``(error_type, retryable)``."""
     from jobs.constants import TRANSIENT_ERROR_MARKERS
 
-    msg = str(exc).lower()
+    try:
+        msg = str(exc).lower()
+    except Exception:
+        msg = ""
     error_type = type(exc).__name__
     retryable = any(marker in msg for marker in TRANSIENT_ERROR_MARKERS)
     if isinstance(exc, TimeoutError):
