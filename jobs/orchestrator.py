@@ -1,28 +1,40 @@
-"""Production-grade scan pipeline orchestrator with step persistence and retries."""
+"""Production-grade scan pipeline orchestrator.
+
+Hardening guarantees:
+  * Every step runs under a wall-clock timeout (concurrent.futures) so a
+    hung scrape or LLM call cannot freeze the worker forever.
+  * Transient errors retry with exponential backoff.
+  * The job heartbeat is touched between steps so /health/pipeline and
+    the dead-job sweeper can detect crashed workers.
+  * Cancellation is honoured between every listing.
+"""
 
 from __future__ import annotations
 
+import os
 import time
-import traceback
-from typing import Any, Callable, Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+from typing import Any, Callable, List, Optional
 
 from jobs.constants import (
+    DEFAULT_STEP_TIMEOUT_SEC,
     JOB_CANCELLED,
     JOB_FAILED,
+    JOB_RUNNING,
     JOB_SUCCESS,
     JOB_TIMEOUT,
-    LISTING_LEVEL_STEPS,
     RETRY_BASE_DELAY_SEC,
     RETRY_MAX_DELAY_SEC,
     STEP_FAILED,
-    STEP_SKIPPED,
     STEP_SUCCESS,
+    STEP_TIMEOUT,
+    STEP_TIMEOUTS_SEC,
     WORKER_JOB_TIMEOUT_SEC,
 )
+from jobs.errors import StoreError
 from jobs.logging_util import classify_error, format_traceback, get_logger
 from jobs import store
 
-# Domain modules (repo root)
 from scraper import scrape_idealista_search_urls, scrape_listing_text
 from extractor import extract_property_from_text
 from economics import calculate_economics
@@ -33,8 +45,15 @@ from location import geocode_address
 from excel_exporter import export_scan_to_excel
 
 
+_step_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="kua-step")
+
+
 def _retry_delay(attempt: int) -> float:
     return min(RETRY_BASE_DELAY_SEC * (2 ** max(0, attempt - 1)), RETRY_MAX_DELAY_SEC)
+
+
+def _step_timeout(step_key: str) -> int:
+    return int(STEP_TIMEOUTS_SEC.get(step_key, DEFAULT_STEP_TIMEOUT_SEC))
 
 
 def _run_with_retry(
@@ -49,13 +68,26 @@ def _run_with_retry(
     if listing_index is None:
         listing_index = store.JOB_LEVEL_INDEX
     log = get_logger(job_id, step_key)
+    timeout_sec = _step_timeout(step_key)
     last_exc: Optional[Exception] = None
 
     for attempt in range(1, max_attempts + 1):
         started = time.monotonic()
         step_row = store.start_step(job_id, step_key, listing_index=listing_index)
+        store.touch_heartbeat(job_id)
+
         try:
-            result = fn()
+            future = _step_executor.submit(fn)
+            try:
+                result = future.result(timeout=timeout_sec)
+            except FuturesTimeout:
+                # Best-effort cancel; the underlying thread may still run
+                # but the worker continues with the next attempt/step.
+                future.cancel()
+                raise TimeoutError(
+                    f"Step '{step_key}' exceeded {timeout_sec}s wall-clock timeout"
+                )
+
             duration_ms = int((time.monotonic() - started) * 1000)
             store.finish_step(
                 job_id,
@@ -67,32 +99,42 @@ def _run_with_retry(
             )
             log.info("Step succeeded in %sms (attempt %s)", duration_ms, attempt)
             return result
+
         except Exception as exc:
             last_exc = exc
             duration_ms = int((time.monotonic() - started) * 1000)
             error_type, retryable = classify_error(exc)
+            if isinstance(exc, TimeoutError):
+                step_status = STEP_TIMEOUT
+                retryable = True
+            else:
+                step_status = STEP_FAILED
             tb = format_traceback(exc)
-            store.finish_step(
-                job_id,
-                step_key,
-                listing_index=listing_index,
-                status=STEP_FAILED,
-                error_type=error_type,
-                error_message=str(exc),
-                traceback=tb,
-                retryable=retryable,
-                duration_ms=duration_ms,
-            )
-            store.record_error(
-                job_id,
-                step_id=step_row.get("id"),
-                listing_url=listing_url,
-                error_type=error_type,
-                message=str(exc),
-                traceback=tb,
-                retryable=retryable,
-                attempt=attempt,
-            )
+            try:
+                store.finish_step(
+                    job_id,
+                    step_key,
+                    listing_index=listing_index,
+                    status=step_status,
+                    error_type=error_type,
+                    error_message=str(exc),
+                    traceback=tb,
+                    retryable=retryable,
+                    duration_ms=duration_ms,
+                )
+                store.record_error(
+                    job_id,
+                    step_id=step_row.get("id"),
+                    listing_url=listing_url,
+                    error_type=error_type,
+                    message=str(exc),
+                    traceback=tb,
+                    retryable=retryable,
+                    attempt=attempt,
+                )
+            except StoreError as store_exc:
+                log.warning("Could not persist step failure: %s", store_exc)
+
             log.warning("Step failed attempt %s/%s: %s", attempt, max_attempts, exc)
             if not retryable or attempt >= max_attempts:
                 raise
@@ -103,6 +145,9 @@ def _run_with_retry(
     raise RuntimeError(f"Step {step_key} failed without exception")
 
 
+# ---------------------------------------------------------------------------
+# Lazy imports from main (avoid circular module load).
+# ---------------------------------------------------------------------------
 def _clean_property_data(data: dict) -> dict:
     from main import clean_property_data
     return clean_property_data(data)
@@ -123,6 +168,9 @@ def _generate_rejection_note(property_data: dict, economics: dict, score: dict) 
     return generate_rejection_note(property_data, economics, score)
 
 
+# ---------------------------------------------------------------------------
+# Per-listing pipeline
+# ---------------------------------------------------------------------------
 def _process_listing(job_id: str, listing_index: int, url: str) -> dict:
     store.ensure_listing_steps(job_id, listing_index, url)
     store.upsert_listing_result(job_id, listing_index, url, status="running")
@@ -134,14 +182,18 @@ def _process_listing(job_id: str, listing_index: int, url: str) -> dict:
         return scraped
 
     scraped = _run_with_retry(job_id, "scrape_listing", scrape, listing_index=listing_index, listing_url=url)
-    raw_text = scraped.get("raw_text", "")
+    raw_text = scraped.get("raw_text", "") if isinstance(scraped, dict) else ""
 
     def extract():
         data = extract_property_from_text(raw_text)
+        if not isinstance(data, dict):
+            data = {}
         data["listing_url"] = url
         return data
 
-    extracted = _run_with_retry(job_id, "extract_property_data", extract, listing_index=listing_index, listing_url=url)
+    extracted = _run_with_retry(
+        job_id, "extract_property_data", extract, listing_index=listing_index, listing_url=url
+    )
 
     def validate():
         cleaned = _clean_property_data(extracted)
@@ -151,20 +203,28 @@ def _process_listing(job_id: str, listing_index: int, url: str) -> dict:
         return cleaned
 
     try:
-        data = _run_with_retry(job_id, "validate_extraction", validate, listing_index=listing_index, listing_url=url)
+        data = _run_with_retry(
+            job_id, "validate_extraction", validate, listing_index=listing_index, listing_url=url
+        )
     except Exception as exc:
         store.upsert_listing_result(
-            job_id, listing_index, url,
-            status="failed", error_message=str(exc),
+            job_id,
+            listing_index,
+            url,
+            status="failed",
+            error_message=str(exc),
             result={"success": False, "error": str(exc), "source_url": url},
         )
         return {"success": False, "error": str(exc), "source_url": url}
 
     def economics_step():
-        full_address = f"{data.get('address') or data.get('neighbourhood') or data.get('city')}, {data.get('city')}, Spain"
-        coordinates = geocode_address(full_address)
-        data["latitude"] = coordinates["lat"]
-        data["longitude"] = coordinates["lng"]
+        full_address = (
+            f"{data.get('address') or data.get('neighbourhood') or data.get('city')}, "
+            f"{data.get('city')}, Spain"
+        )
+        coordinates = geocode_address(full_address) or {"lat": None, "lng": None}
+        data["latitude"] = coordinates.get("lat")
+        data["longitude"] = coordinates.get("lng")
         econ = calculate_economics(
             gba_m2=data.get("gba_m2"),
             rent_per_m2=data.get("rent_per_m2"),
@@ -175,26 +235,34 @@ def _process_listing(job_id: str, listing_index: int, url: str) -> dict:
         )
         return {"data": data, "economics": econ, "coordinates": coordinates}
 
-    econ_out = _run_with_retry(job_id, "calculate_economics", economics_step, listing_index=listing_index, listing_url=url)
+    econ_out = _run_with_retry(
+        job_id, "calculate_economics", economics_step, listing_index=listing_index, listing_url=url
+    )
     data = econ_out["data"]
     economics = econ_out["economics"]
 
     def score_step():
         auto_scores = calculate_auto_scores(data, economics)
-        final_score = score_property({
-            "extracted": data,
-            "economics": economics,
-            "auto_scores": auto_scores,
-        })
+        final_score = score_property(
+            {
+                "extracted": data,
+                "economics": economics,
+                "auto_scores": auto_scores,
+            }
+        )
         return {"auto_scores": auto_scores, "final_score": final_score}
 
-    score_out = _run_with_retry(job_id, "score_property", score_step, listing_index=listing_index, listing_url=url)
+    score_out = _run_with_retry(
+        job_id, "score_property", score_step, listing_index=listing_index, listing_url=url
+    )
     final_score = score_out["final_score"]
 
     def classify():
         return _assign_deal_status(final_score)
 
-    deal_status = _run_with_retry(job_id, "classify_deal", classify, listing_index=listing_index, listing_url=url)
+    deal_status = _run_with_retry(
+        job_id, "classify_deal", classify, listing_index=listing_index, listing_url=url
+    )
 
     def memo_step():
         property_insert = {
@@ -232,7 +300,9 @@ def _process_listing(job_id: str, listing_index: int, url: str) -> dict:
             memo_text = _generate_rejection_note(property_insert, economics, final_score)
         return {"memo_text": memo_text, "property_insert": property_insert}
 
-    memo_out = _run_with_retry(job_id, "generate_memo", memo_step, listing_index=listing_index, listing_url=url)
+    memo_out = _run_with_retry(
+        job_id, "generate_memo", memo_step, listing_index=listing_index, listing_url=url
+    )
     memo_text = memo_out["memo_text"]
     property_insert = memo_out["property_insert"]
 
@@ -240,6 +310,8 @@ def _process_listing(job_id: str, listing_index: int, url: str) -> dict:
         from database import supabase
 
         property_response = supabase.table("properties").insert(property_insert).execute()
+        if not property_response.data:
+            raise RuntimeError("Supabase did not return inserted property row")
         property_id = property_response.data[0]["id"]
 
         enriched_score = dict(final_score)
@@ -259,8 +331,17 @@ def _process_listing(job_id: str, listing_index: int, url: str) -> dict:
         }
         supabase.table("analyses").insert(analysis_insert).execute()
 
-        store.save_extracted_property(job_id, url, property_id, data, economics, enriched_score)
-        store.save_generated_memo(job_id, url, property_id, memo_text, final_score.get("verdict"), deal_status)
+        try:
+            store.save_extracted_property(
+                job_id, url, property_id, data, economics, enriched_score
+            )
+            store.save_generated_memo(
+                job_id, url, property_id, memo_text, final_score.get("verdict"), deal_status
+            )
+        except StoreError:
+            # Pipeline tables missing is reported by /health/database; do not
+            # block the core save path here.
+            pass
 
         return {
             "property_id": property_id,
@@ -273,7 +354,9 @@ def _process_listing(job_id: str, listing_index: int, url: str) -> dict:
             "success": True,
         }
 
-    result = _run_with_retry(job_id, "save_to_supabase", save_step, listing_index=listing_index, listing_url=url)
+    result = _run_with_retry(
+        job_id, "save_to_supabase", save_step, listing_index=listing_index, listing_url=url
+    )
 
     store.upsert_listing_result(
         job_id,
@@ -289,19 +372,28 @@ def _process_listing(job_id: str, listing_index: int, url: str) -> dict:
     return result
 
 
+# ---------------------------------------------------------------------------
+# Top-level job runner
+# ---------------------------------------------------------------------------
 def run_job(job_id: str) -> dict:
     log = get_logger(job_id, "orchestrator")
     job = store.get_job(job_id)
     started = time.monotonic()
+    worker_id = os.getenv("WORKER_ID") or f"worker-{os.getpid()}"
 
     if job.get("status") == JOB_CANCELLED:
         return store.build_job_response(job_id)
 
     try:
-        search_url = job["search_url"]
+        search_url = job.get("search_url") or ""
         limit = int(job.get("listing_limit") or 10)
         generate_excel = bool(job.get("generate_excel", True))
         filters_used = job.get("filters") or {}
+
+        if not search_url:
+            raise ValueError("Job has no search_url")
+
+        store.touch_heartbeat(job_id, worker_id)
 
         def collect_urls():
             scraped = scrape_idealista_search_urls(search_url, limit=limit)
@@ -319,13 +411,22 @@ def run_job(job_id: str) -> dict:
 
         for idx, url in enumerate(urls):
             if time.monotonic() - started > WORKER_JOB_TIMEOUT_SEC:
-                store.update_job(job_id, status=JOB_TIMEOUT, error_message="Job exceeded worker timeout")
-                break
+                store.update_job(
+                    job_id,
+                    status=JOB_TIMEOUT,
+                    error_message="Job exceeded global wall-clock timeout",
+                    finished_at=store._now(),
+                )
+                log.warning("Job exceeded global timeout; stopping at idx=%s", idx)
+                return store.build_job_response(job_id)
 
             current_job = store.get_job(job_id)
             if current_job.get("status") == JOB_CANCELLED:
                 log.info("Job cancelled — stopping pipeline")
-                break
+                store.update_job(job_id, finished_at=store._now())
+                return store.build_job_response(job_id)
+
+            store.touch_heartbeat(job_id, worker_id)
 
             try:
                 result = _process_listing(job_id, idx, url)
@@ -344,25 +445,35 @@ def run_job(job_id: str) -> dict:
                 failed += 1
                 err_result = {"success": False, "error": str(exc), "source_url": url}
                 results.append(err_result)
-                store.upsert_listing_result(job_id, idx, url, status="failed", error_message=str(exc), result=err_result)
+                try:
+                    store.upsert_listing_result(
+                        job_id, idx, url, status="failed", error_message=str(exc), result=err_result
+                    )
+                except StoreError:
+                    pass
                 log.exception("Listing %s failed: %s", idx, exc)
 
             done = idx + 1
             pct = 5 + int((done / max(len(urls), 1)) * 85)
-            store.update_job(
-                job_id,
-                listings_done=done,
-                listings_failed=failed,
-                approved_count=approved,
-                manual_review_count=manual,
-                rejected_count=rejected,
-                progress_pct=min(pct, 90),
-            )
+            try:
+                store.update_job(
+                    job_id,
+                    listings_done=done,
+                    listings_failed=failed,
+                    approved_count=approved,
+                    manual_review_count=manual,
+                    rejected_count=rejected,
+                    progress_pct=min(pct, 90),
+                )
+            except StoreError:
+                pass
 
         excel_path = None
         if generate_excel and results:
             def export_step():
                 successful = [r for r in results if r.get("property_id") and r.get("score")]
+                if not successful:
+                    return {"excel_path": None}
                 path = export_scan_to_excel(
                     results=successful,
                     search_url=search_url,
@@ -372,15 +483,21 @@ def run_job(job_id: str) -> dict:
 
             try:
                 export_out = _run_with_retry(job_id, "export_artifacts", export_step)
-                excel_path = export_out.get("excel_path")
+                excel_path = export_out.get("excel_path") if isinstance(export_out, dict) else None
             except Exception as exc:
                 log.warning("Excel export failed: %s", exc)
-                store.record_error(job_id, error_type="ExportError", message=str(exc), traceback=format_traceback(exc))
+                store.record_error(
+                    job_id, error_type="ExportError", message=str(exc), traceback=format_traceback(exc)
+                )
 
         def notify():
             return {"notified": True, "listings": len(results)}
 
-        _run_with_retry(job_id, "notify_frontend", notify)
+        try:
+            _run_with_retry(job_id, "notify_frontend", notify)
+        except Exception:
+            # notification is best-effort
+            pass
 
         final_status = JOB_SUCCESS if results else JOB_FAILED
         store.update_job(
@@ -402,17 +519,20 @@ def run_job(job_id: str) -> dict:
 
     except Exception as exc:
         log.exception("Job failed: %s", exc)
-        store.update_job(
-            job_id,
-            status=JOB_FAILED,
-            error_message=str(exc),
-            finished_at=store._now(),
-        )
-        store.record_error(
-            job_id,
-            error_type=type(exc).__name__,
-            message=str(exc),
-            traceback=format_traceback(exc),
-            retryable=False,
-        )
+        try:
+            store.update_job(
+                job_id,
+                status=JOB_FAILED,
+                error_message=str(exc)[:1000],
+                finished_at=store._now(),
+            )
+            store.record_error(
+                job_id,
+                error_type=type(exc).__name__,
+                message=str(exc),
+                traceback=format_traceback(exc),
+                retryable=False,
+            )
+        except Exception:
+            pass
         raise

@@ -1,186 +1,39 @@
 -- =============================================================================
--- K.U.A. — Async scan pipeline schema (Supabase / PostgreSQL)
--- Paste this ENTIRE file into Supabase → SQL Editor → Run
+-- K.U.A. — Pipeline schema migration (Supabase / PostgreSQL)
+--
+-- WHAT THIS DOES
+--   Creates and/or repairs every Supabase table the K.U.A. backend writes to:
+--     * scan_jobs
+--     * scan_steps
+--     * scan_logs
+--     * scan_errors
+--     * scan_listing_results
+--     * generated_memos
+--     * extracted_properties
+--
+--   Adds EVERY column the backend touches via ALTER TABLE ... ADD COLUMN
+--   IF NOT EXISTS, so partial / hand-rolled tables get upgraded in place
+--   without losing data. Adds indexes and (where data permits) UNIQUE
+--   constraints needed by the orchestrator. Safe to run repeatedly.
+--
+-- HOW TO USE
+--   Supabase → SQL Editor → New query → paste this file → Run.
+--   Re-running is a no-op for already-correct schemas.
+--
+-- DESIGN NOTES
+--   * No CHECK constraints on status fields — the backend validates them
+--     and CHECKs would fail to retrofit if any legacy row violates them.
+--   * property_id is TEXT (not UUID) because the backend treats it as an
+--     opaque identifier and inserts it from Supabase-side UUID strings.
+--   * step_id is UUID with ON DELETE SET NULL so log/error rows survive
+--     step deletion.
+--   * job_id is UUID with ON DELETE CASCADE so cleanup removes children.
 -- =============================================================================
 
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
 -- ---------------------------------------------------------------------------
--- scan_jobs
--- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS public.scan_jobs (
-    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    job_type            TEXT NOT NULL DEFAULT 'idealista_auto',
-    status              TEXT NOT NULL DEFAULT 'pending'
-                        CHECK (status IN (
-                            'pending','queued','running','retrying',
-                            'success','failed','cancelled','timeout'
-                        )),
-    created_by          TEXT,
-    search_url          TEXT,
-    filters             JSONB NOT NULL DEFAULT '{}'::jsonb,
-    payload             JSONB NOT NULL DEFAULT '{}'::jsonb,
-    listing_limit       INT NOT NULL DEFAULT 10,
-    generate_excel      BOOLEAN NOT NULL DEFAULT TRUE,
-    progress_pct        INT NOT NULL DEFAULT 0 CHECK (progress_pct BETWEEN 0 AND 100),
-    current_step        TEXT,
-    listings_total      INT NOT NULL DEFAULT 0,
-    listings_done       INT NOT NULL DEFAULT 0,
-    listings_failed     INT NOT NULL DEFAULT 0,
-    approved_count      INT NOT NULL DEFAULT 0,
-    manual_review_count INT NOT NULL DEFAULT 0,
-    rejected_count      INT NOT NULL DEFAULT 0,
-    result_summary      JSONB,
-    result              JSONB,
-    excel_path          TEXT,
-    error_message       TEXT,
-    retry_count         INT NOT NULL DEFAULT 0,
-    max_retries         INT NOT NULL DEFAULT 3,
-    request_id          TEXT,
-    started_at          TIMESTAMPTZ,
-    finished_at         TIMESTAMPTZ,
-    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_scan_jobs_status ON public.scan_jobs(status);
-CREATE INDEX IF NOT EXISTS idx_scan_jobs_created_at ON public.scan_jobs(created_at DESC);
-
--- ---------------------------------------------------------------------------
--- scan_steps  (listing_index = -1 for job-level steps)
--- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS public.scan_steps (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    job_id          UUID NOT NULL REFERENCES public.scan_jobs(id) ON DELETE CASCADE,
-    listing_index   INT NOT NULL DEFAULT -1,
-    listing_url     TEXT,
-    step_key        TEXT NOT NULL,
-    step_order      INT NOT NULL DEFAULT 0,
-    status          TEXT NOT NULL DEFAULT 'pending'
-                    CHECK (status IN (
-                        'pending','running','success','failed',
-                        'skipped','retrying'
-                    )),
-    attempt         INT NOT NULL DEFAULT 0,
-    max_attempts    INT NOT NULL DEFAULT 3,
-    payload         JSONB,
-    input_data      JSONB,
-    output_data     JSONB,
-    result          JSONB,
-    error_type      TEXT,
-    error_message   TEXT,
-    traceback       TEXT,
-    retryable       BOOLEAN NOT NULL DEFAULT TRUE,
-    duration_ms     INT,
-    started_at      TIMESTAMPTZ,
-    finished_at     TIMESTAMPTZ,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (job_id, listing_index, step_key)
-);
-
-CREATE INDEX IF NOT EXISTS idx_scan_steps_job_id ON public.scan_steps(job_id);
-CREATE INDEX IF NOT EXISTS idx_scan_steps_status ON public.scan_steps(status);
-CREATE INDEX IF NOT EXISTS idx_scan_steps_job_order ON public.scan_steps(job_id, step_order);
-
--- ---------------------------------------------------------------------------
--- scan_logs
--- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS public.scan_logs (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    job_id      UUID NOT NULL REFERENCES public.scan_jobs(id) ON DELETE CASCADE,
-    step_id     UUID REFERENCES public.scan_steps(id) ON DELETE SET NULL,
-    level       TEXT NOT NULL DEFAULT 'info',
-    message     TEXT NOT NULL,
-    context     JSONB NOT NULL DEFAULT '{}'::jsonb,
-    payload     JSONB,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_scan_logs_job_id ON public.scan_logs(job_id);
-CREATE INDEX IF NOT EXISTS idx_scan_logs_created_at ON public.scan_logs(job_id, created_at DESC);
-
--- ---------------------------------------------------------------------------
--- scan_errors
--- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS public.scan_errors (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    job_id      UUID NOT NULL REFERENCES public.scan_jobs(id) ON DELETE CASCADE,
-    step_id     UUID REFERENCES public.scan_steps(id) ON DELETE SET NULL,
-    listing_url TEXT,
-    error_type  TEXT NOT NULL,
-    message     TEXT NOT NULL,
-    traceback   TEXT,
-    payload     JSONB,
-    retryable   BOOLEAN NOT NULL DEFAULT TRUE,
-    attempt     INT NOT NULL DEFAULT 1,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_scan_errors_job_id ON public.scan_errors(job_id);
-CREATE INDEX IF NOT EXISTS idx_scan_errors_created_at ON public.scan_errors(job_id, created_at DESC);
-
--- ---------------------------------------------------------------------------
--- scan_listing_results
--- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS public.scan_listing_results (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    job_id          UUID NOT NULL REFERENCES public.scan_jobs(id) ON DELETE CASCADE,
-    listing_index   INT NOT NULL,
-    listing_url     TEXT,
-    status          TEXT NOT NULL DEFAULT 'pending',
-    property_id     TEXT,
-    deal_status     TEXT,
-    score           NUMERIC,
-    verdict         TEXT,
-    result          JSONB,
-    payload         JSONB,
-    error_message   TEXT,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (job_id, listing_index)
-);
-
-CREATE INDEX IF NOT EXISTS idx_scan_listing_results_job_id ON public.scan_listing_results(job_id);
-CREATE INDEX IF NOT EXISTS idx_scan_listing_results_status ON public.scan_listing_results(status);
-
--- ---------------------------------------------------------------------------
--- generated_memos
--- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS public.generated_memos (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    job_id          UUID REFERENCES public.scan_jobs(id) ON DELETE SET NULL,
-    property_id     TEXT,
-    listing_url     TEXT,
-    memo_text       TEXT NOT NULL,
-    verdict         TEXT,
-    deal_status     TEXT,
-    payload         JSONB,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_generated_memos_job_id ON public.generated_memos(job_id);
-
--- ---------------------------------------------------------------------------
--- extracted_properties
--- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS public.extracted_properties (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    job_id          UUID REFERENCES public.scan_jobs(id) ON DELETE SET NULL,
-    listing_url     TEXT,
-    property_id     TEXT,
-    extracted       JSONB NOT NULL DEFAULT '{}'::jsonb,
-    economics       JSONB,
-    score           JSONB,
-    result          JSONB,
-    payload         JSONB,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_extracted_properties_job_id ON public.extracted_properties(job_id);
-
--- ---------------------------------------------------------------------------
--- updated_at trigger
+-- updated_at helper (idempotent)
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.kua_set_updated_at()
 RETURNS TRIGGER AS $$
@@ -190,27 +43,387 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+
+-- =============================================================================
+-- scan_jobs
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS public.scan_jobs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid()
+);
+
+ALTER TABLE public.scan_jobs ADD COLUMN IF NOT EXISTS job_type            TEXT NOT NULL DEFAULT 'idealista_auto';
+ALTER TABLE public.scan_jobs ADD COLUMN IF NOT EXISTS status              TEXT NOT NULL DEFAULT 'queued';
+ALTER TABLE public.scan_jobs ADD COLUMN IF NOT EXISTS created_by          TEXT;
+ALTER TABLE public.scan_jobs ADD COLUMN IF NOT EXISTS search_url          TEXT;
+ALTER TABLE public.scan_jobs ADD COLUMN IF NOT EXISTS filters             JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE public.scan_jobs ADD COLUMN IF NOT EXISTS payload             JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE public.scan_jobs ADD COLUMN IF NOT EXISTS listing_limit       INT  NOT NULL DEFAULT 10;
+ALTER TABLE public.scan_jobs ADD COLUMN IF NOT EXISTS generate_excel      BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE public.scan_jobs ADD COLUMN IF NOT EXISTS progress_pct        INT  NOT NULL DEFAULT 0;
+ALTER TABLE public.scan_jobs ADD COLUMN IF NOT EXISTS current_step        TEXT;
+ALTER TABLE public.scan_jobs ADD COLUMN IF NOT EXISTS listings_total      INT  NOT NULL DEFAULT 0;
+ALTER TABLE public.scan_jobs ADD COLUMN IF NOT EXISTS listings_done       INT  NOT NULL DEFAULT 0;
+ALTER TABLE public.scan_jobs ADD COLUMN IF NOT EXISTS listings_failed     INT  NOT NULL DEFAULT 0;
+ALTER TABLE public.scan_jobs ADD COLUMN IF NOT EXISTS approved_count      INT  NOT NULL DEFAULT 0;
+ALTER TABLE public.scan_jobs ADD COLUMN IF NOT EXISTS manual_review_count INT  NOT NULL DEFAULT 0;
+ALTER TABLE public.scan_jobs ADD COLUMN IF NOT EXISTS rejected_count      INT  NOT NULL DEFAULT 0;
+ALTER TABLE public.scan_jobs ADD COLUMN IF NOT EXISTS result_summary      JSONB;
+ALTER TABLE public.scan_jobs ADD COLUMN IF NOT EXISTS result              JSONB;
+ALTER TABLE public.scan_jobs ADD COLUMN IF NOT EXISTS excel_path          TEXT;
+ALTER TABLE public.scan_jobs ADD COLUMN IF NOT EXISTS error_message       TEXT;
+ALTER TABLE public.scan_jobs ADD COLUMN IF NOT EXISTS retry_count         INT  NOT NULL DEFAULT 0;
+ALTER TABLE public.scan_jobs ADD COLUMN IF NOT EXISTS max_retries         INT  NOT NULL DEFAULT 3;
+ALTER TABLE public.scan_jobs ADD COLUMN IF NOT EXISTS request_id          TEXT;
+ALTER TABLE public.scan_jobs ADD COLUMN IF NOT EXISTS worker_id           TEXT;
+ALTER TABLE public.scan_jobs ADD COLUMN IF NOT EXISTS last_heartbeat_at   TIMESTAMPTZ;
+ALTER TABLE public.scan_jobs ADD COLUMN IF NOT EXISTS started_at          TIMESTAMPTZ;
+ALTER TABLE public.scan_jobs ADD COLUMN IF NOT EXISTS finished_at         TIMESTAMPTZ;
+ALTER TABLE public.scan_jobs ADD COLUMN IF NOT EXISTS created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE public.scan_jobs ADD COLUMN IF NOT EXISTS updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+CREATE INDEX IF NOT EXISTS idx_scan_jobs_status         ON public.scan_jobs(status);
+CREATE INDEX IF NOT EXISTS idx_scan_jobs_created_at     ON public.scan_jobs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_scan_jobs_heartbeat      ON public.scan_jobs(last_heartbeat_at);
+CREATE INDEX IF NOT EXISTS idx_scan_jobs_status_created ON public.scan_jobs(status, created_at);
+
 DROP TRIGGER IF EXISTS trg_scan_jobs_updated ON public.scan_jobs;
 CREATE TRIGGER trg_scan_jobs_updated
     BEFORE UPDATE ON public.scan_jobs
     FOR EACH ROW EXECUTE FUNCTION public.kua_set_updated_at();
+
+
+-- =============================================================================
+-- scan_steps  (listing_index = -1 for job-level steps; NULL would break UNIQUE)
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS public.scan_steps (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid()
+);
+
+ALTER TABLE public.scan_steps ADD COLUMN IF NOT EXISTS job_id          UUID;
+ALTER TABLE public.scan_steps ADD COLUMN IF NOT EXISTS listing_index   INT NOT NULL DEFAULT -1;
+ALTER TABLE public.scan_steps ADD COLUMN IF NOT EXISTS listing_url     TEXT;
+ALTER TABLE public.scan_steps ADD COLUMN IF NOT EXISTS step_key        TEXT NOT NULL DEFAULT '';
+ALTER TABLE public.scan_steps ADD COLUMN IF NOT EXISTS step_order      INT  NOT NULL DEFAULT 0;
+ALTER TABLE public.scan_steps ADD COLUMN IF NOT EXISTS status          TEXT NOT NULL DEFAULT 'pending';
+ALTER TABLE public.scan_steps ADD COLUMN IF NOT EXISTS attempt         INT  NOT NULL DEFAULT 0;
+ALTER TABLE public.scan_steps ADD COLUMN IF NOT EXISTS max_attempts    INT  NOT NULL DEFAULT 3;
+ALTER TABLE public.scan_steps ADD COLUMN IF NOT EXISTS payload         JSONB;
+ALTER TABLE public.scan_steps ADD COLUMN IF NOT EXISTS input_data      JSONB;
+ALTER TABLE public.scan_steps ADD COLUMN IF NOT EXISTS output_data     JSONB;
+ALTER TABLE public.scan_steps ADD COLUMN IF NOT EXISTS result          JSONB;
+ALTER TABLE public.scan_steps ADD COLUMN IF NOT EXISTS error_type      TEXT;
+ALTER TABLE public.scan_steps ADD COLUMN IF NOT EXISTS error_message   TEXT;
+ALTER TABLE public.scan_steps ADD COLUMN IF NOT EXISTS traceback       TEXT;
+ALTER TABLE public.scan_steps ADD COLUMN IF NOT EXISTS retryable       BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE public.scan_steps ADD COLUMN IF NOT EXISTS duration_ms     INT;
+ALTER TABLE public.scan_steps ADD COLUMN IF NOT EXISTS started_at      TIMESTAMPTZ;
+ALTER TABLE public.scan_steps ADD COLUMN IF NOT EXISTS finished_at     TIMESTAMPTZ;
+ALTER TABLE public.scan_steps ADD COLUMN IF NOT EXISTS created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE public.scan_steps ADD COLUMN IF NOT EXISTS updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+-- FK + UNIQUE conditionally (skip if data would violate)
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.table_constraints
+         WHERE constraint_schema='public' AND table_name='scan_steps'
+           AND constraint_name='scan_steps_job_id_fkey'
+    ) THEN
+        BEGIN
+            ALTER TABLE public.scan_steps
+              ADD CONSTRAINT scan_steps_job_id_fkey
+              FOREIGN KEY (job_id) REFERENCES public.scan_jobs(id) ON DELETE CASCADE;
+        EXCEPTION WHEN others THEN
+            RAISE NOTICE 'Skipped scan_steps_job_id_fkey: %', SQLERRM;
+        END;
+    END IF;
+END$$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.table_constraints
+         WHERE constraint_schema='public' AND table_name='scan_steps'
+           AND constraint_name='scan_steps_job_listing_step_uniq'
+    ) THEN
+        BEGIN
+            ALTER TABLE public.scan_steps
+              ADD CONSTRAINT scan_steps_job_listing_step_uniq
+              UNIQUE (job_id, listing_index, step_key);
+        EXCEPTION WHEN others THEN
+            RAISE NOTICE 'Skipped scan_steps unique constraint: %', SQLERRM;
+        END;
+    END IF;
+END$$;
+
+CREATE INDEX IF NOT EXISTS idx_scan_steps_job_id    ON public.scan_steps(job_id);
+CREATE INDEX IF NOT EXISTS idx_scan_steps_status    ON public.scan_steps(status);
+CREATE INDEX IF NOT EXISTS idx_scan_steps_job_order ON public.scan_steps(job_id, step_order);
+CREATE INDEX IF NOT EXISTS idx_scan_steps_created   ON public.scan_steps(created_at DESC);
 
 DROP TRIGGER IF EXISTS trg_scan_steps_updated ON public.scan_steps;
 CREATE TRIGGER trg_scan_steps_updated
     BEFORE UPDATE ON public.scan_steps
     FOR EACH ROW EXECUTE FUNCTION public.kua_set_updated_at();
 
+
+-- =============================================================================
+-- scan_logs
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS public.scan_logs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid()
+);
+
+ALTER TABLE public.scan_logs ADD COLUMN IF NOT EXISTS job_id     UUID;
+ALTER TABLE public.scan_logs ADD COLUMN IF NOT EXISTS step_id    UUID;
+ALTER TABLE public.scan_logs ADD COLUMN IF NOT EXISTS level      TEXT NOT NULL DEFAULT 'info';
+ALTER TABLE public.scan_logs ADD COLUMN IF NOT EXISTS message    TEXT NOT NULL DEFAULT '';
+ALTER TABLE public.scan_logs ADD COLUMN IF NOT EXISTS context    JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE public.scan_logs ADD COLUMN IF NOT EXISTS payload    JSONB;
+ALTER TABLE public.scan_logs ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.table_constraints
+         WHERE constraint_schema='public' AND table_name='scan_logs'
+           AND constraint_name='scan_logs_job_id_fkey'
+    ) THEN
+        BEGIN
+            ALTER TABLE public.scan_logs
+              ADD CONSTRAINT scan_logs_job_id_fkey
+              FOREIGN KEY (job_id) REFERENCES public.scan_jobs(id) ON DELETE CASCADE;
+        EXCEPTION WHEN others THEN
+            RAISE NOTICE 'Skipped scan_logs_job_id_fkey: %', SQLERRM;
+        END;
+    END IF;
+END$$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.table_constraints
+         WHERE constraint_schema='public' AND table_name='scan_logs'
+           AND constraint_name='scan_logs_step_id_fkey'
+    ) THEN
+        BEGIN
+            ALTER TABLE public.scan_logs
+              ADD CONSTRAINT scan_logs_step_id_fkey
+              FOREIGN KEY (step_id) REFERENCES public.scan_steps(id) ON DELETE SET NULL;
+        EXCEPTION WHEN others THEN
+            RAISE NOTICE 'Skipped scan_logs_step_id_fkey: %', SQLERRM;
+        END;
+    END IF;
+END$$;
+
+CREATE INDEX IF NOT EXISTS idx_scan_logs_job_id     ON public.scan_logs(job_id);
+CREATE INDEX IF NOT EXISTS idx_scan_logs_created_at ON public.scan_logs(job_id, created_at DESC);
+
+
+-- =============================================================================
+-- scan_errors
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS public.scan_errors (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid()
+);
+
+ALTER TABLE public.scan_errors ADD COLUMN IF NOT EXISTS job_id      UUID;
+ALTER TABLE public.scan_errors ADD COLUMN IF NOT EXISTS step_id     UUID;
+ALTER TABLE public.scan_errors ADD COLUMN IF NOT EXISTS listing_url TEXT;
+ALTER TABLE public.scan_errors ADD COLUMN IF NOT EXISTS error_type  TEXT NOT NULL DEFAULT 'Unknown';
+ALTER TABLE public.scan_errors ADD COLUMN IF NOT EXISTS message     TEXT NOT NULL DEFAULT '';
+ALTER TABLE public.scan_errors ADD COLUMN IF NOT EXISTS traceback   TEXT;
+ALTER TABLE public.scan_errors ADD COLUMN IF NOT EXISTS payload     JSONB;
+ALTER TABLE public.scan_errors ADD COLUMN IF NOT EXISTS retryable   BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE public.scan_errors ADD COLUMN IF NOT EXISTS attempt     INT NOT NULL DEFAULT 1;
+ALTER TABLE public.scan_errors ADD COLUMN IF NOT EXISTS created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.table_constraints
+         WHERE constraint_schema='public' AND table_name='scan_errors'
+           AND constraint_name='scan_errors_job_id_fkey'
+    ) THEN
+        BEGIN
+            ALTER TABLE public.scan_errors
+              ADD CONSTRAINT scan_errors_job_id_fkey
+              FOREIGN KEY (job_id) REFERENCES public.scan_jobs(id) ON DELETE CASCADE;
+        EXCEPTION WHEN others THEN
+            RAISE NOTICE 'Skipped scan_errors_job_id_fkey: %', SQLERRM;
+        END;
+    END IF;
+END$$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.table_constraints
+         WHERE constraint_schema='public' AND table_name='scan_errors'
+           AND constraint_name='scan_errors_step_id_fkey'
+    ) THEN
+        BEGIN
+            ALTER TABLE public.scan_errors
+              ADD CONSTRAINT scan_errors_step_id_fkey
+              FOREIGN KEY (step_id) REFERENCES public.scan_steps(id) ON DELETE SET NULL;
+        EXCEPTION WHEN others THEN
+            RAISE NOTICE 'Skipped scan_errors_step_id_fkey: %', SQLERRM;
+        END;
+    END IF;
+END$$;
+
+CREATE INDEX IF NOT EXISTS idx_scan_errors_job_id     ON public.scan_errors(job_id);
+CREATE INDEX IF NOT EXISTS idx_scan_errors_created_at ON public.scan_errors(job_id, created_at DESC);
+
+
+-- =============================================================================
+-- scan_listing_results
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS public.scan_listing_results (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid()
+);
+
+ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS job_id        UUID;
+ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS listing_index INT NOT NULL DEFAULT 0;
+ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS listing_url   TEXT;
+ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS status        TEXT NOT NULL DEFAULT 'pending';
+ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS property_id   TEXT;
+ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS deal_status   TEXT;
+ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS score         NUMERIC;
+ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS verdict       TEXT;
+ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS result        JSONB;
+ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS payload       JSONB;
+ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS error_message TEXT;
+ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.table_constraints
+         WHERE constraint_schema='public' AND table_name='scan_listing_results'
+           AND constraint_name='scan_listing_results_job_id_fkey'
+    ) THEN
+        BEGIN
+            ALTER TABLE public.scan_listing_results
+              ADD CONSTRAINT scan_listing_results_job_id_fkey
+              FOREIGN KEY (job_id) REFERENCES public.scan_jobs(id) ON DELETE CASCADE;
+        EXCEPTION WHEN others THEN
+            RAISE NOTICE 'Skipped scan_listing_results_job_id_fkey: %', SQLERRM;
+        END;
+    END IF;
+END$$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.table_constraints
+         WHERE constraint_schema='public' AND table_name='scan_listing_results'
+           AND constraint_name='scan_listing_results_job_listing_uniq'
+    ) THEN
+        BEGIN
+            ALTER TABLE public.scan_listing_results
+              ADD CONSTRAINT scan_listing_results_job_listing_uniq
+              UNIQUE (job_id, listing_index);
+        EXCEPTION WHEN others THEN
+            RAISE NOTICE 'Skipped scan_listing_results unique constraint: %', SQLERRM;
+        END;
+    END IF;
+END$$;
+
+CREATE INDEX IF NOT EXISTS idx_scan_listing_results_job_id ON public.scan_listing_results(job_id);
+CREATE INDEX IF NOT EXISTS idx_scan_listing_results_status ON public.scan_listing_results(status);
+CREATE INDEX IF NOT EXISTS idx_scan_listing_results_created ON public.scan_listing_results(created_at DESC);
+
 DROP TRIGGER IF EXISTS trg_scan_listing_results_updated ON public.scan_listing_results;
 CREATE TRIGGER trg_scan_listing_results_updated
     BEFORE UPDATE ON public.scan_listing_results
     FOR EACH ROW EXECUTE FUNCTION public.kua_set_updated_at();
 
--- ---------------------------------------------------------------------------
--- Permissions (service role used by backend)
--- ---------------------------------------------------------------------------
-GRANT USAGE ON SCHEMA public TO postgres, anon, authenticated, service_role;
-GRANT ALL ON ALL TABLES IN SCHEMA public TO postgres, service_role;
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO service_role;
 
--- Reload PostgREST schema cache so API sees new tables immediately
+-- =============================================================================
+-- extracted_properties
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS public.extracted_properties (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid()
+);
+
+ALTER TABLE public.extracted_properties ADD COLUMN IF NOT EXISTS job_id      UUID;
+ALTER TABLE public.extracted_properties ADD COLUMN IF NOT EXISTS listing_url TEXT;
+ALTER TABLE public.extracted_properties ADD COLUMN IF NOT EXISTS property_id TEXT;
+ALTER TABLE public.extracted_properties ADD COLUMN IF NOT EXISTS extracted   JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE public.extracted_properties ADD COLUMN IF NOT EXISTS economics   JSONB;
+ALTER TABLE public.extracted_properties ADD COLUMN IF NOT EXISTS score       JSONB;
+ALTER TABLE public.extracted_properties ADD COLUMN IF NOT EXISTS result      JSONB;
+ALTER TABLE public.extracted_properties ADD COLUMN IF NOT EXISTS payload     JSONB;
+ALTER TABLE public.extracted_properties ADD COLUMN IF NOT EXISTS created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.table_constraints
+         WHERE constraint_schema='public' AND table_name='extracted_properties'
+           AND constraint_name='extracted_properties_job_id_fkey'
+    ) THEN
+        BEGIN
+            ALTER TABLE public.extracted_properties
+              ADD CONSTRAINT extracted_properties_job_id_fkey
+              FOREIGN KEY (job_id) REFERENCES public.scan_jobs(id) ON DELETE SET NULL;
+        EXCEPTION WHEN others THEN
+            RAISE NOTICE 'Skipped extracted_properties_job_id_fkey: %', SQLERRM;
+        END;
+    END IF;
+END$$;
+
+CREATE INDEX IF NOT EXISTS idx_extracted_properties_job_id  ON public.extracted_properties(job_id);
+CREATE INDEX IF NOT EXISTS idx_extracted_properties_created ON public.extracted_properties(created_at DESC);
+
+
+-- =============================================================================
+-- generated_memos
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS public.generated_memos (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid()
+);
+
+ALTER TABLE public.generated_memos ADD COLUMN IF NOT EXISTS job_id      UUID;
+ALTER TABLE public.generated_memos ADD COLUMN IF NOT EXISTS property_id TEXT;
+ALTER TABLE public.generated_memos ADD COLUMN IF NOT EXISTS listing_url TEXT;
+ALTER TABLE public.generated_memos ADD COLUMN IF NOT EXISTS memo_text   TEXT NOT NULL DEFAULT '';
+ALTER TABLE public.generated_memos ADD COLUMN IF NOT EXISTS verdict     TEXT;
+ALTER TABLE public.generated_memos ADD COLUMN IF NOT EXISTS deal_status TEXT;
+ALTER TABLE public.generated_memos ADD COLUMN IF NOT EXISTS payload     JSONB;
+ALTER TABLE public.generated_memos ADD COLUMN IF NOT EXISTS created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.table_constraints
+         WHERE constraint_schema='public' AND table_name='generated_memos'
+           AND constraint_name='generated_memos_job_id_fkey'
+    ) THEN
+        BEGIN
+            ALTER TABLE public.generated_memos
+              ADD CONSTRAINT generated_memos_job_id_fkey
+              FOREIGN KEY (job_id) REFERENCES public.scan_jobs(id) ON DELETE SET NULL;
+        EXCEPTION WHEN others THEN
+            RAISE NOTICE 'Skipped generated_memos_job_id_fkey: %', SQLERRM;
+        END;
+    END IF;
+END$$;
+
+CREATE INDEX IF NOT EXISTS idx_generated_memos_job_id  ON public.generated_memos(job_id);
+CREATE INDEX IF NOT EXISTS idx_generated_memos_created ON public.generated_memos(created_at DESC);
+
+
+-- =============================================================================
+-- Permissions for the Supabase service role used by the backend
+-- =============================================================================
+GRANT USAGE ON SCHEMA public TO postgres, anon, authenticated, service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO service_role;
+
+-- Force PostgREST to reload its schema cache so the new tables/columns are
+-- visible to the REST API immediately (otherwise PGRST205 may persist).
 NOTIFY pgrst, 'reload schema';

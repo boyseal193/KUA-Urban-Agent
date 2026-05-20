@@ -1,7 +1,23 @@
+"""K.U.A. FastAPI application.
+
+Hardened with:
+  * Request-ID middleware (x-request-id propagated on every response)
+  * Global exception handler — no raw 500s without a JSON body
+  * /, /health, /health/database, /health/pipeline, /health/full
+  * Structured DatabaseSetupError / StoreError responses (503 / 502)
+  * Async job endpoints: enqueue, list, get, cancel, retry
+  * /jobs/cleanup admin endpoint to sweep stale jobs
+"""
+
+from __future__ import annotations
+
 import os
 import re
+import time
+import uuid
+from typing import Any, Dict, Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -16,27 +32,21 @@ from memo import generate_ic_memo
 from location import geocode_address
 from excel_exporter import export_scan_to_excel
 
+from jobs.logging_util import configure_logging, get_logger
+
+configure_logging(os.getenv("LOG_LEVEL", "INFO"))
 
 app = FastAPI(
     title="TruTrastero AI Backend / K.U.A.",
-    description="FastAPI backend for the K.U.A. (Klave Urban Agent) "
-    "acquisitions intelligence platform.",
-    version="1.0.0",
+    description=(
+        "FastAPI backend for the K.U.A. (Klave Urban Agent) acquisitions intelligence platform."
+    ),
+    version="1.1.0",
 )
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # CORS
-#
-# In production the Next.js Route Handlers proxy every browser request through
-# /api/proxy/*, so the browser never calls FastAPI directly and CORS is
-# technically optional. We still enable it so the API can be exercised from
-# local tooling (Postman, curl, Insomnia, Swagger /docs) and any future
-# first-party frontends.
-#
-# Allowed origins are loaded from FRONTEND_ORIGINS (comma-separated).
-# The defaults ALREADY include the known K.U.A. Railway frontend URLs so
-# things keep working even if FRONTEND_ORIGINS is missing.
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 _DEFAULT_ORIGINS = ",".join(
     [
         "https://honest-trust-production-fcdb.up.railway.app",
@@ -51,11 +61,7 @@ _origins = [
     if o.strip()
 ]
 
-# Allow Railway preview deployments (anything matching honest-trust-* /
-# kua-frontend-*) without manual reconfiguration on every push.
-_origin_regex = (
-    r"^https://(honest-trust|kua-frontend)[a-z0-9-]*\.up\.railway\.app$"
-)
+_origin_regex = r"^https://(honest-trust|kua-frontend)[a-z0-9-]*\.up\.railway\.app$"
 
 app.add_middleware(
     CORSMiddleware,
@@ -64,56 +70,94 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"],
+    expose_headers=["x-request-id"],
 )
+
+
+# ---------------------------------------------------------------------------
+# Request-ID + access log middleware
+# ---------------------------------------------------------------------------
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    request_id = request.headers.get("x-request-id") or uuid.uuid4().hex[:16]
+    request.state.request_id = request_id
+    started = time.monotonic()
+    log = get_logger(request_id, request.url.path)
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        log.exception("Unhandled error in request: %s", exc)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "error_type": type(exc).__name__,
+                "message": str(exc)[:500] or "Internal server error",
+                "request_id": request_id,
+                "elapsed_ms": elapsed_ms,
+                "retryable": False,
+            },
+            headers={"x-request-id": request_id},
+        )
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    response.headers["x-request-id"] = request_id
+    log.info("%s %s -> %s (%sms)", request.method, request.url.path, response.status_code, elapsed_ms)
+    return response
+
 
 app.include_router(auth_router, prefix="/auth", tags=["auth"])
 
 
+# ---------------------------------------------------------------------------
+# Root / liveness
+# ---------------------------------------------------------------------------
 @app.get("/")
 def home():
-    return {"status": "running", "message": "TruTrastero AI Backend is live"}
+    return {"status": "running", "service": "kua-backend", "version": "1.1.0"}
 
 
+@app.get("/health")
+def health():
+    """Cheap liveness probe — no Supabase round-trip."""
+    return {"ok": True, "service": "kua-backend", "ts": time.time()}
+
+
+# ---------------------------------------------------------------------------
+# Property processing helpers (unchanged behaviour, defensive defaults)
+# ---------------------------------------------------------------------------
 def safe_float(value, default=None):
     if value is None:
         return default
-
     if isinstance(value, bool):
         return default
-
     if isinstance(value, (int, float)):
         return float(value)
-
     if isinstance(value, str):
         value = value.strip().lower()
-        value = value.replace(",", ".")
-        value = value.replace("m²", "")
-        value = value.replace("m2", "")
-        value = value.replace("meters", "")
-        value = value.replace("metres", "")
-        value = value.replace("€", "")
-        value = value.replace("eur", "")
-        value = value.strip()
-
+        value = (
+            value.replace(",", ".")
+            .replace("m²", "")
+            .replace("m2", "")
+            .replace("meters", "")
+            .replace("metres", "")
+            .replace("€", "")
+            .replace("eur", "")
+            .strip()
+        )
         nums = re.findall(r"\d+(?:\.\d+)?", value)
-
         if len(nums) >= 2:
             nums = [float(x) for x in nums[:2]]
             return round(sum(nums) / len(nums), 2)
-
         if len(nums) == 1:
             return float(nums[0])
-
     return default
 
 
 def clean_property_data(data: dict):
     if not data:
         return {}
-
     cleaned = dict(data)
-
     cleaned["gba_m2"] = safe_float(cleaned.get("gba_m2"))
     cleaned["asking_price"] = safe_float(cleaned.get("asking_price"))
     cleaned["asking_rent_month"] = safe_float(cleaned.get("asking_rent_month"))
@@ -121,70 +165,63 @@ def clean_property_data(data: dict):
     cleaned["ceiling_height"] = safe_float(cleaned.get("ceiling_height"))
     cleaned["price_per_m2_nra"] = safe_float(cleaned.get("price_per_m2_nra"))
     cleaned["nra_efficiency"] = safe_float(cleaned.get("nra_efficiency"))
-
     if cleaned.get("city") is None:
         cleaned["city"] = "Barcelona"
-
     if cleaned.get("price_per_m2_nra") is None:
         cleaned["price_per_m2_nra"] = 15
-
     if cleaned.get("nra_efficiency") is None:
         cleaned["nra_efficiency"] = 0.75
-
     if cleaned.get("loading_access") is None:
         cleaned["loading_access"] = False
-
     return cleaned
 
 
 def is_valid_property_data(data: dict):
     if not data:
         return False, "No extracted property data"
-
     if data.get("gba_m2") is None or data.get("gba_m2") <= 0:
         return False, "Missing or invalid GBA"
-
     if data.get("asking_price") is None and data.get("asking_rent_month") is None:
         return False, "Missing both asking price and asking rent"
-
     return True, None
 
 
 def assign_deal_status(score: dict):
+    if not isinstance(score, dict):
+        return "rejected"
     score_value = score.get("score", 0)
     verdict = score.get("verdict")
     deal_killer = score.get("deal_killer")
-
     if deal_killer:
         return "rejected"
-
     if verdict == "YES" and score_value >= 80:
         return "approved_candidate"
-
     if score_value >= 60:
         return "manual_review"
-
     return "rejected"
 
 
 def generate_rejection_note(property_data: dict, economics: dict, score: dict):
+    pd = property_data or {}
+    ec = economics or {}
+    sc = score or {}
     return f"""
 # REJECTION SUMMARY
 
-Property: {property_data.get("address")}, {property_data.get("city")}
-Verdict: {score.get("verdict")}
-Score: {score.get("score")}/100
-Classification: {score.get("classification")}
-Deal killer: {score.get("deal_killer") or "Score below investment threshold"}
+Property: {pd.get("address")}, {pd.get("city")}
+Verdict: {sc.get("verdict")}
+Score: {sc.get("score")}/100
+Classification: {sc.get("classification")}
+Deal killer: {sc.get("deal_killer") or "Score below investment threshold"}
 
 Key metrics:
-- GBA: {property_data.get("gba_m2")} m²
-- Asking price: €{property_data.get("asking_price")}
-- EBITDA: €{economics.get("ebitda")}
-- EBITDA yield: {economics.get("ebitda_yield")}
-- True EBITDA yield: {economics.get("true_ebitda_yield")}
-- Payback years: {economics.get("payback_years")}
-- True payback years: {economics.get("true_payback_years")}
+- GBA: {pd.get("gba_m2")} m²
+- Asking price: €{pd.get("asking_price")}
+- EBITDA: €{ec.get("ebitda")}
+- EBITDA yield: {ec.get("ebitda_yield")}
+- True EBITDA yield: {ec.get("true_ebitda_yield")}
+- Payback years: {ec.get("payback_years")}
+- True payback years: {ec.get("true_payback_years")}
 
 Reason:
 This deal was rejected automatically because it does not meet the minimum TruTrastero investment threshold. It remains saved in the rejected history for manual review.
@@ -196,17 +233,16 @@ def run_full_pipeline(data: dict, source: str = "auto"):
 
     valid, error = is_valid_property_data(data)
     if not valid:
-        return {
-            "success": False,
-            "error": error,
-            "extracted": data,
-        }
+        return {"success": False, "error": error, "extracted": data}
 
-    full_address = f"{data.get('address') or data.get('neighbourhood') or data.get('city')}, {data.get('city')}, Spain"
-    coordinates = geocode_address(full_address)
+    full_address = (
+        f"{data.get('address') or data.get('neighbourhood') or data.get('city')}, "
+        f"{data.get('city')}, Spain"
+    )
+    coordinates = geocode_address(full_address) or {"lat": None, "lng": None}
 
-    data["latitude"] = coordinates["lat"]
-    data["longitude"] = coordinates["lng"]
+    data["latitude"] = coordinates.get("lat")
+    data["longitude"] = coordinates.get("lng")
 
     economics = calculate_economics(
         gba_m2=data.get("gba_m2"),
@@ -219,11 +255,9 @@ def run_full_pipeline(data: dict, source: str = "auto"):
 
     auto_scores = calculate_auto_scores(data, economics)
 
-    final_score = score_property({
-        "extracted": data,
-        "economics": economics,
-        "auto_scores": auto_scores,
-    })
+    final_score = score_property(
+        {"extracted": data, "economics": economics, "auto_scores": auto_scores}
+    )
 
     deal_status = assign_deal_status(final_score)
 
@@ -254,6 +288,8 @@ def run_full_pipeline(data: dict, source: str = "auto"):
     }
 
     property_response = supabase.table("properties").insert(property_insert).execute()
+    if not property_response.data:
+        return {"success": False, "error": "Supabase did not return inserted property"}
     property_id = property_response.data[0]["id"]
 
     if deal_status in ["approved_candidate", "manual_review"]:
@@ -269,8 +305,6 @@ def run_full_pipeline(data: dict, source: str = "auto"):
             score=final_score,
         )
 
-    # Persist auto_scores alongside the final score so the frontend
-    # score-breakdown radar can render even for historical deals.
     enriched_score = dict(final_score)
     if isinstance(auto_scores, dict) and "auto_scores" in auto_scores:
         enriched_score.setdefault("auto_scores", auto_scores.get("auto_scores"))
@@ -285,7 +319,6 @@ def run_full_pipeline(data: dict, source: str = "auto"):
         "deal_killer": final_score.get("deal_killer"),
         "ic_memo": memo_text,
     }
-
     supabase.table("analyses").insert(analysis_insert).execute()
 
     return {
@@ -297,82 +330,40 @@ def run_full_pipeline(data: dict, source: str = "auto"):
         "score": final_score,
         "deal_status": deal_status,
         "ic_memo": memo_text,
+        "success": True,
     }
 
 
+# ---------------------------------------------------------------------------
+# Single-listing analyse
+# ---------------------------------------------------------------------------
 @app.post("/analyse")
 def analyse(payload: dict):
-    url = payload.get("url")
-    raw_text = payload.get("text") or payload.get("raw_text")
+    url = (payload or {}).get("url")
+    raw_text = (payload or {}).get("text") or (payload or {}).get("raw_text")
 
     if not url and not raw_text:
         return {"success": False, "error": "Provide either url or text/raw_text"}
 
     if url:
         scraped = scrape_listing_text(url)
-
         if not scraped.get("success"):
             return scraped
-
         raw_text = scraped.get("raw_text", "")
-        data = extract_property_from_text(raw_text)
+        data = extract_property_from_text(raw_text) or {}
         data["listing_url"] = url
-
         result = run_full_pipeline(data, source="url_auto")
-        result["scrape_preview"] = raw_text[:1000]
+        result["scrape_preview"] = (raw_text or "")[:1000]
         result["source_url"] = url
         return result
 
-    data = extract_property_from_text(raw_text)
+    data = extract_property_from_text(raw_text) or {}
     return run_full_pipeline(data, source="text_auto")
 
 
-def split_scan_results(results: list):
-    successful_results = [
-        r for r in results
-        if isinstance(r, dict)
-        and r.get("property_id")
-        and r.get("score")
-    ]
-
-    failed_results = [
-        r for r in results
-        if not (
-            isinstance(r, dict)
-            and r.get("property_id")
-            and r.get("score")
-        )
-    ]
-
-    approved_candidates = [
-        r for r in successful_results
-        if r.get("deal_status") == "approved_candidate"
-    ]
-
-    manual_review_deals = [
-        r for r in successful_results
-        if r.get("deal_status") == "manual_review"
-    ]
-
-    rejected_deals = [
-        r for r in successful_results
-        if r.get("deal_status") == "rejected"
-    ]
-
-    top_deals = approved_candidates + manual_review_deals
-    rejected_history = failed_results + rejected_deals
-
-    return {
-        "successful_results": successful_results,
-        "failed_results": failed_results,
-        "approved_candidates": approved_candidates,
-        "manual_review_deals": manual_review_deals,
-        "top_deals": top_deals,
-        "rejected_deals": rejected_deals,
-        "rejected_history": rejected_history,
-    }
-
-
+# ---------------------------------------------------------------------------
+# Structured error responses
+# ---------------------------------------------------------------------------
 def _setup_error_response(exc) -> JSONResponse:
     from jobs.errors import DatabaseSetupError
 
@@ -384,6 +375,7 @@ def _setup_error_response(exc) -> JSONResponse:
                 "error_type": "DatabaseSetupError",
                 "message": str(exc),
                 "missing_tables": exc.missing_tables,
+                "missing_columns": exc.missing_columns,
                 "retryable": False,
                 "setup_required": True,
             },
@@ -399,6 +391,21 @@ def _setup_error_response(exc) -> JSONResponse:
     )
 
 
+def _store_error_response(exc) -> JSONResponse:
+    return JSONResponse(
+        status_code=502,
+        content={
+            "success": False,
+            "error_type": "StoreError",
+            "message": str(exc),
+            "retryable": getattr(exc, "retryable", False),
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Scan enqueue
+# ---------------------------------------------------------------------------
 def _enqueue_scan_job(
     *,
     job_type: str,
@@ -406,9 +413,9 @@ def _enqueue_scan_job(
     filters: dict,
     limit: int,
     generate_excel: bool,
-    created_by: str | None = None,
+    created_by: Optional[str] = None,
+    request_id: Optional[str] = None,
 ):
-    """Create an async scan job and return immediately with job_id."""
     from jobs import store
     from jobs.errors import DatabaseSetupError, StoreError
 
@@ -420,19 +427,12 @@ def _enqueue_scan_job(
             listing_limit=limit,
             generate_excel=generate_excel,
             created_by=created_by,
+            request_id=request_id,
         )
     except DatabaseSetupError as exc:
         return _setup_error_response(exc)
     except StoreError as exc:
-        return JSONResponse(
-            status_code=502,
-            content={
-                "success": False,
-                "error_type": "StoreError",
-                "message": str(exc),
-                "retryable": exc.retryable,
-            },
-        )
+        return _store_error_response(exc)
 
     return {
         "success": True,
@@ -445,24 +445,23 @@ def _enqueue_scan_job(
 
 
 @app.post("/scan/idealista")
-def scan_idealista(payload: dict):
-    """
-    Enqueue an Idealista batch scan. Returns job_id immediately.
-    Long-running work is processed by the background worker.
-    """
-    search_url = payload.get("search_url")
-    limit = int(payload.get("limit", 10))
-    generate_excel = payload.get("generate_excel", True)
-    filters_used = payload.get("filters_used", payload)
-    created_by = payload.get("created_by")
+def scan_idealista(payload: dict, request: Request):
+    search_url = (payload or {}).get("search_url")
+    limit = int((payload or {}).get("limit", 10))
+    generate_excel = (payload or {}).get("generate_excel", True)
+    filters_used = (payload or {}).get("filters_used", payload)
+    created_by = (payload or {}).get("created_by")
 
     if not search_url:
-        return {
-            "success": False,
-            "error_type": "ValidationError",
-            "message": "search_url is required",
-            "retryable": False,
-        }
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "error_type": "ValidationError",
+                "message": "search_url is required",
+                "retryable": False,
+            },
+        )
 
     return _enqueue_scan_job(
         job_type="idealista_url",
@@ -471,14 +470,13 @@ def scan_idealista(payload: dict):
         limit=limit,
         generate_excel=bool(generate_excel),
         created_by=created_by,
+        request_id=getattr(request.state, "request_id", None),
     )
 
 
 @app.post("/scan/idealista/auto")
-def scan_idealista_auto(payload: dict):
-    """
-    Enqueue an auto-filter Idealista scan. Returns job_id immediately.
-    """
+def scan_idealista_auto(payload: dict, request: Request):
+    payload = payload or {}
     city_slug = payload.get("city_slug", "barcelona-barcelona")
     max_price = int(payload.get("max_price", 1000000))
     min_m2 = int(payload.get("min_m2", 200))
@@ -495,7 +493,8 @@ def scan_idealista_auto(payload: dict):
         f"metros-cuadrados-mas-de_{min_m2}",
         f"metros-cuadrados-menos-de_{max_m2}",
     ]
-    filter_parts.extend(property_types)
+    if isinstance(property_types, list):
+        filter_parts.extend(property_types)
     if ground_floor_only:
         filter_parts.append("en-planta-calle")
     if sale_only:
@@ -524,9 +523,13 @@ def scan_idealista_auto(payload: dict):
         limit=limit,
         generate_excel=bool(generate_excel),
         created_by=created_by,
+        request_id=getattr(request.state, "request_id", None),
     )
 
 
+# ---------------------------------------------------------------------------
+# Property + deals (legacy direct reads — kept for backward compat)
+# ---------------------------------------------------------------------------
 @app.post("/property/from-url")
 def analyse_from_url(payload: dict):
     return analyse(payload)
@@ -540,16 +543,10 @@ def analyse_from_text(payload: dict):
 @app.get("/property/{property_id}")
 def get_property_detail(property_id: str):
     property_result = (
-        supabase.table("properties")
-        .select("*")
-        .eq("id", property_id)
-        .execute()
-        .data
+        supabase.table("properties").select("*").eq("id", property_id).execute().data
     )
-
     if not property_result:
         return {"success": False, "error": "Property not found"}
-
     analysis_result = (
         supabase.table("analyses")
         .select("*")
@@ -559,7 +556,6 @@ def get_property_detail(property_id: str):
         .execute()
         .data
     )
-
     return {
         "success": True,
         "property": property_result[0],
@@ -577,8 +573,7 @@ def get_top_deals(limit: int = 10):
         .limit(limit)
         .execute()
     )
-
-    return {"top_deals": results.data}
+    return {"top_deals": results.data or []}
 
 
 @app.get("/deals/manual-review")
@@ -591,8 +586,7 @@ def get_manual_review_deals(limit: int = 10):
         .limit(limit)
         .execute()
     )
-
-    return {"manual_review_deals": results.data}
+    return {"manual_review_deals": results.data or []}
 
 
 @app.get("/deals/approved")
@@ -605,8 +599,7 @@ def get_approved_deals(limit: int = 10):
         .limit(limit)
         .execute()
     )
-
-    return {"approved_candidates": results.data}
+    return {"approved_candidates": results.data or []}
 
 
 @app.get("/deals/status/{deal_status}")
@@ -619,8 +612,7 @@ def get_deals_by_status(deal_status: str, limit: int = 10):
         .limit(limit)
         .execute()
     )
-
-    return {"deals": results.data}
+    return {"deals": results.data or []}
 
 
 @app.get("/deals/rejected")
@@ -633,20 +625,14 @@ def get_rejected_deals(limit: int = 10):
         .limit(limit)
         .execute()
     )
-
-    return {"rejected_deals": results.data}
+    return {"rejected_deals": results.data or []}
 
 
 @app.post("/property/memo/{property_id}")
 def generate_memo(property_id: str):
     property_result = (
-        supabase.table("properties")
-        .select("*")
-        .eq("id", property_id)
-        .execute()
-        .data
+        supabase.table("properties").select("*").eq("id", property_id).execute().data
     )
-
     if not property_result:
         return {"error": "Property not found"}
 
@@ -659,7 +645,6 @@ def generate_memo(property_id: str):
         .execute()
         .data
     )
-
     if not analysis_result:
         return {"error": "No analysis found for this property"}
 
@@ -672,55 +657,69 @@ def generate_memo(property_id: str):
         score=analysis_data["score"],
     )
 
-    supabase.table("analyses").update({
-        "ic_memo": memo_text
-    }).eq("id", analysis_data["id"]).execute()
+    supabase.table("analyses").update({"ic_memo": memo_text}).eq(
+        "id", analysis_data["id"]
+    ).execute()
 
-    return {
-        "property_id": property_id,
-        "ic_memo": memo_text,
-    }
+    return {"property_id": property_id, "ic_memo": memo_text}
 
 
-# =============================================================================
-# Async job API — poll these endpoints from the frontend
-# =============================================================================
-
+# ---------------------------------------------------------------------------
+# Health endpoints
+# ---------------------------------------------------------------------------
 @app.get("/health/full")
 def health_full():
     from jobs.health import full_health
+
     return full_health()
 
 
 @app.get("/health/database")
 def health_database():
     from jobs.db_health import database_health
+
     result = database_health(force=True)
     status_code = 200 if result.get("success") else 503
     return JSONResponse(status_code=status_code, content=result)
 
 
+@app.get("/health/pipeline")
+def health_pipeline():
+    from jobs.health import pipeline_health
+
+    result = pipeline_health()
+    status_code = 200 if result.get("ok") else 503
+    return JSONResponse(status_code=status_code, content=result)
+
+
+# ---------------------------------------------------------------------------
+# Async job API — frontend polls these
+# ---------------------------------------------------------------------------
 @app.get("/jobs")
-def list_scan_jobs(limit: int = 20):
+def list_scan_jobs(limit: int = 20, status: Optional[str] = None):
     from jobs import store
-    from jobs.errors import DatabaseSetupError
+    from jobs.errors import DatabaseSetupError, StoreError
 
     try:
-        jobs = store.list_jobs(limit=limit)
+        jobs = store.list_jobs(limit=limit, status=status)
         return {"success": True, "jobs": jobs}
     except DatabaseSetupError as exc:
         return _setup_error_response(exc)
+    except StoreError as exc:
+        return _store_error_response(exc)
 
 
 @app.get("/jobs/{job_id}")
 def get_scan_job(job_id: str):
     from jobs import store
-    from jobs.errors import DatabaseSetupError
+    from jobs.errors import DatabaseSetupError, StoreError
 
     try:
         return store.build_job_response(job_id)
     except DatabaseSetupError as exc:
         return _setup_error_response(exc)
+    except StoreError as exc:
+        return _store_error_response(exc)
     except KeyError:
         return JSONResponse(
             status_code=404,
@@ -736,20 +735,76 @@ def get_scan_job(job_id: str):
 @app.post("/jobs/{job_id}/cancel")
 def cancel_scan_job(job_id: str):
     from jobs import store
-    from jobs.constants import JOB_CANCELLED
+    from jobs.constants import JOB_CANCELLED, TERMINAL_JOB_STATUSES
+    from jobs.errors import DatabaseSetupError, StoreError
 
     try:
         job = store.get_job(job_id)
     except KeyError:
-        return {
-            "success": False,
-            "error_type": "NotFound",
-            "message": f"Job not found: {job_id}",
-            "retryable": False,
-        }
+        return JSONResponse(
+            status_code=404,
+            content={
+                "success": False,
+                "error_type": "NotFound",
+                "message": f"Job not found: {job_id}",
+                "retryable": False,
+            },
+        )
+    except DatabaseSetupError as exc:
+        return _setup_error_response(exc)
+    except StoreError as exc:
+        return _store_error_response(exc)
 
-    if job.get("status") in ("success", "failed", "cancelled"):
+    if job.get("status") in TERMINAL_JOB_STATUSES:
         return {"success": True, "job": job, "message": "Job already terminal"}
 
-    updated = store.update_job(job_id, status=JOB_CANCELLED, finished_at=store._now())
-    return {"success": True, "job": updated}
+    try:
+        updated = store.update_job(
+            job_id, status=JOB_CANCELLED, finished_at=store._now()
+        )
+        return {"success": True, "job": updated}
+    except StoreError as exc:
+        return _store_error_response(exc)
+
+
+@app.post("/jobs/{job_id}/retry")
+def retry_scan_job(job_id: str):
+    from jobs import store
+    from jobs.errors import DatabaseSetupError, StoreError
+
+    try:
+        job = store.requeue_for_retry(job_id)
+        return {
+            "success": True,
+            "job": job,
+            "message": "Job re-queued for the worker.",
+        }
+    except DatabaseSetupError as exc:
+        return _setup_error_response(exc)
+    except StoreError as exc:
+        return _store_error_response(exc)
+    except KeyError:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "success": False,
+                "error_type": "NotFound",
+                "message": f"Job not found: {job_id}",
+                "retryable": False,
+            },
+        )
+
+
+@app.post("/jobs/cleanup")
+def cleanup_dead_jobs():
+    """Force a dead-job sweep. Safe to call any time."""
+    from jobs import store
+    from jobs.errors import DatabaseSetupError, StoreError
+
+    try:
+        recovered = store.sweep_dead_jobs()
+        return {"success": True, "recovered": recovered}
+    except DatabaseSetupError as exc:
+        return _setup_error_response(exc)
+    except StoreError as exc:
+        return _store_error_response(exc)
