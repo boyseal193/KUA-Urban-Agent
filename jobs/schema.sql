@@ -490,6 +490,103 @@ FOR EACH ROW EXECUTE FUNCTION public.touch_export_jobs_updated_at();
 
 
 -- =============================================================================
+-- properties — dedupe + soft-delete columns
+-- The properties table itself is created/owned by the legacy Supabase setup;
+-- here we only ADD COLUMN IF NOT EXISTS, so existing rows are preserved.
+-- =============================================================================
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS deleted_at              TIMESTAMPTZ;
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS deleted_by              TEXT;
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS deletion_reason         TEXT;
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS dedupe_key              TEXT;
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS duplicate_of            UUID;
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS merged_into_property_id UUID;
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS is_test                 BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS scan_count              INT     NOT NULL DEFAULT 1;
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS first_seen_at           TIMESTAMPTZ;
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS last_seen_at            TIMESTAMPTZ;
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS first_seen_job_id       UUID;
+ALTER TABLE public.properties ADD COLUMN IF NOT EXISTS last_seen_job_id        UUID;
+
+-- Self-referencing FK for duplicate_of (no CASCADE — a deleted duplicate
+-- should not nuke the canonical row it points to).
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.table_constraints
+         WHERE constraint_schema='public' AND table_name='properties'
+           AND constraint_name='properties_duplicate_of_fkey'
+    ) THEN
+        BEGIN
+            ALTER TABLE public.properties
+              ADD CONSTRAINT properties_duplicate_of_fkey
+              FOREIGN KEY (duplicate_of) REFERENCES public.properties(id) ON DELETE SET NULL;
+        EXCEPTION WHEN others THEN
+            RAISE NOTICE 'Skipped properties_duplicate_of_fkey: %', SQLERRM;
+        END;
+    END IF;
+END$$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.table_constraints
+         WHERE constraint_schema='public' AND table_name='properties'
+           AND constraint_name='properties_merged_into_fkey'
+    ) THEN
+        BEGIN
+            ALTER TABLE public.properties
+              ADD CONSTRAINT properties_merged_into_fkey
+              FOREIGN KEY (merged_into_property_id) REFERENCES public.properties(id) ON DELETE SET NULL;
+        EXCEPTION WHEN others THEN
+            RAISE NOTICE 'Skipped properties_merged_into_fkey: %', SQLERRM;
+        END;
+    END IF;
+END$$;
+
+-- Unique partial index: at most one ACTIVE (non-deleted) row per dedupe_key.
+-- Soft-deleted rows are exempt so the operator can restore one later.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_properties_dedupe_key_active
+ON public.properties(dedupe_key)
+WHERE deleted_at IS NULL AND dedupe_key IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_properties_deleted_at      ON public.properties(deleted_at);
+CREATE INDEX IF NOT EXISTS idx_properties_listing_url     ON public.properties(listing_url) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_properties_duplicate_of    ON public.properties(duplicate_of);
+CREATE INDEX IF NOT EXISTS idx_properties_last_seen_at    ON public.properties(last_seen_at DESC);
+
+
+-- =============================================================================
+-- analyses / generated_memos / scan_jobs — soft-delete columns
+-- =============================================================================
+ALTER TABLE public.analyses        ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+ALTER TABLE public.generated_memos ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+ALTER TABLE public.scan_jobs       ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_analyses_deleted_at        ON public.analyses(deleted_at);
+CREATE INDEX IF NOT EXISTS idx_generated_memos_deleted_at ON public.generated_memos(deleted_at);
+CREATE INDEX IF NOT EXISTS idx_scan_jobs_deleted_at       ON public.scan_jobs(deleted_at);
+
+
+-- =============================================================================
+-- audit_log — append-only record of deletes / restores / cleanup actions
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS public.audit_log (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid()
+);
+
+ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS actor         TEXT;
+ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS action        TEXT NOT NULL DEFAULT 'unknown';
+ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS resource_type TEXT;
+ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS resource_id   TEXT;
+ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS payload       JSONB;
+ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS request_id    TEXT;
+ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_created_at   ON public.audit_log(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_log_resource     ON public.audit_log(resource_type, resource_id);
+CREATE INDEX IF NOT EXISTS idx_audit_log_action       ON public.audit_log(action);
+
+
+-- =============================================================================
 -- Permissions for the Supabase service role used by the backend
 -- =============================================================================
 GRANT USAGE ON SCHEMA public TO postgres, anon, authenticated, service_role;

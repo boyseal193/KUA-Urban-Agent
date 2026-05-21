@@ -17,6 +17,7 @@ import { Badge } from "@/components/ui/badge";
 import { ScoreBadge } from "./score-badge";
 import { DealStatusIndicator } from "./deal-status-indicator";
 import { YieldWidget } from "./yield-widget";
+import { DeletePropertyButton } from "@/components/properties/delete-property-button";
 import { moneyCompact, yearsLabel, metersLabel } from "@/lib/format";
 import { verdictMeta } from "@/lib/constants";
 import { cn } from "@/lib/utils";
@@ -62,6 +63,15 @@ export function DealCard({
     >
       {/* hover sweep */}
       <div className="pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-primary/60 to-transparent opacity-0 transition-opacity group-hover:opacity-100" />
+
+      {/* delete affordance — overlay so it doesn't trip the card link */}
+      <div className="absolute right-2 top-2 z-20 opacity-0 transition-opacity group-hover:opacity-100">
+        <DeletePropertyButton
+          propertyId={deal.id}
+          label={deal.address || deal.neighbourhood || undefined}
+          variant="icon"
+        />
+      </div>
 
       <Link href={`/deals/${deal.id}`} className="block p-4">
         <div className="flex items-start justify-between gap-3">

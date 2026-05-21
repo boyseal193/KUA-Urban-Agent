@@ -23,6 +23,7 @@ import { ExportButton } from "@/components/deals/export-button";
 import { DealMiniMap } from "@/components/deals/deal-mini-map";
 import { KpiGridSkeleton } from "@/components/common/loading-skeleton";
 import { EmptyState } from "@/components/common/empty-state";
+import { DeletePropertyButton } from "@/components/properties/delete-property-button";
 
 import { usePropertyDetail } from "@/hooks/use-deals";
 import { verdictMeta } from "@/lib/constants";
@@ -89,6 +90,11 @@ export default function DealDetailPage() {
               </Button>
             </Link>
             <ExportButton property={property} analysis={analysis} />
+            <DeletePropertyButton
+              propertyId={property.id}
+              label={property.address || property.neighbourhood || `Property ${property.id.slice(0, 8)}`}
+              redirectTo="/pipeline"
+            />
           </>
         }
       />

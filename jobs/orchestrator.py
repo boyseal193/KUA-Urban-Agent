@@ -308,11 +308,19 @@ def _process_listing(job_id: str, listing_index: int, url: str) -> dict:
 
     def save_step():
         from database import supabase
+        from jobs.properties_store import upsert_from_pipeline
 
-        property_response = supabase.table("properties").insert(property_insert).execute()
-        if not property_response.data:
-            raise RuntimeError("Supabase did not return inserted property row")
-        property_id = property_response.data[0]["id"]
+        upsert = upsert_from_pipeline(
+            property_insert=property_insert,
+            extracted=data,
+            job_id=job_id,
+        )
+        if not upsert.get("success") or not upsert.get("property_id"):
+            raise RuntimeError(
+                f"Supabase did not return property id: {upsert.get('error', 'unknown')}"
+            )
+        property_id = upsert["property_id"]
+        was_duplicate = upsert.get("was_duplicate", False)
 
         enriched_score = dict(final_score)
         auto_scores = score_out.get("auto_scores")
@@ -352,6 +360,8 @@ def _process_listing(job_id: str, listing_index: int, url: str) -> dict:
             "ic_memo": memo_text,
             "source_url": url,
             "success": True,
+            "duplicate": was_duplicate,
+            "dedupe_key": upsert.get("dedupe_key"),
         }
 
     result = _run_with_retry(

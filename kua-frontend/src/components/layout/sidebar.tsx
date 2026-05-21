@@ -7,11 +7,13 @@ import { motion } from "framer-motion";
 import {
   BrainCircuit,
   Columns3,
+  History,
   LayoutGrid,
   MapPinned,
   Radar,
   Settings,
   ShieldCheck,
+  Wrench,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { APP_NAME, APP_SHORT } from "@/lib/constants";
@@ -20,13 +22,15 @@ const NAV = [
   { href: "/dashboard", label: "Command", icon: LayoutGrid, kbd: "1" },
   { href: "/pipeline", label: "Pipeline", icon: Columns3, kbd: "2" },
   { href: "/scan", label: "Live Scan", icon: Radar, kbd: "3" },
-  { href: "/map", label: "Tactical Map", icon: MapPinned, kbd: "4" },
+  { href: "/scans", label: "History", icon: History, kbd: "4" },
+  { href: "/map", label: "Tactical Map", icon: MapPinned, kbd: "5" },
   {
     href: "/intelligence",
     label: "Intelligence",
     icon: BrainCircuit,
-    kbd: "5",
+    kbd: "6",
   },
+  { href: "/admin", label: "Admin", icon: Wrench, kbd: "7" },
 ];
 
 function Logo() {

@@ -1,18 +1,20 @@
 "use client";
 
 import * as React from "react";
-import { Radar } from "lucide-react";
+import { Radar, Activity } from "lucide-react";
 import { PageHeader } from "@/components/common/page-header";
 import { ScanLauncher } from "@/components/scan/scan-launcher";
 import { LiveScanFeed } from "@/components/scan/live-scan-feed";
 import { ScanHistory } from "@/components/scan/scan-history";
 import { StatusPill } from "@/components/common/status-pill";
 import { ErrorBoundary } from "@/components/error-boundary";
+import { useActiveScan } from "@/lib/contexts/active-scan-context";
 import type { AnalysisResult, ScanResponse } from "@/lib/api/types";
 
 export default function ScanPage() {
   const [liveResults, setLiveResults] = React.useState<AnalysisResult[]>([]);
   const [summary, setSummary] = React.useState<ScanResponse | null>(null);
+  const activeScan = useActiveScan();
 
   // Stable callbacks — passed to a child that wraps them in useEffect.
   // Without these, every render would create a new function reference,
@@ -49,6 +51,19 @@ export default function ScanPage() {
         subtitle="Launch an async Idealista sweep. The backend worker processes listings in the background while this page polls live pipeline state."
         rightSlot={<StatusPill label="ASYNC ENGINE" color="#38E1FF" />}
       />
+
+      {activeScan.isResumed && activeScan.isPolling && (
+        <div className="flex items-center gap-2 rounded-md border border-primary/40 bg-primary/[0.08] px-4 py-3 backdrop-blur-xl">
+          <Activity className="h-3.5 w-3.5 text-primary" />
+          <p className="text-xs text-foreground">
+            Reconnected to an in-flight scan ·{" "}
+            <code className="font-mono text-primary">
+              {activeScan.jobId?.slice(0, 12)}
+            </code>{" "}
+            · the worker kept running while you were away.
+          </p>
+        </div>
+      )}
 
       <ErrorBoundary>
         <ScanLauncher

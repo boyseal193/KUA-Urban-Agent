@@ -5,6 +5,8 @@ import { Topbar } from "@/components/layout/topbar";
 import { StatusTicker } from "@/components/layout/status-ticker";
 import { AuthGuard } from "@/components/auth/auth-guard";
 import { ErrorBoundary } from "@/components/error-boundary";
+import { ActiveScanProvider } from "@/lib/contexts/active-scan-context";
+import { ActiveScanBanner } from "@/components/scan/active-scan-banner";
 
 /**
  * Server-rendered dashboard shell.
@@ -26,18 +28,21 @@ export default async function DashboardLayout({
 
   return (
     <AuthGuard>
-      <div className="relative z-10 flex min-h-screen">
-        <Sidebar />
-        <div className="flex min-h-screen w-full min-w-0 flex-col">
-          <Topbar />
-          <StatusTicker />
-          <main className="relative flex-1 overflow-x-hidden">
-            <div className="mx-auto w-full max-w-[1600px] px-4 py-6 sm:px-6 lg:px-8 lg:py-8">
-              <ErrorBoundary>{children}</ErrorBoundary>
-            </div>
-          </main>
+      <ActiveScanProvider>
+        <div className="relative z-10 flex min-h-screen">
+          <Sidebar />
+          <div className="flex min-h-screen w-full min-w-0 flex-col">
+            <Topbar />
+            <StatusTicker />
+            <main className="relative flex-1 overflow-x-hidden">
+              <div className="mx-auto w-full max-w-[1600px] px-4 py-6 sm:px-6 lg:px-8 lg:py-8">
+                <ErrorBoundary>{children}</ErrorBoundary>
+              </div>
+            </main>
+          </div>
         </div>
-      </div>
+        <ActiveScanBanner />
+      </ActiveScanProvider>
     </AuthGuard>
   );
 }

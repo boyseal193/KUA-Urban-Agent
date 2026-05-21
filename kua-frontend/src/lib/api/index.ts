@@ -10,3 +10,9 @@ export {
   EXPORT_FORMAT_META,
 } from "./exports";
 export type { ExportFormat, ExportArtifact } from "./exports";
+export { propertiesApi, adminApi } from "./properties";
+export type {
+  DeletePropertyResponse,
+  RestorePropertyResponse,
+  DuplicateCluster,
+} from "./properties";

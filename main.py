@@ -289,10 +289,20 @@ def run_full_pipeline(data: dict, source: str = "auto"):
         "deal_status": deal_status,
     }
 
-    property_response = supabase.table("properties").insert(property_insert).execute()
-    if not property_response.data:
-        return {"success": False, "error": "Supabase did not return inserted property"}
-    property_id = property_response.data[0]["id"]
+    from jobs.properties_store import upsert_from_pipeline
+
+    upsert = upsert_from_pipeline(
+        property_insert=property_insert,
+        extracted=data,
+        job_id=None,
+    )
+    if not upsert.get("success") or not upsert.get("property_id"):
+        return {
+            "success": False,
+            "error": upsert.get("error") or "Supabase did not return property id",
+        }
+    property_id = upsert["property_id"]
+    was_duplicate = upsert.get("was_duplicate", False)
 
     if deal_status in ["approved_candidate", "manual_review"]:
         memo_text = generate_ic_memo(
@@ -333,6 +343,8 @@ def run_full_pipeline(data: dict, source: str = "auto"):
         "deal_status": deal_status,
         "ic_memo": memo_text,
         "success": True,
+        "duplicate": was_duplicate,
+        "dedupe_key": upsert.get("dedupe_key"),
     }
 
 
@@ -543,16 +555,18 @@ def analyse_from_text(payload: dict):
 
 
 @app.get("/property/{property_id}")
-def get_property_detail(property_id: str):
-    property_result = (
-        supabase.table("properties").select("*").eq("id", property_id).execute().data
-    )
+def get_property_detail(property_id: str, include_deleted: bool = False):
+    query = supabase.table("properties").select("*").eq("id", property_id)
+    if not include_deleted:
+        query = query.is_("deleted_at", "null")
+    property_result = query.execute().data
     if not property_result:
         return {"success": False, "error": "Property not found"}
     analysis_result = (
         supabase.table("analyses")
         .select("*")
         .eq("property_id", property_id)
+        .is_("deleted_at", "null")
         .order("created_at", desc=True)
         .limit(1)
         .execute()
@@ -571,6 +585,7 @@ def get_top_deals(limit: int = 10):
         supabase.table("properties")
         .select("*")
         .in_("deal_status", ["approved_candidate", "manual_review"])
+        .is_("deleted_at", "null")
         .order("score", desc=True)
         .limit(limit)
         .execute()
@@ -584,6 +599,7 @@ def get_manual_review_deals(limit: int = 10):
         supabase.table("properties")
         .select("*")
         .eq("deal_status", "manual_review")
+        .is_("deleted_at", "null")
         .order("score", desc=True)
         .limit(limit)
         .execute()
@@ -597,6 +613,7 @@ def get_approved_deals(limit: int = 10):
         supabase.table("properties")
         .select("*")
         .eq("deal_status", "approved_candidate")
+        .is_("deleted_at", "null")
         .order("score", desc=True)
         .limit(limit)
         .execute()
@@ -610,6 +627,7 @@ def get_deals_by_status(deal_status: str, limit: int = 10):
         supabase.table("properties")
         .select("*")
         .eq("deal_status", deal_status)
+        .is_("deleted_at", "null")
         .order("created_at", desc=True)
         .limit(limit)
         .execute()
@@ -623,11 +641,114 @@ def get_rejected_deals(limit: int = 10):
         supabase.table("properties")
         .select("*")
         .eq("deal_status", "rejected")
+        .is_("deleted_at", "null")
         .order("created_at", desc=True)
         .limit(limit)
         .execute()
     )
     return {"rejected_deals": results.data or []}
+
+
+# ---------------------------------------------------------------------------
+# Property delete / restore / duplicates / admin
+# ---------------------------------------------------------------------------
+@app.delete("/properties/{property_id}")
+def delete_property(property_id: str, request: Request, reason: Optional[str] = None):
+    """Soft-delete a property. Cascades to analyses + memos via deleted_at."""
+    from jobs import properties_store
+
+    actor = getattr(request.state, "user_id", None) or "operator"
+    request_id = getattr(request.state, "request_id", None)
+    result = properties_store.soft_delete(
+        property_id, deleted_by=actor, reason=reason, request_id=request_id
+    )
+    if not result.get("success"):
+        if result.get("error") == "not_found":
+            return JSONResponse(status_code=404, content={"success": False, "error": "Property not found"})
+        return JSONResponse(status_code=500, content={"success": False, "error": result.get("error")})
+    return result
+
+
+@app.post("/properties/{property_id}/restore")
+def restore_property(property_id: str, request: Request):
+    from jobs import properties_store
+
+    actor = getattr(request.state, "user_id", None) or "operator"
+    request_id = getattr(request.state, "request_id", None)
+    result = properties_store.restore(property_id, actor=actor, request_id=request_id)
+    if not result.get("success"):
+        if result.get("error") == "not_found":
+            return JSONResponse(status_code=404, content={"success": False, "error": "Property not found"})
+        if result.get("error") == "dedupe_key_conflict":
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "success": False,
+                    "error": "dedupe_key_conflict",
+                    "conflicting_property_id": result.get("conflicting_property_id"),
+                    "message": "An active property with the same identity already exists",
+                },
+            )
+        return JSONResponse(status_code=500, content={"success": False, "error": result.get("error")})
+    return result
+
+
+@app.post("/properties/bulk-delete")
+def bulk_delete_properties(payload: dict, request: Request):
+    from jobs import properties_store
+
+    ids = (payload or {}).get("ids") or []
+    if not isinstance(ids, list) or not ids:
+        return JSONResponse(status_code=400, content={"success": False, "error": "ids must be a non-empty list"})
+    actor = getattr(request.state, "user_id", None) or "operator"
+    reason = (payload or {}).get("reason") or "bulk_delete"
+    return properties_store.bulk_soft_delete(ids, deleted_by=actor, reason=reason)
+
+
+@app.get("/properties/duplicates")
+def list_property_duplicates(limit: int = 50):
+    from jobs import properties_store
+
+    clusters = properties_store.find_duplicate_clusters(min_cluster_size=2, limit=limit)
+    return {"success": True, "clusters": clusters, "count": len(clusters)}
+
+
+@app.get("/properties/deleted")
+def list_deleted_properties(limit: int = 100):
+    from jobs import properties_store
+
+    return {"success": True, "properties": properties_store.list_deleted(limit=limit)}
+
+
+@app.get("/admin/stats")
+def get_admin_stats():
+    from jobs import properties_store
+
+    return {"success": True, "stats": properties_store.admin_stats()}
+
+
+@app.post("/admin/cleanup/test-data")
+def admin_cleanup_test_data(request: Request):
+    from jobs import properties_store
+
+    actor = getattr(request.state, "user_id", None) or "operator"
+    return properties_store.purge_test_data(actor=actor)
+
+
+@app.post("/admin/cleanup/failed-jobs")
+def admin_cleanup_failed_jobs(request: Request, older_than_days: int = 1):
+    from jobs import properties_store
+
+    actor = getattr(request.state, "user_id", None) or "operator"
+    return properties_store.purge_failed_jobs(older_than_days=older_than_days, actor=actor)
+
+
+@app.post("/admin/cleanup/orphans")
+def admin_cleanup_orphans(request: Request):
+    from jobs import properties_store
+
+    actor = getattr(request.state, "user_id", None) or "operator"
+    return properties_store.purge_orphans(actor=actor)
 
 
 @app.post("/property/memo/{property_id}")
