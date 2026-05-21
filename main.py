@@ -189,16 +189,28 @@ def is_valid_property_data(data: dict):
 
 
 def assign_deal_status(score: dict):
+    """Map a scored property onto its lifecycle bucket.
+
+    Thresholds (philosophy kua-2.0):
+        ≥ 75 → approved_candidate
+        ≥ 40 → manual_review
+        else → rejected
+
+    A hard ``deal_killer`` always overrides regardless of score.
+    """
     if not isinstance(score, dict):
         return "rejected"
     score_value = score.get("score", 0)
-    verdict = score.get("verdict")
     deal_killer = score.get("deal_killer")
     if deal_killer:
         return "rejected"
-    if verdict == "YES" and score_value >= 80:
+    try:
+        score_value = int(score_value)
+    except (TypeError, ValueError):
+        score_value = 0
+    if score_value >= 75:
         return "approved_candidate"
-    if score_value >= 60:
+    if score_value >= 40:
         return "manual_review"
     return "rejected"
 
@@ -695,6 +707,13 @@ def restore_property(property_id: str, request: Request):
 
 @app.post("/properties/bulk-delete")
 def bulk_delete_properties(payload: dict, request: Request):
+    """Soft-delete many properties at once.
+
+    Safety guards (enforced server-side, even if the client skips them):
+      * max 100 ids per request
+      * batches of ≥ 10 require ``confirmation="DELETE"``
+      * batches that would remove >50% of active properties are rejected
+    """
     from jobs import properties_store
 
     ids = (payload or {}).get("ids") or []
@@ -702,7 +721,42 @@ def bulk_delete_properties(payload: dict, request: Request):
         return JSONResponse(status_code=400, content={"success": False, "error": "ids must be a non-empty list"})
     actor = getattr(request.state, "user_id", None) or "operator"
     reason = (payload or {}).get("reason") or "bulk_delete"
-    return properties_store.bulk_soft_delete(ids, deleted_by=actor, reason=reason)
+    confirmation = (payload or {}).get("confirmation")
+
+    result = properties_store.bulk_soft_delete(
+        ids, deleted_by=actor, reason=reason, confirmation=confirmation
+    )
+    if not result.get("success"):
+        # 400 for caller-fixable issues, 422 for confirmation/percentage guards.
+        status = 422 if result.get("error") in {
+            "confirmation_required",
+            "percentage_guard_tripped",
+        } else 400
+        return JSONResponse(status_code=status, content=result)
+    return result
+
+
+@app.post("/properties/active-ids")
+def verify_active_property_ids(payload: dict):
+    """Return ``{id: is_active}`` for every supplied property id.
+
+    Used by the frontend to detect stale React-Query list entries — when an
+    id resolves to ``false`` the client purges that card from every cache.
+    """
+    from jobs import properties_store
+
+    ids = (payload or {}).get("ids") or []
+    if not isinstance(ids, list):
+        return JSONResponse(
+            status_code=400,
+            content={"success": False, "error": "ids must be an array"},
+        )
+    if not ids:
+        return {"success": True, "active": {}}
+    return {
+        "success": True,
+        "active": properties_store.filter_active_property_ids(ids),
+    }
 
 
 @app.get("/properties/duplicates")
@@ -754,22 +808,34 @@ def admin_cleanup_orphans(request: Request):
 @app.post("/property/memo/{property_id}")
 def generate_memo(property_id: str):
     property_result = (
-        supabase.table("properties").select("*").eq("id", property_id).execute().data
+        supabase.table("properties")
+        .select("*")
+        .eq("id", property_id)
+        .is_("deleted_at", "null")
+        .execute()
+        .data
     )
     if not property_result:
-        return {"error": "Property not found"}
+        return JSONResponse(
+            status_code=404,
+            content={"success": False, "error": "Property not found or deleted"},
+        )
 
     analysis_result = (
         supabase.table("analyses")
         .select("*")
         .eq("property_id", property_id)
+        .is_("deleted_at", "null")
         .order("created_at", desc=True)
         .limit(1)
         .execute()
         .data
     )
     if not analysis_result:
-        return {"error": "No analysis found for this property"}
+        return JSONResponse(
+            status_code=404,
+            content={"success": False, "error": "No analysis found for this property"},
+        )
 
     property_data = property_result[0]
     analysis_data = analysis_result[0]

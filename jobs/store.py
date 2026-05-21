@@ -636,13 +636,16 @@ def upsert_listing_result(job_id: str, listing_index: int, listing_url: str, **f
     return res.data[0] if res.data else payload
 
 
-def get_listing_results(job_id: str) -> List[dict]:
+def get_listing_results(job_id: str, *, include_deleted: bool = False) -> List[dict]:
+    """Return every listing row for a job, by default skipping deleted ones."""
+    def _query():
+        q = supabase.table("scan_listing_results").select("*").eq("job_id", job_id)
+        if not include_deleted:
+            q = q.is_("deleted_at", "null")
+        return q.order("listing_index").execute()
+
     res = _execute(
-        lambda: supabase.table("scan_listing_results")
-        .select("*")
-        .eq("job_id", job_id)
-        .order("listing_index")
-        .execute(),
+        _query,
         table="scan_listing_results",
         operation="select",
     )
@@ -750,6 +753,22 @@ def build_job_response(job_id: str) -> dict:
     listings = get_listing_results(job_id)
     logs = get_logs(job_id, limit=50)
     errors = get_errors(job_id, limit=20)
+
+    # Strip listings that point at deleted properties so the live feed,
+    # exports and history never render ghost rows.
+    listings = [r for r in listings if not r.get("deleted_at")]
+    try:
+        candidate_ids = [r.get("property_id") for r in listings if r.get("property_id")]
+        if candidate_ids:
+            from jobs.properties_store import filter_active_property_ids
+
+            active_map = filter_active_property_ids(candidate_ids)
+            listings = [
+                r for r in listings
+                if not r.get("property_id") or active_map.get(r["property_id"], True)
+            ]
+    except Exception:  # pragma: no cover — defensive
+        pass
 
     results = [r.get("result") for r in listings if r.get("result")]
     approved = [

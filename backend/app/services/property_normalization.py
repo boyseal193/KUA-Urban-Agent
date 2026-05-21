@@ -64,14 +64,24 @@ def is_valid_property_data(data: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
 
 
 def assign_deal_status(score: Dict[str, Any]) -> str:
+    """Map a scored property onto its lifecycle bucket.
+
+    Thresholds (philosophy kua-2.0):
+        ≥ 75 → approved_candidate
+        ≥ 40 → manual_review
+        else → rejected
+    """
     score_value = score.get("score", 0)
-    verdict = score.get("verdict")
     deal_killer = score.get("deal_killer")
     if deal_killer:
         return "rejected"
-    if verdict == "YES" and score_value >= 80:
+    try:
+        score_value = int(score_value)
+    except (TypeError, ValueError):
+        score_value = 0
+    if score_value >= 75:
         return "approved_candidate"
-    if score_value >= 60:
+    if score_value >= 40:
         return "manual_review"
     return "rejected"
 

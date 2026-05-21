@@ -556,14 +556,18 @@ CREATE INDEX IF NOT EXISTS idx_properties_last_seen_at    ON public.properties(l
 
 
 -- =============================================================================
--- analyses / generated_memos / scan_jobs — soft-delete columns
+-- analyses / generated_memos / scan_jobs / scan_listing_results — soft-delete
 -- =============================================================================
-ALTER TABLE public.analyses        ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-ALTER TABLE public.generated_memos ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-ALTER TABLE public.scan_jobs       ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-CREATE INDEX IF NOT EXISTS idx_analyses_deleted_at        ON public.analyses(deleted_at);
-CREATE INDEX IF NOT EXISTS idx_generated_memos_deleted_at ON public.generated_memos(deleted_at);
-CREATE INDEX IF NOT EXISTS idx_scan_jobs_deleted_at       ON public.scan_jobs(deleted_at);
+ALTER TABLE public.analyses              ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+ALTER TABLE public.generated_memos       ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+ALTER TABLE public.scan_jobs             ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+ALTER TABLE public.scan_listing_results  ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+ALTER TABLE public.extracted_properties  ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_analyses_deleted_at             ON public.analyses(deleted_at);
+CREATE INDEX IF NOT EXISTS idx_generated_memos_deleted_at      ON public.generated_memos(deleted_at);
+CREATE INDEX IF NOT EXISTS idx_scan_jobs_deleted_at            ON public.scan_jobs(deleted_at);
+CREATE INDEX IF NOT EXISTS idx_scan_listing_results_deleted_at ON public.scan_listing_results(deleted_at);
+CREATE INDEX IF NOT EXISTS idx_extracted_properties_deleted_at ON public.extracted_properties(deleted_at);
 
 
 -- =============================================================================

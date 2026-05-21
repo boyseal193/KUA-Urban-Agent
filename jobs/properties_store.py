@@ -271,7 +271,14 @@ def soft_delete(
         return {"success": False, "property": None, "error": f"update_failed: {exc}"}
 
     # Cascade soft-delete to children. Failures are non-fatal (audit only).
-    for child_table in ("analyses", "generated_memos"):
+    # Every table that references properties.id by property_id MUST appear here
+    # so the live scan feed, exports and history don't surface ghost rows.
+    for child_table in (
+        "analyses",
+        "generated_memos",
+        "extracted_properties",
+        "scan_listing_results",
+    ):
         try:
             sb.table(child_table).update({"deleted_at": timestamp}).eq("property_id", property_id).execute()
         except Exception as exc:  # pragma: no cover
@@ -355,7 +362,12 @@ def restore(
         log.exception("restore: update failed for %s", property_id)
         return {"success": False, "property": None, "error": f"update_failed: {exc}"}
 
-    for child_table in ("analyses", "generated_memos"):
+    for child_table in (
+        "analyses",
+        "generated_memos",
+        "extracted_properties",
+        "scan_listing_results",
+    ):
         try:
             sb.table(child_table).update({"deleted_at": None}).eq("property_id", property_id).execute()
         except Exception as exc:  # pragma: no cover
@@ -391,25 +403,126 @@ def hard_purge(property_id: str, *, actor: Optional[str] = None) -> Dict[str, An
 
 
 # ---------------------------------------------------------------------------
-# Bulk operations
+# Bulk operations + safety guards
 # ---------------------------------------------------------------------------
+BULK_DELETE_HARD_LIMIT = 100        # max ids accepted in one call
+BULK_DELETE_PERCENT_GUARD = 0.50    # reject if ids cover >50% of active set
+BULK_DELETE_TYPED_CONFIRMATION = "DELETE"  # client must echo this verbatim
+
+
+def count_active() -> int:
+    """Return the number of currently-active (non-deleted) properties."""
+    try:
+        res = (
+            _supabase()
+            .table("properties")
+            .select("id", count="exact")
+            .is_("deleted_at", "null")
+            .execute()
+        )
+        return int(getattr(res, "count", 0) or len(res.data or []))
+    except Exception:
+        return 0
+
+
+def filter_active_property_ids(property_ids: Iterable[str]) -> Dict[str, bool]:
+    """Return a ``{id: is_active}`` map for every supplied id.
+
+    Missing or deleted ids resolve to ``False``. Used by the frontend to
+    purge stale list-cache entries after a soft-delete has happened
+    out-of-band (e.g. another tab, an admin cleanup, or a dedupe merge).
+    """
+    ids = [pid for pid in property_ids if pid]
+    if not ids:
+        return {}
+    result: Dict[str, bool] = {pid: False for pid in ids}
+    try:
+        res = (
+            _supabase()
+            .table("properties")
+            .select("id, deleted_at")
+            .in_("id", ids[:500])      # hard cap so a malicious client can't flood
+            .execute()
+        )
+        for row in res.data or []:
+            rid = row.get("id")
+            if rid:
+                result[rid] = row.get("deleted_at") is None
+    except Exception as exc:
+        log.warning("filter_active_property_ids failed: %s", exc)
+    return result
+
+
 def bulk_soft_delete(
     property_ids: Iterable[str],
     *,
     deleted_by: Optional[str] = None,
     reason: Optional[str] = None,
+    confirmation: Optional[str] = None,
 ) -> Dict[str, Any]:
-    ids = [pid for pid in property_ids if pid]
-    if not ids:
-        return {"success": True, "deleted": 0, "errors": []}
+    """Soft-delete many properties at once, with safety guards.
 
-    results = {"deleted": 0, "errors": []}
+    Refuses to run if:
+      * more than ``BULK_DELETE_HARD_LIMIT`` ids are supplied
+      * the request would delete more than ``BULK_DELETE_PERCENT_GUARD``
+        of all currently-active properties
+      * ``confirmation`` is missing or does not equal
+        ``BULK_DELETE_TYPED_CONFIRMATION`` when ≥ 10 ids are submitted
+    """
+    ids = list({pid for pid in property_ids if pid})  # de-dup
+    if not ids:
+        return {"success": True, "deleted": 0, "errors": [], "skipped": True}
+
+    if len(ids) > BULK_DELETE_HARD_LIMIT:
+        return {
+            "success": False,
+            "deleted": 0,
+            "error": f"too_many_ids: max {BULK_DELETE_HARD_LIMIT} per request, got {len(ids)}",
+            "limit": BULK_DELETE_HARD_LIMIT,
+        }
+
+    if len(ids) >= 10 and confirmation != BULK_DELETE_TYPED_CONFIRMATION:
+        return {
+            "success": False,
+            "deleted": 0,
+            "error": "confirmation_required",
+            "required_confirmation": BULK_DELETE_TYPED_CONFIRMATION,
+            "hint": "Pass confirmation=\"DELETE\" once the operator has typed the safe word.",
+        }
+
+    active_total = count_active()
+    if (
+        active_total > 0
+        and len(ids) / max(1, active_total) > BULK_DELETE_PERCENT_GUARD
+    ):
+        return {
+            "success": False,
+            "deleted": 0,
+            "error": "percentage_guard_tripped",
+            "message": (
+                f"This request would delete {len(ids)} of {active_total} active "
+                f"properties ({len(ids) / active_total:.0%}). "
+                f"Maximum allowed in one batch is {BULK_DELETE_PERCENT_GUARD:.0%}."
+            ),
+            "active_total": active_total,
+            "request_size": len(ids),
+        }
+
+    results: Dict[str, Any] = {"deleted": 0, "errors": []}
     for pid in ids:
         r = soft_delete(pid, deleted_by=deleted_by, reason=reason)
         if r.get("success"):
             results["deleted"] += 1
         else:
             results["errors"].append({"id": pid, "error": r.get("error")})
+
+    write_audit(
+        actor=deleted_by,
+        action="property.bulk_soft_delete",
+        resource_type="property",
+        resource_id=None,
+        payload={"count": results["deleted"], "request_size": len(ids), "reason": reason},
+    )
     return {"success": True, **results}
 
 
