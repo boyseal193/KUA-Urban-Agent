@@ -22,7 +22,43 @@ import { Label } from "@/components/ui/label";
 import { propertiesApi } from "@/lib/api/properties";
 import { ApiError } from "@/lib/api/client";
 import { dealKeys } from "@/hooks/use-deals";
+import { staleProperties } from "@/lib/stale-properties";
 import { cn } from "@/lib/utils";
+
+/**
+ * Invalidate (and where relevant, remove) every cache that could still
+ * contain a reference to a deleted property — so the UI never renders a
+ * card or detail-page link that resolves to "Property not found".
+ */
+function purgePropertyCaches(qc: ReturnType<typeof useQueryClient>, propertyId: string) {
+  staleProperties.add(propertyId);
+
+  qc.invalidateQueries({ queryKey: dealKeys.all });
+  qc.invalidateQueries({ queryKey: ["scan-job"] });
+  qc.invalidateQueries({ queryKey: ["scan-history"] });
+  qc.invalidateQueries({ queryKey: ["scan-history-full"] });
+  qc.invalidateQueries({ queryKey: ["jobs-list"] });
+  qc.invalidateQueries({ queryKey: ["deleted-properties"] });
+  qc.invalidateQueries({ queryKey: ["admin-stats"] });
+  qc.invalidateQueries({ queryKey: ["admin-duplicates"] });
+  qc.invalidateQueries({ queryKey: ["pipeline"] });
+  qc.invalidateQueries({ queryKey: ["map-properties"] });
+
+  qc.removeQueries({ queryKey: dealKeys.detail(propertyId) });
+  qc.removeQueries({ queryKey: ["property", propertyId] });
+}
+
+function restorePropertyCaches(qc: ReturnType<typeof useQueryClient>, propertyId: string) {
+  staleProperties.remove(propertyId);
+  qc.invalidateQueries({ queryKey: dealKeys.all });
+  qc.invalidateQueries({ queryKey: ["scan-history-full"] });
+  qc.invalidateQueries({ queryKey: ["deleted-properties"] });
+  qc.invalidateQueries({ queryKey: ["admin-stats"] });
+  qc.invalidateQueries({ queryKey: ["pipeline"] });
+  qc.invalidateQueries({ queryKey: ["map-properties"] });
+}
+
+export { purgePropertyCaches, restorePropertyCaches };
 
 interface DeletePropertyButtonProps {
   propertyId: string;
@@ -58,10 +94,8 @@ export function DeletePropertyButton({
         toast.error("Delete failed", { description: res.error ?? "unknown error" });
         return;
       }
-      // Optimistic invalidate — refetch every list view.
-      qc.invalidateQueries({ queryKey: dealKeys.all });
-      qc.invalidateQueries({ queryKey: ["scan-job"] });
-      qc.invalidateQueries({ queryKey: ["deleted-properties"] });
+
+      purgePropertyCaches(qc, propertyId);
 
       toast.success("Property deleted", {
         description: label
@@ -73,7 +107,7 @@ export function DeletePropertyButton({
             try {
               const r = await propertiesApi.restore(propertyId);
               if (r.success) {
-                qc.invalidateQueries({ queryKey: dealKeys.all });
+                restorePropertyCaches(qc, propertyId);
                 toast.success("Property restored");
               } else {
                 toast.error("Restore failed", { description: r.error ?? "unknown" });

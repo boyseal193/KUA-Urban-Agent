@@ -105,7 +105,8 @@ function listingResultsToAnalysis(
   if (!listings || listings.length === 0) return [];
   const out: AnalysisResult[] = [];
   for (const l of listings) {
-    if (l && l.result && typeof l.result === "object") {
+    if (!l || (l as { deleted_at?: unknown }).deleted_at != null) continue;
+    if (l.result && typeof l.result === "object") {
       out.push(l.result as AnalysisResult);
     }
   }

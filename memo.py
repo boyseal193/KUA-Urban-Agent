@@ -42,24 +42,81 @@ def get_property_name(property_data):
 
 
 def get_recommendation(score):
-    verdict = score.get("verdict")
-    score_value = score.get("score", 0)
-    classification = score.get("classification")
-    deal_killer = score.get("deal_killer")
+    """Map a scored property onto a human-readable recommendation string.
+
+    Aligned with philosophy kua-2.0:
+        ≥ 75 → APPROVE FOR DUE DILIGENCE
+        ≥ 40 → MANUAL REVIEW
+        else → REJECT
+    """
+    score_value = score.get("score", 0) if isinstance(score, dict) else 0
+    deal_killer = score.get("deal_killer") if isinstance(score, dict) else None
+
+    try:
+        score_value = int(score_value)
+    except (TypeError, ValueError):
+        score_value = 0
 
     if deal_killer:
         return "REJECT"
-
-    if verdict == "YES" and score_value >= 80:
+    if score_value >= 75:
         return "APPROVE FOR DUE DILIGENCE"
-
-    if verdict == "CONDITIONAL YES" or score_value >= 65:
-        return "PROCEED ONLY AFTER DUE DILIGENCE"
-
-    if verdict == "WEAK" or 50 <= score_value < 65:
-        return "MANUAL REVIEW ONLY"
-
+    if score_value >= 40:
+        return "MANUAL REVIEW"
     return "REJECT"
+
+
+def _render_breakdown(score: dict) -> str:
+    """Render the score breakdown as a markdown sub-section for the memo."""
+    if not isinstance(score, dict):
+        return ""
+    bd = score.get("breakdown") or {}
+    if not bd:
+        return ""
+    cats = bd.get("category_scores") or score.get("auto_scores") or {}
+    weights = bd.get("weights") or {}
+
+    cat_rows = "\n".join(
+        f"| {label} | {cats.get(key, '—')}/100 | {int(round((weights.get(weight_key, 0) or 0) * 100))}% |"
+        for label, key, weight_key in (
+            ("Economics", "economics_score", "economics"),
+            ("Operational feasibility", "operational_score", "operational"),
+            ("Location", "location_score", "location"),
+            ("Certainty (data quality)", "certainty_score", "certainty"),
+            ("Completeness", "completeness_score", "completeness"),
+        )
+    )
+
+    pos = bd.get("positive_adjustments") or []
+    neg = bd.get("negative_adjustments") or []
+    pos_lines = "\n".join(f"- +{p['delta']} {p['name']}" for p in pos) or "- None"
+    neg_lines = "\n".join(f"- {n['delta']} {n['name']}" for n in neg) or "- None"
+
+    floor_line = ""
+    if bd.get("floor_applied"):
+        floor_line = (
+            f"\n**Score floor applied:** economics_score "
+            f"≥ {bd.get('floor_threshold', 70)} → floor at {bd.get('floor_value', 45)}\n"
+        )
+
+    return f"""
+### Scoring breakdown
+
+| Category | Score | Weight |
+|---|---|---|
+{cat_rows}
+
+**Base score (weighted sum):** {bd.get('base_score', '—')}/100
+
+**Positive adjustments** (cumulative cap +{bd.get('adjustment_cap_up', 10)}):
+{pos_lines}
+
+**Negative adjustments** (cumulative cap {bd.get('adjustment_cap_down', -10)}):
+{neg_lines}
+
+**Adjustment total applied:** {bd.get('adjustment_total', 0)}
+{floor_line}**Final score:** {bd.get('final_score', '—')}/100
+""".strip()
 
 
 def generate_ic_memo(property_data: dict, economics: dict, score: dict):
@@ -88,22 +145,19 @@ def generate_ic_memo(property_data: dict, economics: dict, score: dict):
 
     if recommendation == "APPROVE FOR DUE DILIGENCE":
         tone_summary = (
-            "This asset appears to be a strong candidate based on current underwriting. "
-            "The deal should proceed to due diligence, but final approval should depend on confirming legal use, technical condition, loading access, and conversion costs."
+            "This asset clears the K.U.A. approval threshold across economics, operational feasibility, "
+            "and location. It should proceed to due diligence — final approval still depends on confirming "
+            "legal use, technical condition, loading access, and conversion costs."
         )
-    elif recommendation == "PROCEED ONLY AFTER DUE DILIGENCE":
+    elif recommendation == "MANUAL REVIEW":
         tone_summary = (
-            "This asset has some attractive features but should not be treated as approved. "
-            "It requires further due diligence before any offer or commitment."
-        )
-    elif recommendation == "MANUAL REVIEW ONLY":
-        tone_summary = (
-            "This asset should not be treated as a top deal. "
-            "It may only be worth manual review if the price can be renegotiated, missing information is confirmed, or the operating assumptions improve."
+            "This asset shows real potential but does not clear the approval threshold automatically. "
+            "It is a manual-review candidate: the operator should pressure-test the weaker dimensions "
+            "(see breakdown below) and decide whether to negotiate, confirm missing fields, or pass."
         )
     else:
         tone_summary = (
-            "This asset does not meet the current TruTrastero investment threshold. "
+            "This asset does not meet the K.U.A. investment threshold. "
             "It should be rejected unless a major change in price, access, layout, or economics is confirmed."
         )
 
@@ -203,7 +257,13 @@ The most important metric is the **true EBITDA yield**, because it includes both
 
 ---
 
-## 7. Final Decision
+## 7. Scoring Breakdown
+
+{_render_breakdown(score)}
+
+---
+
+## 8. Final Decision
 
 **Recommendation:** {recommendation}
 

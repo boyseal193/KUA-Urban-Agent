@@ -27,6 +27,23 @@ export interface DuplicateCluster {
   }>;
 }
 
+/** Server-enforced safety constants — keep in sync with `jobs/properties_store.py`. */
+export const BULK_DELETE_HARD_LIMIT = 100;
+export const BULK_DELETE_TYPED_CONFIRMATION = "DELETE";
+export const BULK_DELETE_CONFIRMATION_REQUIRED_AT = 10;
+
+export interface BulkDeleteResult {
+  success: boolean;
+  deleted: number;
+  errors?: Array<{ id: string; error: string }>;
+  error?: string;
+  message?: string;
+  required_confirmation?: string;
+  active_total?: number;
+  request_size?: number;
+  limit?: number;
+}
+
 export const propertiesApi = {
   delete: (id: string, reason?: string) =>
     api<DeletePropertyResponse>(
@@ -40,14 +57,30 @@ export const propertiesApi = {
       timeoutMs: 20_000,
     }),
 
-  bulkDelete: (ids: string[], reason?: string) =>
-    api<{ success: boolean; deleted: number; errors: Array<{ id: string; error: string }> }>(
-      `/properties/bulk-delete`,
-      {
-        method: "POST",
-        body: { ids, reason },
-        timeoutMs: 60_000,
-      }
+  /**
+   * Soft-delete many properties at once.
+   *
+   * The backend enforces three safety guards even if the caller skips them:
+   *   * max 100 ids per call
+   *   * batches of ≥ 10 require ``confirmation: "DELETE"``
+   *   * batches that would remove >50% of active properties are rejected
+   */
+  bulkDelete: (ids: string[], opts?: { reason?: string; confirmation?: string }) =>
+    api<BulkDeleteResult>(`/properties/bulk-delete`, {
+      method: "POST",
+      body: { ids, reason: opts?.reason, confirmation: opts?.confirmation },
+      timeoutMs: 60_000,
+    }),
+
+  /**
+   * Resolve a batch of property ids → ``{id: is_active}``.
+   * Frontend uses this to detect stale list-cache entries after a
+   * soft-delete done elsewhere (admin panel, another tab, dedupe merge).
+   */
+  verifyActive: (ids: string[]) =>
+    api<{ success: boolean; active: Record<string, boolean> }>(
+      `/properties/active-ids`,
+      { method: "POST", body: { ids }, timeoutMs: 15_000 }
     ),
 
   duplicates: (limit = 50) =>

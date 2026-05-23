@@ -2,8 +2,10 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { useParams } from "next/navigation";
-import { ArrowLeft, MapPin, Sparkles } from "lucide-react";
+import { useParams, useRouter } from "next/navigation";
+import { useQueryClient } from "@tanstack/react-query";
+import { ArrowLeft, MapPin, RefreshCcw, Sparkles, Trash2 } from "lucide-react";
+import { toast } from "sonner";
 
 import { PageHeader } from "@/components/common/page-header";
 import { Button } from "@/components/ui/button";
@@ -23,17 +25,39 @@ import { ExportButton } from "@/components/deals/export-button";
 import { DealMiniMap } from "@/components/deals/deal-mini-map";
 import { KpiGridSkeleton } from "@/components/common/loading-skeleton";
 import { EmptyState } from "@/components/common/empty-state";
-import { DeletePropertyButton } from "@/components/properties/delete-property-button";
+import {
+  DeletePropertyButton,
+  purgePropertyCaches,
+} from "@/components/properties/delete-property-button";
 
-import { usePropertyDetail } from "@/hooks/use-deals";
+import { dealKeys, usePropertyDetail } from "@/hooks/use-deals";
 import { verdictMeta } from "@/lib/constants";
 import { Badge } from "@/components/ui/badge";
 import { money, metersLabel } from "@/lib/format";
+import { staleProperties } from "@/lib/stale-properties";
 
 export default function DealDetailPage() {
   const params = useParams<{ id: string }>();
+  const router = useRouter();
+  const qc = useQueryClient();
   const id = String(params?.id ?? "");
-  const { data, isLoading, error } = usePropertyDetail(id);
+  const { data, isLoading, error, refetch, isRefetching } = usePropertyDetail(id);
+
+  /**
+   * If the backend returns "no record" (because the property has been
+   * soft-deleted or its id is stale), proactively purge every cache that
+   * could still be rendering a card for it. This is the missing piece that
+   * makes ghost cards disappear instantly after a delete in another tab.
+   */
+  const detailMissing =
+    !isLoading && !isRefetching && (Boolean(error) || !data?.success || !data?.property);
+
+  React.useEffect(() => {
+    if (detailMissing && id) {
+      staleProperties.add(id);
+      purgePropertyCaches(qc, id);
+    }
+  }, [detailMissing, id, qc]);
 
   if (isLoading) {
     return (
@@ -48,16 +72,29 @@ export default function DealDetailPage() {
     );
   }
 
-  if (error || !data?.success || !data?.property) {
+  if (detailMissing) {
+    const handleRemoveStaleCard = () => {
+      staleProperties.add(id);
+      purgePropertyCaches(qc, id);
+      toast.success("Stale reference removed", {
+        description: "Returning to the pipeline.",
+      });
+      router.push("/pipeline");
+    };
+
     return (
       <div className="space-y-6">
         <PageHeader
           eyebrow="OPS · DEAL DETAIL"
-          title="Property not found"
-          subtitle={data?.error ?? "We could not load this property."}
+          title="Property no longer available"
+          subtitle={
+            data?.error?.toString().toLowerCase().includes("deleted")
+              ? "This property has been deleted. Any stale cards will be removed."
+              : "The property could not be loaded — it may have been deleted or merged."
+          }
           rightSlot={
             <Link href="/pipeline">
-              <Button variant="outline" size="sm">
+              <Button variant="outline" size="sm" className="gap-1.5">
                 <ArrowLeft className="h-3.5 w-3.5" /> Pipeline
               </Button>
             </Link>
@@ -65,10 +102,37 @@ export default function DealDetailPage() {
         />
         <EmptyState
           title="No record"
-          description="Try returning to the pipeline and selecting another asset."
+          description="The property record is missing or has been removed. Use the actions below to recover."
         />
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="gap-1.5"
+            onClick={() => {
+              qc.invalidateQueries({ queryKey: dealKeys.all });
+              void refetch();
+            }}
+          >
+            <RefreshCcw className="h-3.5 w-3.5" /> Refresh
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="gap-1.5 text-destructive hover:bg-destructive/[0.08]"
+            onClick={handleRemoveStaleCard}
+          >
+            <Trash2 className="h-3.5 w-3.5" /> Remove stale card
+          </Button>
+        </div>
       </div>
     );
+  }
+
+  if (!data?.property) {
+    return null;
   }
 
   const property = data.property;

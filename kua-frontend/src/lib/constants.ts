@@ -60,6 +60,17 @@ export const VERDICT_META: Record<
     color: "#7CFAB3",
     chipClass: "border-accent/40 bg-accent/10 text-accent",
   },
+  "MANUAL REVIEW": {
+    label: "REVIEW",
+    color: "#F5B400",
+    chipClass: "border-kua-amber/40 bg-kua-amber/10 text-kua-amber",
+  },
+  NO: {
+    label: "NO",
+    color: "#FF4D6D",
+    chipClass: "border-destructive/40 bg-destructive/10 text-destructive",
+  },
+  // ----- Legacy verdicts (pre kua-2.0) — preserved so old scans render -----
   "CONDITIONAL YES": {
     label: "COND.",
     color: "#38E1FF",
@@ -70,11 +81,6 @@ export const VERDICT_META: Record<
     color: "#F5B400",
     chipClass: "border-kua-amber/40 bg-kua-amber/10 text-kua-amber",
   },
-  NO: {
-    label: "NO",
-    color: "#FF4D6D",
-    chipClass: "border-destructive/40 bg-destructive/10 text-destructive",
-  },
 };
 
 export function dealStatusMeta(status?: DealStatus | null) {
@@ -82,14 +88,20 @@ export function dealStatusMeta(status?: DealStatus | null) {
 }
 
 export function verdictMeta(verdict?: Verdict | null) {
-  return VERDICT_META[verdict ?? ""] ?? VERDICT_META.WEAK;
+  return VERDICT_META[verdict ?? ""] ?? VERDICT_META["MANUAL REVIEW"];
 }
 
+/**
+ * Score → tier label mapping, aligned with the kua-2.0 scoring philosophy:
+ *
+ *   ≥ 75  → CORE (approved candidate, strong conviction)
+ *   ≥ 40  → REVIEW (manual underwriting required)
+ *   < 40  → REJECT
+ */
 export function scoreTier(score?: number | null) {
   if (score == null) return { label: "—", color: "#7C8699", glow: "" };
-  if (score >= 80) return { label: "CORE", color: "#7CFAB3", glow: "shadow-glow-neon" };
-  if (score >= 65) return { label: "CORE-DD", color: "#38E1FF", glow: "shadow-glow" };
-  if (score >= 55) return { label: "VALUE-ADD", color: "#F5B400", glow: "" };
+  if (score >= 75) return { label: "CORE", color: "#7CFAB3", glow: "shadow-glow-neon" };
+  if (score >= 40) return { label: "REVIEW", color: "#F5B400", glow: "" };
   return { label: "REJECT", color: "#FF4D6D", glow: "" };
 }
 

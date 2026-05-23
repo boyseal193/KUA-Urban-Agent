@@ -10,6 +10,7 @@ import { DealStatusIndicator } from "@/components/dashboard/deal-status-indicato
 import { Badge } from "@/components/ui/badge";
 import { moneyCompact, metersLabel } from "@/lib/format";
 import { verdictMeta } from "@/lib/constants";
+import { useStaleProperties } from "@/lib/stale-properties";
 import { cn } from "@/lib/utils";
 
 import type { AnalysisResult } from "@/lib/api/types";
@@ -27,12 +28,15 @@ export function LiveScanFeed({
   emptyHint = "Awaiting scan output. Launch an acquisition sweep above.",
   title = "Live Acquisition Feed",
 }: LiveScanFeedProps) {
+  const { isStale } = useStaleProperties();
+
   const list = React.useMemo(() => {
     if (!Array.isArray(results)) return [];
     return results
       .filter((r): r is AnalysisResult => Boolean(r && r.property_id))
+      .filter((r) => !isStale(r.property_id))
       .slice(0, 20);
-  }, [results]);
+  }, [results, isStale]);
 
   return (
     <div className={cn("panel relative overflow-hidden p-5", className)}>

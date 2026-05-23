@@ -20,6 +20,7 @@ import { YieldWidget } from "./yield-widget";
 import { DeletePropertyButton } from "@/components/properties/delete-property-button";
 import { moneyCompact, yearsLabel, metersLabel } from "@/lib/format";
 import { verdictMeta } from "@/lib/constants";
+import { useStaleProperties } from "@/lib/stale-properties";
 import { cn } from "@/lib/utils";
 
 import type { PropertyRecord, AnalysisResult, DealEconomics } from "@/lib/api/types";
@@ -40,6 +41,14 @@ export function DealCard({
   compact = false,
   className,
 }: DealCardProps) {
+  const { isStale } = useStaleProperties();
+
+  // If the property has been deleted out-of-band (admin, another tab, etc.),
+  // refuse to render — the card would be a dead link.
+  if (!deal?.id || isStale(deal.id)) {
+    return null;
+  }
+
   const verdict = verdictMeta(deal.verdict);
   const econ: Partial<DealEconomics> = enriched?.economics ?? {};
   const flags = enriched?.score?.due_diligence_flags ?? [];

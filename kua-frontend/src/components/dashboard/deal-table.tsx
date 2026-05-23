@@ -10,13 +10,22 @@ import { ScoreBadge } from "./score-badge";
 import { money, metersLabel } from "@/lib/format";
 import { verdictMeta } from "@/lib/constants";
 import { Badge } from "@/components/ui/badge";
+import { useStaleProperties } from "@/lib/stale-properties";
 import type { PropertyRecord } from "@/lib/api/types";
 
 interface DealTableProps {
   deals: PropertyRecord[];
 }
 
-export function DealTable({ deals }: DealTableProps) {
+export function DealTable({ deals: incomingDeals }: DealTableProps) {
+  const { isStale } = useStaleProperties();
+  const deals = React.useMemo(
+    () =>
+      Array.isArray(incomingDeals)
+        ? incomingDeals.filter((d) => d && !isStale(d.id))
+        : [],
+    [incomingDeals, isStale]
+  );
   return (
     <div className="panel overflow-hidden">
       <div className="overflow-x-auto">

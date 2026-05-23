@@ -17,6 +17,7 @@ import {
 import { PageHeader } from "@/components/common/page-header";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { BulkDeleteDialog } from "@/components/properties/bulk-delete-dialog";
 import { adminApi, propertiesApi } from "@/lib/api";
 import type { DuplicateCluster } from "@/lib/api/properties";
 import { ApiError } from "@/lib/api/client";
@@ -76,6 +77,41 @@ export default function AdminPage() {
 
   const statValues = stats.data?.stats ?? {};
   const clusters: DuplicateCluster[] = duplicates.data?.clusters ?? [];
+
+  // ── Duplicate cluster resolution ────────────────────────────────────────
+  type ClusterDialogState = {
+    open: boolean;
+    ids: string[];
+    rows: Array<{ id: string; label?: string | null }>;
+    category: string;
+  };
+  const [clusterDialog, setClusterDialog] = React.useState<ClusterDialogState>({
+    open: false,
+    ids: [],
+    rows: [],
+    category: "",
+  });
+
+  const openClusterResolve = React.useCallback((cluster: DuplicateCluster) => {
+    // Keep the highest-scoring property (or the first one as fallback) and
+    // queue the rest for deletion. The operator can still cancel.
+    const sorted = [...cluster.properties].sort((a, b) => {
+      const sa = typeof a.score === "number" ? a.score : -1;
+      const sb = typeof b.score === "number" ? b.score : -1;
+      return sb - sa;
+    });
+    const losers = sorted.slice(1).filter((p) => p?.id);
+    if (losers.length === 0) return;
+    setClusterDialog({
+      open: true,
+      ids: losers.map((p) => String(p.id)),
+      rows: losers.map((p) => ({
+        id: String(p.id),
+        label: (p.address as string) ?? (p.listing_url as string) ?? null,
+      })),
+      category: `older duplicates of dedupe_key ${cluster.dedupe_key.slice(0, 12)}…`,
+    });
+  }, []);
 
   return (
     <div className="space-y-6">
@@ -235,11 +271,35 @@ export default function AdminPage() {
                     </li>
                   ))}
                 </ul>
+                <div className="flex justify-end">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    className="gap-1.5 text-destructive hover:bg-destructive/[0.08]"
+                    onClick={() => openClusterResolve(cluster)}
+                  >
+                    <Trash2 className="h-3 w-3" /> Keep best, delete{" "}
+                    {cluster.properties.length - 1} older
+                  </Button>
+                </div>
               </li>
             ))}
           </ul>
         )}
       </div>
+
+      <BulkDeleteDialog
+        open={clusterDialog.open}
+        onOpenChange={(open) =>
+          setClusterDialog((s) => ({ ...s, open }))
+        }
+        propertyIds={clusterDialog.ids}
+        previewRows={clusterDialog.rows}
+        category={clusterDialog.category}
+        reason="duplicate_resolve"
+        onCompleted={() => invalidate()}
+      />
     </div>
   );
 }

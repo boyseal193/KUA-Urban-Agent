@@ -8,7 +8,14 @@
  * the network boundary. Add new fields here first, then propagate.
  */
 
-export type Verdict = "YES" | "CONDITIONAL YES" | "WEAK" | "NO" | (string & {});
+export type Verdict =
+  | "YES"
+  | "MANUAL REVIEW"
+  // Legacy verdict labels — preserved so historic scans keep rendering.
+  | "CONDITIONAL YES"
+  | "WEAK"
+  | "NO"
+  | (string & {});
 
 export type DealStatus =
   | "approved_candidate"

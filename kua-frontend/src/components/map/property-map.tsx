@@ -23,6 +23,7 @@ import { BARCELONA_CENTER, dealStatusMeta } from "@/lib/constants";
 import { ScoreBadge } from "@/components/dashboard/score-badge";
 import { Badge } from "@/components/ui/badge";
 import { metersLabel, moneyCompact } from "@/lib/format";
+import { useStaleProperties } from "@/lib/stale-properties";
 import type { PropertyRecord } from "@/lib/api/types";
 
 interface PropertyMapProps {
@@ -53,12 +54,17 @@ export default function PropertyMap({
   deals,
   height = "calc(100vh - 220px)",
 }: PropertyMapProps) {
+  const { isStale } = useStaleProperties();
   const valid = React.useMemo(
     () =>
       deals.filter(
-        (d) => typeof d.latitude === "number" && typeof d.longitude === "number"
+        (d) =>
+          d &&
+          !isStale(d.id) &&
+          typeof d.latitude === "number" &&
+          typeof d.longitude === "number"
       ),
-    [deals]
+    [deals, isStale]
   );
 
   return (
