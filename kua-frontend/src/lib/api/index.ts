@@ -16,7 +16,11 @@ export type {
   RestorePropertyResponse,
   DuplicateCluster,
 } from "./properties";
-export { laundryApi } from "./laundry";
+export {
+  laundryApi,
+  LAUNDRY_PREFERRED_NEIGHBOURHOODS,
+  LAUNDRY_DEFAULT_MAX_SQM,
+} from "./laundry";
 export type {
   LaundryProperty,
   LaundryAnalysis,

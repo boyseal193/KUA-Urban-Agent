@@ -114,20 +114,46 @@ async def _overpass_count(query: str) -> int:
         return -1
 
 
+def _match_preferred_market(
+    *,
+    neighbourhood: Optional[str],
+    city: Optional[str],
+    address: Optional[str] = None,
+) -> Optional[str]:
+    """Return the first preferred-neighbourhood label (case-insensitive substring)
+    that appears in any of the location fields, or ``None``."""
+    biz = default_assumptions().business_profile
+    haystack = " ".join(
+        s for s in (neighbourhood, city, address) if s
+    ).lower()
+    if not haystack:
+        return None
+    for label in biz.preferred_neighbourhoods:
+        if label.lower() in haystack:
+            return label
+    return None
+
+
 async def gather_location_intel(
     *,
     lat: Optional[float],
     lng: Optional[float],
     neighbourhood: Optional[str] = None,
     city: Optional[str] = None,
+    address: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Pull the location signals required by the scoring engine.
 
     Always returns the full set of keys — missing live data is replaced by the
     ``LocationBaseline`` defaults so the scoring engine never has to guess.
+    Also flags whether the property is inside one of the operator's preferred
+    Barcelona target markets (Raval, Sant Antoni, Poble Sec, Clot, Hospitalet).
     """
     baseline = default_assumptions().location_baseline
+    biz = default_assumptions().business_profile
+
+    matched = _match_preferred_market(neighbourhood=neighbourhood, city=city, address=address)
 
     intel: Dict[str, Any] = {
         "population_density_per_km2": baseline.population_density_per_km2,
@@ -140,12 +166,16 @@ async def gather_location_intel(
         "competitors_within_1km": baseline.competitors_within_1km,
         "walkability_score_0_100": baseline.walkability_score_0_100,
         "night_safety_0_100": baseline.night_safety_0_100,
-        "growth_potential_0_100": 62,
+        "growth_potential_0_100": 70 if matched else 62,
         "street_visibility_0_100": 70,
-        "public_transport_score_0_100": 72,
+        "public_transport_score_0_100": 75 if matched else 72,
         "data_sources": [],
         "neighbourhood": neighbourhood,
         "city": city,
+        "in_preferred_market": bool(matched),
+        "matched_preferred_neighbourhood": matched,
+        "target_city": biz.target_city,
+        "preferred_neighbourhoods": list(biz.preferred_neighbourhoods),
     }
 
     if lat is None or lng is None:

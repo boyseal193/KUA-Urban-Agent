@@ -244,14 +244,34 @@ export interface LaundryLaunchScanPayload {
   property_type?: LaundryPropertyType | null;
   acquisition_type?: LaundryAcquisitionType | null;
   search_type: LaundrySearchType;
-  search_url?: string | null;
-  seed_text?: string | null;
+  /** Listing or area-search URL. ``search_url`` is still accepted by the backend for legacy clients. */
+  listing_url?: string | null;
+  /** Free-form listing text. ``seed_text`` is the legacy alias. */
+  raw_listing_text?: string | null;
+  listing_limit?: number;
+  /** Queue on the ARQ worker (default). ``async_mode`` is the legacy alias. */
+  run_in_background?: boolean;
+  /** Run the LLM polish pass on the generated memo. ``polish_with_llm`` is the legacy alias. */
+  llm_memo_polish?: boolean;
+  /** Case-insensitive substring whitelist applied to address + city + neighbourhood. */
+  neighbourhood_filters?: string[];
+  /** Soft upper bound on floor area (m²) — oversized hits land in manual_review. */
+  max_size_sqm?: number | null;
+  /** Shortcut to push weights/thresholds into ``overrides``. */
+  scoring_overrides?: Record<string, unknown>;
   filters?: Record<string, unknown>;
   overrides?: Record<string, unknown>;
-  listing_limit?: number;
-  async_mode?: boolean;
-  polish_with_llm?: boolean;
 }
+
+export const LAUNDRY_PREFERRED_NEIGHBOURHOODS = [
+  "Raval",
+  "Sant Antoni",
+  "Poble Sec",
+  "Clot",
+  "Hospitalet",
+] as const;
+
+export const LAUNDRY_DEFAULT_MAX_SQM = 80;
 
 export interface LaundryExportRecord {
   id: string;

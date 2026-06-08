@@ -5,18 +5,34 @@ Produces a 0 – 100 score with full transparency on every component, plus the
 companion ``verdict`` and ``deal_status`` buckets:
 
 * ``>= 75``  approved_candidate / "EXCELLENT OPPORTUNITY"
-* ``50-74``  manual_review     / "FURTHER REVIEW"
-* ``< 50``   rejected          / "REJECT"
+* ``40-74``  manual_review     / "FURTHER REVIEW"
+* ``< 40``   rejected          / "REJECT"
 
 Missing fields never auto-reject the deal — they decay confidence instead. The
 philosophy: real-world good opportunities should land mostly in *manual_review*
 because operators always need to verify on the ground.
+
+Right-sizing
+------------
+
+The engine favours small, dense urban units (60–80 m², ~10 machines) that fit
+the K.U.A. operator profile. Oversized stores (> 110 m²) are not auto-rejected
+but lose physical-fit points because they incur higher capex / opex with
+diminishing returns.
+
+Preferred markets
+-----------------
+
+When ``location.in_preferred_market`` is true (e.g. Barcelona: Raval, Sant
+Antoni, Poble Sec, Clot, Hospitalet) the location sub-score receives a fixed
+bonus to reflect the operator's strategic targeting.
 """
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
 from app.laundry.assumptions import (
+    BusinessProfile,
     LaundryAssumptions,
     default_assumptions,
     merge_overrides,
@@ -183,18 +199,31 @@ def _score_physical_fit(
     has_3phase_power: bool,
     ground_floor: bool,
     loading_access: bool,
+    biz: BusinessProfile,
 ) -> Dict[str, Any]:
     score = 50.0
     drivers: List[str] = []
 
-    if floor_area_m2 >= 60:
-        score += 18
-        drivers.append("good_floor_area")
-    elif floor_area_m2 >= 40:
-        score += 9
-    elif floor_area_m2 < 25:
-        score -= 22
+    # ------------------- Right-sizing -------------------
+    # Reward floor area inside the operator's sweet spot (35-80 m²), penalise
+    # undersized AND oversized properties because both hurt unit economics.
+    ideal = biz.ideal_floor_area_m2
+    if floor_area_m2 <= 0:
+        drivers.append("floor_area_unknown")
+    elif floor_area_m2 < biz.min_viable_floor_area_m2:
+        score -= 20
         drivers.append("undersized_unit")
+    elif floor_area_m2 <= biz.max_recommended_floor_area_m2:
+        # Triangular bonus that peaks at ``ideal`` and falls off either side.
+        proximity = 1.0 - abs(floor_area_m2 - ideal) / max(ideal, 1.0)
+        score += 18.0 * max(proximity, 0.4)
+        drivers.append("right_sized_unit")
+    elif floor_area_m2 <= biz.hard_max_floor_area_m2:
+        score += 4
+        drivers.append("slightly_oversized_unit")
+    else:
+        score -= 12
+        drivers.append("oversized_unit_higher_capex")
 
     if ceiling_height and ceiling_height >= 2.7:
         score += 4
@@ -229,6 +258,105 @@ def _score_physical_fit(
     return {"score": _clamp(score), "drivers": drivers or ["fit_standard"]}
 
 
+def _score_preferred_market(location: Dict[str, Any], biz: BusinessProfile) -> Dict[str, Any]:
+    """+0 to +15 bonus applied on top of the location component."""
+    matched = location.get("matched_preferred_neighbourhood")
+    if location.get("in_preferred_market") or matched:
+        return {
+            "bonus": 15.0,
+            "matched": matched or "preferred_market",
+            "reason": "operator_target_market",
+        }
+    if (
+        biz.target_city
+        and str(location.get("city") or "").lower().startswith(biz.target_city.lower())
+    ):
+        return {"bonus": 5.0, "matched": biz.target_city, "reason": "target_city_match"}
+    return {"bonus": 0.0, "matched": None, "reason": None}
+
+
+def _score_demographic_targeting(
+    *,
+    apartment_pct: float,
+    population_density: float,
+    income_eur: float,
+    renter_pct: Optional[float],
+    small_housing_pct: Optional[float],
+    biz: BusinessProfile,
+) -> Dict[str, Any]:
+    """0-100. Rewards the demographic profile most likely to use a laundromat.
+
+    The K.U.A. brief favours: smaller housing stock (no large washers at home),
+    renters, dense urban environment, lower-middle income, walking distance.
+    """
+    score = 50.0
+    drivers: List[str] = []
+
+    lo, hi = biz.target_income_band_eur
+    if lo <= income_eur <= hi:
+        score += 14
+        drivers.append("income_in_target_band")
+    elif income_eur > 0:
+        score -= min(abs(income_eur - (lo + hi) / 2) / 3000.0, 10.0)
+
+    if biz.target_population_density_min <= population_density <= biz.target_population_density_max:
+        score += 12
+        drivers.append("density_in_target_band")
+
+    if apartment_pct >= biz.target_renter_pct_min:
+        score += 10
+        drivers.append("apartment_dominant_neighbourhood")
+
+    if renter_pct is not None and renter_pct >= biz.target_renter_pct_min:
+        score += 8
+        drivers.append("renter_majority")
+
+    if small_housing_pct is not None and small_housing_pct >= biz.target_small_housing_pct_min:
+        score += 8
+        drivers.append("small_housing_stock")
+
+    return {"score": _clamp(score), "drivers": drivers or ["demographics_unknown"]}
+
+
+def _score_secondary_revenue_potential(
+    *,
+    economics: Dict[str, Any],
+    extracted: Dict[str, Any],
+    location: Dict[str, Any],
+) -> Dict[str, Any]:
+    """0-100 measuring how much realistic secondary revenue the property unlocks."""
+    score = 40.0
+    drivers: List[str] = []
+    secondary_total = float(economics.get("secondary_revenue_eur") or 0.0)
+    primary_total = float(economics.get("year1_revenue_eur") or 0.0) or 1.0
+
+    ratio = secondary_total / primary_total
+    if ratio >= 0.25:
+        score += 35
+        drivers.append("strong_secondary_revenue")
+    elif ratio >= 0.15:
+        score += 22
+        drivers.append("solid_secondary_revenue")
+    elif ratio >= 0.07:
+        score += 12
+        drivers.append("modest_secondary_revenue")
+
+    if extracted.get("corner_unit"):
+        score += 8
+        drivers.append("corner_unit_extra_frontage")
+    if extracted.get("loading_access"):
+        score += 4
+        drivers.append("loading_access_for_drop_off")
+    if int(location.get("hotels_within_500m") or 0) >= 3:
+        score += 6
+        drivers.append("nearby_hotel_demand")
+    if int(location.get("students_within_1km") or 0) >= 800:
+        score += 4
+        drivers.append("student_density")
+
+    return {"score": _clamp(score), "drivers": drivers or ["secondary_revenue_limited"]}
+
+
 def _confidence(filled_fields: int, thresholds) -> Dict[str, Any]:
     if filled_fields >= thresholds.high_confidence_min_fields:
         band = "high"
@@ -260,6 +388,7 @@ def score_property(
     payload: Dict[str, Any],
     *,
     overrides: Optional[Dict[str, Any]] = None,
+    filters: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Score a single laundromat opportunity.
@@ -271,15 +400,21 @@ def score_property(
             "location": {<demographic + competition inputs>},
             "economics": {<output from app.laundry.economics.calculate_economics>},
         }
+
+    ``filters`` (from the scan launcher) is consulted for soft constraints —
+    e.g. ``max_size_sqm`` causes oversized properties to be flagged as
+    *manual_review* automatically.
     """
     extracted = dict(payload.get("extracted") or {})
     location = dict(payload.get("location") or {})
     economics = dict(payload.get("economics") or {})
+    filters = dict(filters or {})
 
     assumptions = merge_overrides(default_assumptions(), overrides)
     baseline = assumptions.location_baseline
     weights = assumptions.scoring_weights
     thresholds = assumptions.thresholds
+    biz = assumptions.business_profile
 
     pop_density = _safe_float(location.get("population_density_per_km2"), baseline.population_density_per_km2)
     income = _safe_float(location.get("household_income_eur"), baseline.median_household_income_eur)
@@ -320,8 +455,9 @@ def score_property(
 
     competition_component = _score_competition(nearby, competitors)
     economics_block = _score_economics(economics)
+    floor_area_for_fit = _safe_float(economics.get("floor_area_m2") or extracted.get("floor_area_m2"))
     physical_block = _score_physical_fit(
-        floor_area_m2=_safe_float(economics.get("floor_area_m2") or extracted.get("floor_area_m2")),
+        floor_area_m2=floor_area_for_fit,
         ceiling_height=_safe_float(extracted.get("ceiling_height")),
         has_water=bool(extracted.get("water_available", True)),
         has_gas=bool(extracted.get("gas_available", True)),
@@ -329,6 +465,27 @@ def score_property(
         has_3phase_power=bool(extracted.get("three_phase_power", False)),
         ground_floor=bool(extracted.get("ground_floor", True)),
         loading_access=bool(extracted.get("loading_access", False)),
+        biz=biz,
+    )
+
+    # Preferred-market + demographic targeting + secondary-revenue ----------
+    preferred = _score_preferred_market(location, biz)
+    location_component = _clamp(location_component + preferred["bonus"], 0, 100)
+
+    demographic_block = _score_demographic_targeting(
+        apartment_pct=apartment_pct,
+        population_density=pop_density,
+        income_eur=income,
+        renter_pct=_safe_float(location.get("renter_pct"), 0.0) or None,
+        small_housing_pct=_safe_float(location.get("small_housing_pct"), 0.0) or None,
+        biz=biz,
+    )
+    # The demographic block is a 20 % overlay on the location component so it
+    # does not need its own weight in the headline mix.
+    location_component = _clamp(location_component * 0.80 + demographic_block["score"] * 0.20, 0, 100)
+
+    secondary_block = _score_secondary_revenue_potential(
+        economics=economics, extracted=extracted, location=location
     )
 
     # Risk component: aggregates listing red flags --------------------------
@@ -352,7 +509,15 @@ def score_property(
     risk_component = _clamp(risk_component)
 
     # Weighted blend --------------------------------------------------------
-    total_weight = weights.location + weights.economics + weights.physical_fit + weights.competition + weights.risk
+    secondary_weight = getattr(weights, "secondary_revenue", 0.0) or 0.0
+    total_weight = (
+        weights.location
+        + weights.economics
+        + weights.physical_fit
+        + weights.competition
+        + weights.risk
+        + secondary_weight
+    )
     if total_weight <= 0:
         total_weight = 1.0
     final = (
@@ -361,6 +526,7 @@ def score_property(
         + physical_block["score"] * (weights.physical_fit / total_weight)
         + competition_component * (weights.competition / total_weight)
         + risk_component * (weights.risk / total_weight)
+        + secondary_block["score"] * (secondary_weight / total_weight)
     )
     final_score = int(round(_clamp(final)))
 
@@ -371,13 +537,23 @@ def score_property(
     verdict = _verdict_from_score(final_score, thresholds)
     deal_status = _deal_status_from_score(final_score, thresholds)
 
+    notes: List[str] = []
+
+    # Soft constraint: when the operator capped max size (e.g. 80 m²) and the
+    # property is materially larger, downgrade approved → manual_review so a
+    # human checks whether the oversize is intentional.
+    max_size = _safe_float(filters.get("max_size_sqm"), 0.0)
+    if max_size > 0 and floor_area_for_fit > max_size * 1.05:
+        if deal_status == "approved_candidate":
+            deal_status = "manual_review"
+            verdict = "MANUAL REVIEW"
+        notes.append(f"property_exceeds_max_size_{int(max_size)}m2")
+
     # When confidence is low we bump rejects to manual_review so the operator decides.
     if confidence["band"] == "low" and deal_status == "rejected":
         deal_status = "manual_review"
         verdict = "MANUAL REVIEW"
-        notes = ["promoted_to_review_due_to_low_confidence"]
-    else:
-        notes = []
+        notes.append("promoted_to_review_due_to_low_confidence")
 
     classification = _classification(final_score, economics, location, physical_block, competition_component)
 
@@ -393,6 +569,8 @@ def score_property(
             "physical_fit_score": round(physical_block["score"], 2),
             "competition_score": round(competition_component, 2),
             "risk_score": round(risk_component, 2),
+            "secondary_revenue_score": round(secondary_block["score"], 2),
+            "demographic_targeting_score": round(demographic_block["score"], 2),
             "sub_components": {
                 "population": round(population_score, 2),
                 "income": round(income_score, 2),
@@ -405,10 +583,13 @@ def score_property(
                 "public_transport": round(public_transport_score, 2),
             },
         },
+        "preferred_market": preferred,
         "drivers": {
             "economics": economics_block["drivers"],
             "physical": physical_block["drivers"],
             "risk": risk_drivers,
+            "demographics": demographic_block["drivers"],
+            "secondary_revenue": secondary_block["drivers"],
         },
         "notes": notes,
         "weights_used": {
@@ -417,11 +598,13 @@ def score_property(
             "physical_fit": weights.physical_fit,
             "competition": weights.competition,
             "risk": weights.risk,
+            "secondary_revenue": secondary_weight,
         },
         "thresholds": {
             "approved_min": thresholds.approved_min,
             "manual_review_min": thresholds.manual_review_min,
         },
+        "applied_filters": filters,
     }
 
 

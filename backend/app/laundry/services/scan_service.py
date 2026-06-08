@@ -66,6 +66,11 @@ async def run_laundry_scan(
     if not job:
         return {"success": False, "error": "scan job not found"}
 
+    # Job-level filters (neighbourhood whitelist, max size, etc.) flow into
+    # every pipeline call so the soft constraints picked at scan time stay
+    # consistent across resumes.
+    filters: Dict[str, Any] = dict(job.filters or {})
+
     await update_scan_job_progress(db, job, status="running", progress_pct=2.0)
     await _emit(
         job_id=job_id,
@@ -149,7 +154,11 @@ async def run_laundry_scan(
             # Maybe a seed_text job — analyse it as a single listing
             if job.seed_text:
                 result = await pipeline_service.analyse_text(
-                    db, job.seed_text, overrides=overrides, user_id=job.created_by_user_id
+                    db,
+                    job.seed_text,
+                    overrides=overrides,
+                    filters=filters,
+                    user_id=job.created_by_user_id,
                 )
                 results.append(result)
             else:
@@ -178,6 +187,7 @@ async def run_laundry_scan(
                         db,
                         url,
                         overrides=overrides,
+                        filters=filters,
                         user_id=job.created_by_user_id,
                     )
                     success = bool(result.get("property_id"))

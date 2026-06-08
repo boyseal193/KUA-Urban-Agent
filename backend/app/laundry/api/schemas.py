@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Literal, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 
 PropertyTypeLiteral = Literal[
@@ -19,18 +19,101 @@ SearchTypeLiteral = Literal["automatic_scan", "manual_url", "area_search"]
 
 
 class ScanLaunchPayload(BaseModel):
-    """Operator-facing scan request (matches the UI "Scan Options" panel)."""
+    """Operator-facing scan request (matches the UI "Scan Options" panel).
+
+    Field names mirror the modern operator vocabulary
+    (``listing_url`` / ``raw_listing_text`` / ``run_in_background`` /
+    ``llm_memo_polish``). The legacy names from the first frontend release
+    (``search_url`` / ``seed_text`` / ``async_mode`` / ``polish_with_llm``)
+    are still accepted via ``AliasChoices`` so deployed clients never break.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
     property_type: Optional[PropertyTypeLiteral] = Field(default=None)
     acquisition_type: Optional[AcquisitionTypeLiteral] = Field(default=None)
     search_type: SearchTypeLiteral = Field(default="manual_url")
-    search_url: Optional[str] = Field(default=None, description="Listing or search-results URL")
-    seed_text: Optional[str] = Field(default=None, description="Raw listing text for text-based scans")
+
+    listing_url: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("listing_url", "search_url", "url"),
+        description="Listing URL, area / search-results URL, or seed page for automatic scans.",
+    )
+    raw_listing_text: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("raw_listing_text", "seed_text", "text"),
+        description="Optional raw listing text — used when no scrapable URL is available.",
+    )
+
+    listing_limit: int = Field(default=20, ge=1, le=200)
+    run_in_background: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("run_in_background", "async_mode"),
+        description="Queue the scan on the ARQ worker. Disable only for very small inline jobs.",
+    )
+    llm_memo_polish: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("llm_memo_polish", "polish_with_llm"),
+    )
+
+    # Filters that constrain which listings reach the underwriter
+    neighbourhood_filters: List[str] = Field(
+        default_factory=list,
+        description="If set, only listings whose city or neighbourhood matches one of these "
+        "strings (case-insensitive substring) are processed.",
+    )
+    max_size_sqm: Optional[float] = Field(
+        default=None,
+        ge=0,
+        description="Hard upper limit on floor area. Right-sized urban laundromats sit around "
+        "60-80 m²; oversized properties are still analysed but flagged as oversized.",
+    )
+
+    # Free-form bag the underwriter can read directly
     filters: Dict[str, Any] = Field(default_factory=dict)
     overrides: Dict[str, Any] = Field(default_factory=dict)
-    listing_limit: int = Field(default=20, ge=1, le=200)
-    async_mode: bool = Field(default=True, description="Run via ARQ worker (default true)")
-    polish_with_llm: bool = Field(default=False)
+    scoring_overrides: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Shorthand to override only the scoring weights / thresholds. "
+        "Merged into ``overrides.scoring_weights`` / ``overrides.thresholds`` automatically.",
+    )
+
+    @model_validator(mode="after")
+    def _absorb_into_filters_and_overrides(self) -> "ScanLaunchPayload":
+        if self.neighbourhood_filters:
+            self.filters.setdefault("neighbourhood_filters", self.neighbourhood_filters)
+        if self.max_size_sqm is not None:
+            self.filters.setdefault("max_size_sqm", self.max_size_sqm)
+        if self.scoring_overrides:
+            sw = self.scoring_overrides.get("scoring_weights")
+            th = self.scoring_overrides.get("thresholds")
+            if sw:
+                self.overrides.setdefault("scoring_weights", {}).update(sw)
+            if th:
+                self.overrides.setdefault("thresholds", {}).update(th)
+            # Any other top-level keys (e.g. business_profile) propagate as-is.
+            for k, v in self.scoring_overrides.items():
+                if k in ("scoring_weights", "thresholds"):
+                    continue
+                self.overrides.setdefault(k, v)
+        return self
+
+    # Convenience accessors so legacy call sites keep working ------------------
+    @property
+    def search_url(self) -> Optional[str]:  # pragma: no cover — alias
+        return self.listing_url
+
+    @property
+    def seed_text(self) -> Optional[str]:  # pragma: no cover — alias
+        return self.raw_listing_text
+
+    @property
+    def async_mode(self) -> bool:  # pragma: no cover — alias
+        return self.run_in_background
+
+    @property
+    def polish_with_llm(self) -> bool:  # pragma: no cover — alias
+        return self.llm_memo_polish
 
 
 class ScanJobOut(BaseModel):
@@ -113,6 +196,7 @@ class AnalyseInlinePayload(BaseModel):
     url: Optional[str] = None
     text: Optional[str] = None
     overrides: Dict[str, Any] = Field(default_factory=dict)
+    filters: Dict[str, Any] = Field(default_factory=dict)
     polish_with_llm: bool = False
 
 

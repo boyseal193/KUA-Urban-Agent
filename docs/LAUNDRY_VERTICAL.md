@@ -103,28 +103,72 @@ GET    /laundry/deals/approved           ?limit
 GET    /laundry/deals/manual-review      ?limit
 GET    /laundry/deals/rejected           ?limit
 GET    /laundry/deals/all                ?limit&status
-GET    /laundry/deals/map                ?limit
-GET    /laundry/property/{id}
-DELETE /laundry/property/{id}            (soft delete)
-POST   /laundry/property/{id}/restore
-POST   /laundry/property/{id}/memo       (rebuild)
-POST   /laundry/property/{id}/rescore    (re‑run economics + scoring)
+GET    /laundry/map/markers              ?limit
+GET    /laundry/properties/{id}
+DELETE /laundry/properties/{id}          (soft delete)
+POST   /laundry/properties/{id}/restore
+POST   /laundry/properties/{id}/memo     (rebuild memo)
+POST   /laundry/properties/{id}/rescore  (re‑run economics + scoring)
+GET    /laundry/properties/deleted
+GET    /laundry/properties/duplicates
+POST   /laundry/properties/{id}/exports  (create artefact for one property)
 POST   /laundry/analyse                  (inline URL or raw text)
-POST   /laundry/scan                     (launch scan job)
-GET    /laundry/scan/jobs                ?limit
-GET    /laundry/scan/{job_id}
-POST   /laundry/scan/{job_id}/resume
-POST   /laundry/exports                  (create artefact)
+POST   /laundry/scans                    (launch scan job)            ← canonical
+POST   /laundry/scan                     (legacy alias of /scans)
+GET    /laundry/scans                    ?limit
+GET    /laundry/scans/{job_id}
+POST   /laundry/scans/{job_id}/resume
 GET    /laundry/exports                  ?limit
 GET    /laundry/exports/formats
 GET    /laundry/exports/{export_id}/download
 GET    /laundry/admin/stats
-POST   /laundry/admin/purge-test         (deletes only rows flagged source='test')
+POST   /laundry/admin/cleanup/test-data  (deletes only rows flagged source='test')
 POST   /laundry/admin/bulk-rescore
 GET    /laundry/settings
 PUT    /laundry/settings
-GET    /laundry/location/preview         ?address=...
+GET    /laundry/location/preview         ?address=...&lat=...&lng=...
 WS     /ws/laundry/{job_id}              (live progress stream)
+```
+
+### `POST /laundry/scans` payload
+
+```jsonc
+{
+  "property_type": "empty_commercial",          // existing_laundromat | empty_commercial | retail | mixed_use | industrial
+  "acquisition_type": "rent",                   // buy | rent
+  "search_type": "manual_url",                  // automatic_scan | manual_url | area_search
+
+  "listing_url": "https://www.idealista.com/...",
+  "raw_listing_text": null,                     // optional pasted text
+
+  "listing_limit": 20,                          // 1..200
+  "run_in_background": true,                    // queue on the ARQ worker
+  "llm_memo_polish": false,
+
+  "neighbourhood_filters": ["Raval", "Sant Antoni"],
+  "max_size_sqm": 80,
+  "scoring_overrides": {
+    "scoring_weights": { "secondary_revenue": 0.06 },
+    "thresholds":      { "approved_min": 80 }
+  },
+
+  "filters":   {},                              // free-form bag (merged with the above)
+  "overrides": {}                               // free-form assumptions override (merged with scoring_overrides)
+}
+```
+
+Legacy field names from earlier frontends are accepted transparently
+(`search_url`, `seed_text`, `async_mode`, `polish_with_llm`, plus the short
+`url` / `text`). The response is always:
+
+```json
+{
+  "success": true,
+  "async":   true,
+  "job_id":  "5f9a…",
+  "status":  "queued",
+  "websocket_url": "/ws/laundry/5f9a…"
+}
 ```
 
 The router is registered in `backend/app/main.py`:
@@ -319,3 +363,60 @@ already conservative.
   weights / thresholds) live in `app/laundry/assumptions.py` and can be
   overridden per‑deployment from `laundry_settings.overrides` (UI:
   `/laundry/settings`).
+
+---
+
+## 9. Business model — what the engine actually optimises for
+
+The engine targets **small, dense urban laundromats** rather than
+maximum-size warehouses:
+
+| Dimension | Target |
+|---|---|
+| Floor area | 60 – 80 m² (ideal 70 m²; oversized > 110 m² is penalised) |
+| Machine count | ~10 (configurable per‑deployment: 7 washers + 3 dryers default, 2 large washers + 2 stacking dryers in the mix) |
+| Markets | Barcelona — **Raval, Sant Antoni, Poble Sec, Clot, Hospitalet** (operator-extensible) |
+| Demographics | Renters in apartments under 70 m², lower‑middle income (€16 k–€38 k), 9 k–28 k people/km², high foot traffic |
+| Acquisition modes | Both **buy** and **rent**, both **existing laundromat** and **conversion** of empty commercial / retail / mixed‑use |
+| Secondary revenue | Amazon / InPost lockers, soap / snack / drink vending, ATM, advertising, pickup‑drop-off, hotel / hostel commercial contracts, dry-cleaning partner |
+| Scoring bands | **0–39 reject · 40–74 manual review · 75–100 excellent** |
+| Philosophy | Real-world good deals land in **manual review**; missing information → manual review (never auto-reject) |
+
+The configurable knobs live in `app/laundry/assumptions.py` and can be
+overridden per deployment by writing JSON into the
+`laundry_settings.overrides` row:
+
+- `business_profile.*` — right-sizing limits, preferred markets, demographic targets
+- `machine_mix.*` — washer / dryer / large washer / stacking dryer / vending / kiosk counts
+- `secondary_revenue.*` — annual euro estimates per ancillary line
+- `scoring_weights.*` — location / economics / physical_fit / competition / risk / secondary_revenue
+- `thresholds.*` — `approved_min`, `manual_review_min`
+
+These overrides can also be sent on a per-scan basis through the new
+`scoring_overrides` field on `POST /laundry/scans`.
+
+---
+
+## 10. Troubleshooting
+
+### `POST /laundry/scans → 404`
+
+The deployed backend is missing the laundry router. Verify in order:
+
+1. `docker exec api python -c "from app.laundry.api import laundry_router; print(laundry_router.prefix)"`
+   must print `/laundry`. If it raises `ModuleNotFoundError`, the image
+   isn't built from a commit that includes `backend/app/laundry/`.
+2. `GET /openapi.json | jq '.paths | keys[] | select(test("/laundry"))'`
+   should include `/laundry/scans`. If it doesn't, the import is failing
+   silently — check Railway logs for `app.include_router` traces.
+3. Redeploy: Railway → service → **Deploy** (or `railway up`).
+   The migration is idempotent.
+4. The endpoint also accepts the legacy `/laundry/scan` (singular) path
+   so already-built frontends continue to work.
+
+### Worker doesn't pick up the job
+
+`docker logs worker | grep run_laundry_scan_job`. If the function is
+missing from the registered task list the worker image is stale — the
+shared `app/workers/settings.py` now imports `run_laundry_scan_job` from
+`app.laundry.workers.tasks` and the worker must be redeployed.

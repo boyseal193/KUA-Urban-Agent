@@ -18,7 +18,7 @@ Design rules:
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from app.laundry.assumptions import (
     LaundryAssumptions,
@@ -73,42 +73,169 @@ def estimate_machine_fleet(
     declared_washers: Optional[int],
     declared_dryers: Optional[int],
     machine: "object",
+    machine_mix: Optional["object"] = None,
+    target_total_machines: Optional[int] = None,
 ) -> Dict[str, int]:
     """
-    Pick a sensible washer/dryer split for the available floor area.
+    Pick a sensible washer / dryer split for the available floor area.
 
-    Rule of thumb the model uses:
+    Rules:
 
-    * Reserve ``aisle_seating_ratio`` of the area for circulation, folding, seating.
-    * The remaining space is split 55/45 (washers / dryers).
-    * Each washer/dryer occupies its declared footprint.
-    * Minimum viable store = 4 washers + 3 dryers (≈ 25 m² of machines).
-
-    Listings that declare actual machine counts always win — the AI is not
-    second-guessing the seller's manifest.
+    * Listings that declare actual machine counts always win (no second-guessing
+      the seller's manifest).
+    * Otherwise we honour the *configured* MachineMix targets but cap them by
+      what physically fits in the available floor area (after reserving
+      ``aisle_seating_ratio`` for circulation, folding, seating).
+    * A target_total_machines hint (default 10 from BusinessProfile) sets the
+      starting allocation — the model then shrinks proportionally if floor
+      area is too small or grows up to the area-limited ceiling if there is
+      headroom.
     """
     if declared_washers and declared_washers > 0 and declared_dryers and declared_dryers > 0:
         return {
             "washer_count": int(declared_washers),
             "dryer_count": int(declared_dryers),
+            "large_washer_count": 0,
+            "stacking_dryer_count": int(declared_dryers),
             "source": "declared",
         }
 
     usable = max(floor_area_m2 * (1.0 - machine.aisle_seating_ratio), 0.0)
-    washer_area = usable * 0.55
-    dryer_area = usable * 0.45
 
-    washer_count = max(int(washer_area // machine.washer_footprint_m2), 0)
-    dryer_count = max(int(dryer_area // machine.dryer_footprint_m2), 0)
+    # Area-only ceilings (how many machines could physically fit at all)
+    area_washer_cap = int((usable * 0.55) // machine.washer_footprint_m2)
+    area_dryer_cap = int((usable * 0.45) // machine.dryer_footprint_m2)
 
-    if floor_area_m2 >= 40:
-        washer_count = max(washer_count, 4)
-        dryer_count = max(dryer_count, 3)
+    if machine_mix is not None:
+        target_w = max(int(machine_mix.target_washers), 0)
+        target_d = max(int(machine_mix.target_dryers), 0)
+        target_lg_w = max(int(machine_mix.target_large_washers), 0)
+        target_stack_d = max(int(machine_mix.target_stacking_dryers), 0)
+    else:
+        target_w, target_d = 7, 3
+        target_lg_w, target_stack_d = 2, 2
+
+    target_total = int(target_total_machines or (target_w + target_d) or 10)
+
+    # If the configured mix exceeds the area cap, shrink proportionally while
+    # preserving the washer:dryer ratio operators picked.
+    requested_total = max(target_w + target_d, 1)
+    feasible_total = min(requested_total, area_washer_cap + area_dryer_cap, target_total)
+    if feasible_total <= 0 and floor_area_m2 >= 30:
+        feasible_total = min(area_washer_cap + area_dryer_cap, 6)
+    if feasible_total <= 0:
+        return {
+            "washer_count": 0,
+            "dryer_count": 0,
+            "large_washer_count": 0,
+            "stacking_dryer_count": 0,
+            "source": "no_fit",
+        }
+
+    scale = feasible_total / requested_total
+    washer_count = max(int(round(target_w * scale)), min(area_washer_cap, 4) if floor_area_m2 >= 35 else 0)
+    dryer_count = max(feasible_total - washer_count, 0)
+    if dryer_count > area_dryer_cap:
+        dryer_count = area_dryer_cap
+        washer_count = min(area_washer_cap, feasible_total - dryer_count)
+
+    # Decompose into large + standard washers / stacking vs floor dryers.
+    large_washer_count = min(washer_count, max(int(round(target_lg_w * scale)), 0))
+    stacking_dryer_count = min(dryer_count, max(int(round(target_stack_d * scale)), 0))
 
     return {
         "washer_count": washer_count,
         "dryer_count": dryer_count,
+        "large_washer_count": large_washer_count,
+        "stacking_dryer_count": stacking_dryer_count,
         "source": "estimated",
+    }
+
+
+def estimate_secondary_revenue(
+    *,
+    extracted: Dict[str, Any],
+    floor_area_m2: float,
+    location: Dict[str, Any],
+    secondary_cfg: "object",
+) -> Dict[str, Any]:
+    """Sum the ancillary revenue lines the property can realistically host.
+
+    A line is only included when the property exposes the prerequisite. The
+    function returns both the realised revenue dictionary AND a list of
+    *potential* (un-credited) opportunities so the UI/memo can surface them.
+    """
+    items: Dict[str, float] = {}
+    potential: List[str] = []
+
+    has_frontage = bool(extracted.get("ground_floor", True)) and bool(
+        extracted.get("street_visibility_0_100") or location.get("street_visibility_0_100", 65)
+    )
+    has_loading = bool(extracted.get("loading_access"))
+    has_room_for_locker = floor_area_m2 >= 35 and has_frontage
+    has_room_for_vending = floor_area_m2 >= 30
+    hotels = int(location.get("hotels_within_500m") or 0)
+    universities = int(location.get("universities_within_2km") or 0)
+    students = int(location.get("students_within_1km") or 0)
+    corner = bool(extracted.get("corner_unit"))
+
+    if has_room_for_locker:
+        items["amazon_locker_eur_year"] = secondary_cfg.amazon_locker_eur_year
+        items["inpost_locker_eur_year"] = secondary_cfg.inpost_locker_eur_year * 0.65
+    else:
+        potential.append("parcel_lockers_need_frontage")
+
+    if has_room_for_vending:
+        items["detergent_vending_eur_year"] = secondary_cfg.detergent_vending_eur_year
+        items["snack_vending_eur_year"] = secondary_cfg.snack_vending_eur_year
+        if floor_area_m2 >= 55:
+            items["drink_vending_eur_year"] = secondary_cfg.drink_vending_eur_year
+    else:
+        potential.append("vending_needs_min_30m2")
+
+    if has_frontage and corner:
+        items["atm_eur_year"] = secondary_cfg.atm_eur_year
+    elif has_frontage:
+        potential.append("atm_optional_if_secure_alcove")
+
+    if has_frontage:
+        items["advertising_eur_year"] = secondary_cfg.advertising_eur_year
+
+    # Pickup/drop-off + commercial contracts scale with tourist + student demand.
+    drop_off_multiplier = 0.0
+    if hotels >= 3:
+        drop_off_multiplier += 0.6
+    if students >= 800:
+        drop_off_multiplier += 0.4
+    if universities >= 1:
+        drop_off_multiplier += 0.2
+    if has_loading:
+        drop_off_multiplier += 0.2
+    drop_off_multiplier = min(drop_off_multiplier, 1.2)
+
+    if drop_off_multiplier > 0:
+        items["drop_off_service_eur_year"] = (
+            secondary_cfg.drop_off_service_eur_year * drop_off_multiplier
+        )
+    else:
+        potential.append("drop_off_needs_tourist_or_student_demand")
+
+    if hotels >= 4 or universities >= 1:
+        items["commercial_contract_eur_year"] = secondary_cfg.commercial_contract_eur_year * (
+            0.6 + min(hotels, 8) * 0.05
+        )
+    else:
+        potential.append("commercial_contracts_need_hotel_or_uni_demand")
+
+    if hotels >= 1 or students >= 600:
+        items["dry_cleaning_partner_eur_year"] = secondary_cfg.dry_cleaning_partner_eur_year
+
+    total = sum(items.values())
+
+    return {
+        "items_eur_year": {k: round(v, 2) for k, v in items.items()},
+        "total_eur_year": round(total, 2),
+        "potential_opportunities": potential,
     }
 
 
@@ -141,8 +268,11 @@ def calculate_economics(
 
     assumptions = merge_overrides(default_assumptions(), overrides)
     machine = assumptions.machine
+    machine_mix = assumptions.machine_mix
+    secondary_cfg = assumptions.secondary_revenue
     fit_out = assumptions.fit_out
     opex_cfg = assumptions.opex
+    biz = assumptions.business_profile
 
     floor_area = _safe_float(data.get("floor_area_m2") or data.get("gba_m2") or data.get("size_m2"))
     asking_price = _safe_float(data.get("asking_price"))
@@ -162,20 +292,30 @@ def calculate_economics(
         declared_washers=_safe_int(data.get("washer_count")) or None,
         declared_dryers=_safe_int(data.get("dryer_count")) or None,
         machine=machine,
+        machine_mix=machine_mix,
+        target_total_machines=biz.target_total_machines,
     )
     washer_count = fleet["washer_count"]
     dryer_count = fleet["dryer_count"]
+    large_washer_count = fleet.get("large_washer_count", 0)
+    standard_washer_count = max(washer_count - large_washer_count, 0)
+    stacking_dryer_count = fleet.get("stacking_dryer_count", 0)
+    standard_dryer_count = max(dryer_count - stacking_dryer_count, 0)
 
     # --- Capex: machine investment + fit-out ---
     machine_capex = (
-        washer_count * machine.washer_unit_capex_eur
-        + dryer_count * machine.dryer_unit_capex_eur
+        standard_washer_count * machine.washer_unit_capex_eur
+        + large_washer_count * machine.large_washer_unit_capex_eur
+        + standard_dryer_count * machine.dryer_unit_capex_eur
+        + stacking_dryer_count * machine.stacking_dryer_unit_capex_eur
     )
     ancillary_capex = (
-        (machine.soap_vending_capex_eur if washer_count > 0 else 0)
-        + (machine.snack_vending_capex_eur if floor_area >= 50 else 0)
-        + max(int(floor_area // 25), 2) * machine.folding_table_capex_eur
-        + max(int(floor_area // 8), 4) * machine.seating_unit_capex_eur
+        machine_mix.detergent_vending * machine.soap_vending_capex_eur
+        + machine_mix.snack_vending * machine.snack_vending_capex_eur
+        + machine_mix.drink_vending * machine.drink_vending_capex_eur
+        + machine_mix.payment_kiosks * machine.payment_kiosk_capex_eur
+        + max(machine_mix.folding_stations, int(floor_area // 25)) * machine.folding_table_capex_eur
+        + max(machine_mix.seating_units, int(floor_area // 8)) * machine.seating_unit_capex_eur
     )
     construction_cost = floor_area * fit_out.fit_out_eur_per_m2
     electrical_upgrades = floor_area * fit_out.electrical_upgrade_eur_per_m2
@@ -198,7 +338,8 @@ def calculate_economics(
 
     # --- Revenue: cycles per day × revenue per cycle × utilisation ramp ---
     raw_daily_revenue = (
-        washer_count * machine.avg_cycles_per_washer_day * machine.avg_revenue_per_wash_cycle_eur
+        standard_washer_count * machine.avg_cycles_per_washer_day * machine.avg_revenue_per_wash_cycle_eur
+        + large_washer_count * machine.avg_cycles_per_large_washer_day * machine.avg_revenue_per_large_wash_cycle_eur
         + dryer_count * machine.avg_cycles_per_dryer_day * machine.avg_revenue_per_dry_cycle_eur
     )
     utilisation_factor = min(max(opening_hours / 16.0, 0.55), 1.0)
@@ -207,12 +348,25 @@ def calculate_economics(
     ramp_factor = max(0.0, 1.0 - (ramp_up_months / 24.0) * 0.4)
     year1_revenue = steady_state_annual_revenue * ramp_factor
 
-    # Ancillary revenue (vending, detergent sales) ≈ 6% of machine revenue
-    ancillary_revenue = year1_revenue * 0.06
-    expected_revenue = year1_revenue + ancillary_revenue
+    # In-store ancillary revenue (detergent shelf sales etc.) ≈ 5% of machine revenue
+    in_store_ancillary_revenue = year1_revenue * 0.05
+
+    # Configurable secondary revenue (lockers, vending, drop-off, contracts)
+    secondary = estimate_secondary_revenue(
+        extracted=data,
+        floor_area_m2=floor_area,
+        location=data.get("_location") or {},
+        secondary_cfg=secondary_cfg,
+    )
+    secondary_revenue = secondary["total_eur_year"] * ramp_factor
+
+    expected_revenue = year1_revenue + in_store_ancillary_revenue + secondary_revenue
 
     # --- Opex ---
-    annual_wash_cycles = washer_count * machine.avg_cycles_per_washer_day * operating_days * utilisation_factor
+    annual_wash_cycles = (
+        standard_washer_count * machine.avg_cycles_per_washer_day * operating_days * utilisation_factor
+        + large_washer_count * machine.avg_cycles_per_large_washer_day * operating_days * utilisation_factor
+    )
     annual_dry_cycles = dryer_count * machine.avg_cycles_per_dryer_day * operating_days * utilisation_factor
 
     utility_overrides = data.get("utility_price_overrides") or {}
@@ -307,19 +461,37 @@ def calculate_economics(
         residual=capex * 0.4,
     )
 
+    # Sensitivity analysis: ±20% on cycles/day and ±15% on utilisation
+    sensitivity = _sensitivity(
+        baseline_revenue=expected_revenue,
+        baseline_opex=annual_opex,
+        baseline_capex_total=total_investment,
+    )
+
+    right_size_flag = _right_size_status(floor_area, biz)
+
     out: Dict[str, Any] = {
         "acquisition_type": acquisition_type,
         "operating_days_per_year": round(operating_days, 1),
         "opening_hours_per_day": round(opening_hours, 1),
         "ramp_up_months": round(ramp_up_months, 1),
         "floor_area_m2": round(floor_area, 2),
+        "right_size_status": right_size_flag,
         "fleet": fleet,
         "washer_count": washer_count,
+        "standard_washer_count": standard_washer_count,
+        "large_washer_count": large_washer_count,
         "dryer_count": dryer_count,
+        "standard_dryer_count": standard_dryer_count,
+        "stacking_dryer_count": stacking_dryer_count,
+        "total_machines": washer_count + dryer_count,
         "folding_area_m2": round(floor_area * 0.12, 2),
-        "customer_seating_units": max(int(floor_area // 8), 4),
-        "soap_vending": washer_count > 0,
-        "snack_vending": floor_area >= 50,
+        "folding_stations": machine_mix.folding_stations,
+        "customer_seating_units": max(machine_mix.seating_units, int(floor_area // 8)),
+        "detergent_vending_units": machine_mix.detergent_vending,
+        "snack_vending_units": machine_mix.snack_vending,
+        "drink_vending_units": machine_mix.drink_vending,
+        "payment_kiosks": machine_mix.payment_kiosks,
 
         # Capex line items
         "machine_capex_eur": round(machine_capex, 2),
@@ -345,9 +517,16 @@ def calculate_economics(
         # Revenue
         "raw_daily_revenue_eur": round(raw_daily_revenue, 2),
         "year1_revenue_eur": round(year1_revenue, 2),
-        "ancillary_revenue_eur": round(ancillary_revenue, 2),
+        "in_store_ancillary_revenue_eur": round(in_store_ancillary_revenue, 2),
+        "secondary_revenue_eur": round(secondary_revenue, 2),
+        "secondary_revenue_breakdown": secondary["items_eur_year"],
+        "secondary_revenue_potential": secondary["potential_opportunities"],
+        # legacy alias kept so prior consumers + exports keep rendering
+        "ancillary_revenue_eur": round(in_store_ancillary_revenue + secondary_revenue, 2),
         "expected_revenue_eur": round(expected_revenue, 2),
-        "steady_state_revenue_eur": round(steady_state_annual_revenue + ancillary_revenue, 2),
+        "steady_state_revenue_eur": round(
+            steady_state_annual_revenue + in_store_ancillary_revenue + secondary["total_eur_year"], 2
+        ),
         "utilisation_factor": round(utilisation_factor, 4),
 
         # Opex line items
@@ -376,10 +555,53 @@ def calculate_economics(
         "break_even_revenue_eur": round(break_even_revenue, 2),
         "break_even_cycles_per_day": round(break_even_cycles_per_day, 2) if break_even_cycles_per_day else None,
 
+        # Sensitivity (±20% on revenue, ±15% on opex)
+        "sensitivity": sensitivity,
+
         # Reference assumptions hash (for reproducibility)
-        "assumptions_version": "1.0.0",
+        "assumptions_version": "2.0.0",
     }
     return out
+
+
+def _sensitivity(
+    *,
+    baseline_revenue: float,
+    baseline_opex: float,
+    baseline_capex_total: float,
+) -> Dict[str, Any]:
+    scenarios = []
+    for rev_shock, opex_shock, label in (
+        (-0.20, +0.15, "downside"),
+        (+0.00, +0.00, "base"),
+        (+0.20, -0.10, "upside"),
+    ):
+        rev = baseline_revenue * (1 + rev_shock)
+        opex = baseline_opex * (1 + opex_shock)
+        ebitda = rev - opex
+        payback = (baseline_capex_total / ebitda) if ebitda > 0 else None
+        scenarios.append(
+            {
+                "label": label,
+                "revenue_eur": round(rev, 2),
+                "opex_eur": round(opex, 2),
+                "ebitda_eur": round(ebitda, 2),
+                "payback_years": round(payback, 2) if payback else None,
+            }
+        )
+    return {"scenarios": scenarios}
+
+
+def _right_size_status(floor_area: float, biz) -> str:
+    if floor_area <= 0:
+        return "unknown"
+    if floor_area < biz.min_viable_floor_area_m2:
+        return "undersized"
+    if floor_area <= biz.max_recommended_floor_area_m2:
+        return "ideal"
+    if floor_area <= biz.hard_max_floor_area_m2:
+        return "oversized_acceptable"
+    return "oversized"
 
 
 def _approx_irr(

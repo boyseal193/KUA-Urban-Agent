@@ -19,10 +19,12 @@ import {
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { useLaunchLaundryScan } from "@/hooks/use-laundry";
-import type {
-  LaundryAcquisitionType,
-  LaundryPropertyType,
-  LaundrySearchType,
+import {
+  LAUNDRY_DEFAULT_MAX_SQM,
+  LAUNDRY_PREFERRED_NEIGHBOURHOODS,
+  type LaundryAcquisitionType,
+  type LaundryPropertyType,
+  type LaundrySearchType,
 } from "@/lib/api";
 
 const PROPERTY_TYPES: { value: LaundryPropertyType; label: string }[] = [
@@ -66,18 +68,26 @@ export default function LaundryScanPage() {
     React.useState<LaundryAcquisitionType>("rent");
   const [searchType, setSearchType] =
     React.useState<LaundrySearchType>("manual_url");
-  const [searchUrl, setSearchUrl] = React.useState("");
-  const [seedText, setSeedText] = React.useState("");
+  const [listingUrl, setListingUrl] = React.useState("");
+  const [rawListingText, setRawListingText] = React.useState("");
   const [listingLimit, setListingLimit] = React.useState(20);
-  const [asyncMode, setAsyncMode] = React.useState(true);
-  const [polish, setPolish] = React.useState(false);
+  const [runInBackground, setRunInBackground] = React.useState(true);
+  const [llmMemoPolish, setLlmMemoPolish] = React.useState(false);
+  const [maxSizeSqm, setMaxSizeSqm] = React.useState<number>(LAUNDRY_DEFAULT_MAX_SQM);
+  const [neighbourhoodFilters, setNeighbourhoodFilters] = React.useState<string[]>([]);
 
   const helper = SEARCH_TYPES.find((s) => s.value === searchType)?.help ?? "";
 
+  function toggleNeighbourhood(label: string) {
+    setNeighbourhoodFilters((prev) =>
+      prev.includes(label) ? prev.filter((n) => n !== label) : [...prev, label],
+    );
+  }
+
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if ((searchType === "manual_url" || searchType === "area_search") && !searchUrl.trim()) {
-      toast.error("Provide a URL for this scan type.");
+    if ((searchType === "manual_url" || searchType === "area_search") && !listingUrl.trim()) {
+      toast.error("Provide a listing URL for this scan type.");
       return;
     }
     try {
@@ -85,13 +95,15 @@ export default function LaundryScanPage() {
         property_type: propertyType,
         acquisition_type: acquisitionType,
         search_type: searchType,
-        search_url: searchUrl.trim() || null,
-        seed_text: seedText.trim() || null,
+        listing_url: listingUrl.trim() || null,
+        raw_listing_text: rawListingText.trim() || null,
         listing_limit: listingLimit,
-        async_mode: asyncMode,
-        polish_with_llm: polish,
+        run_in_background: runInBackground,
+        llm_memo_polish: llmMemoPolish,
+        neighbourhood_filters: neighbourhoodFilters,
+        max_size_sqm: maxSizeSqm > 0 ? maxSizeSqm : null,
       });
-      toast.success(`Scan ${res.async ? "queued" : "completed"} — job ${res.job_id.slice(0, 8)}`);
+      toast.success(`Scan ${res.status} — job ${res.job_id.slice(0, 8)}`);
       router.push(`/laundry/scans/${res.job_id}`);
     } catch (err) {
       toast.error((err as Error).message || "Failed to launch scan");
@@ -177,12 +189,12 @@ export default function LaundryScanPage() {
 
             {(searchType === "manual_url" || searchType === "area_search" || searchType === "automatic_scan") && (
               <div className="space-y-2">
-                <Label className="tactical-mono">URL</Label>
+                <Label className="tactical-mono">Listing URL</Label>
                 <Input
                   type="url"
                   required={searchType !== "automatic_scan"}
-                  value={searchUrl}
-                  onChange={(e) => setSearchUrl(e.target.value)}
+                  value={listingUrl}
+                  onChange={(e) => setListingUrl(e.target.value)}
                   placeholder="https://www.idealista.com/en/local-…/"
                 />
               </div>
@@ -191,15 +203,45 @@ export default function LaundryScanPage() {
             <div className="space-y-2">
               <Label className="tactical-mono">Raw listing text (optional)</Label>
               <textarea
-                value={seedText}
-                onChange={(e) => setSeedText(e.target.value)}
+                value={rawListingText}
+                onChange={(e) => setRawListingText(e.target.value)}
                 rows={5}
                 placeholder="Paste a listing description, broker email, or marketing PDF text…"
                 className="w-full rounded-md border border-border/60 bg-background/40 p-3 font-mono text-xs text-foreground focus:outline-none focus:ring-2 focus:ring-violet-400/40"
               />
             </div>
 
-            <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+            <div>
+              <Label className="tactical-mono mb-2 inline-block">
+                Preferred neighbourhoods (Barcelona)
+              </Label>
+              <div className="flex flex-wrap gap-2">
+                {LAUNDRY_PREFERRED_NEIGHBOURHOODS.map((label: string) => {
+                  const active = neighbourhoodFilters.includes(label);
+                  return (
+                    <button
+                      key={label}
+                      type="button"
+                      aria-pressed={active}
+                      onClick={() => toggleNeighbourhood(label)}
+                      className={
+                        "rounded-full border px-3 py-1 text-[11px] uppercase tracking-widest transition " +
+                        (active
+                          ? "border-violet-400/50 bg-violet-400/15 text-violet-200"
+                          : "border-border/60 bg-card/40 text-muted-foreground hover:text-foreground")
+                      }
+                    >
+                      {label}
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="mt-2 text-[11px] text-muted-foreground">
+                When at least one is selected only listings matching the address/city/neighbourhood pass.
+              </p>
+            </div>
+
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-4">
               <div className="space-y-2">
                 <Label className="tactical-mono">Listing limit</Label>
                 <Input
@@ -210,12 +252,33 @@ export default function LaundryScanPage() {
                   onChange={(e) => setListingLimit(Number(e.target.value) || 20)}
                 />
               </div>
+              <div className="space-y-2">
+                <Label className="tactical-mono">Max size (m²)</Label>
+                <Input
+                  type="number"
+                  min={0}
+                  max={1000}
+                  value={maxSizeSqm}
+                  onChange={(e) => setMaxSizeSqm(Number(e.target.value) || 0)}
+                />
+                <p className="text-[10px] text-muted-foreground">
+                  Right-sized urban units sit around 60–80 m². Larger hits go to manual review.
+                </p>
+              </div>
               <div className="flex items-center gap-3 pt-7">
-                <Switch checked={asyncMode} onCheckedChange={setAsyncMode} id="async-mode" />
+                <Switch
+                  checked={runInBackground}
+                  onCheckedChange={setRunInBackground}
+                  id="async-mode"
+                />
                 <Label htmlFor="async-mode" className="text-xs">Run in background</Label>
               </div>
               <div className="flex items-center gap-3 pt-7">
-                <Switch checked={polish} onCheckedChange={setPolish} id="polish-llm" />
+                <Switch
+                  checked={llmMemoPolish}
+                  onCheckedChange={setLlmMemoPolish}
+                  id="polish-llm"
+                />
                 <Label htmlFor="polish-llm" className="text-xs">LLM memo polish</Label>
               </div>
             </div>

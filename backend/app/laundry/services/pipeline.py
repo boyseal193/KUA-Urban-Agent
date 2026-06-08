@@ -47,6 +47,17 @@ from app.laundry.services.normalization import (
 log = structlog.get_logger(__name__)
 
 
+def _matches_neighbourhood_filter(cleaned: Dict[str, Any], filters: Dict[str, Any]) -> bool:
+    """Return True if the property passes the operator-supplied neighbourhood whitelist."""
+    requested = [str(s).strip().lower() for s in (filters.get("neighbourhood_filters") or []) if s]
+    if not requested:
+        return True
+    haystack = " ".join(
+        str(cleaned.get(k) or "") for k in ("neighbourhood", "city", "address")
+    ).lower()
+    return any(req in haystack for req in requested)
+
+
 class LaundryPipelineService:
     async def analyse_listing(
         self,
@@ -55,6 +66,7 @@ class LaundryPipelineService:
         *,
         source: str = "url_auto",
         overrides: Optional[Dict[str, Any]] = None,
+        filters: Optional[Dict[str, Any]] = None,
         user_id: Optional[UUID] = None,
         polish_with_llm: bool = False,
     ) -> Dict[str, Any]:
@@ -63,6 +75,17 @@ class LaundryPipelineService:
         valid, error = is_valid_listing(cleaned)
         if not valid:
             return {"success": False, "error": error, "extracted": cleaned}
+
+        filters = dict(filters or {})
+
+        # Operator-supplied neighbourhood filter (case-insensitive substring)
+        if not _matches_neighbourhood_filter(cleaned, filters):
+            return {
+                "success": False,
+                "error": "neighbourhood_filter_excluded",
+                "extracted": cleaned,
+                "skipped_reason": "neighbourhood_filter",
+            }
 
         # --- Geocode + location intel --------------------------------------
         address = " ".join(
@@ -81,10 +104,15 @@ class LaundryPipelineService:
             lng=coords["lng"],
             neighbourhood=cleaned.get("neighbourhood"),
             city=cleaned.get("city"),
+            address=cleaned.get("address"),
         )
 
         # --- Financial model + scoring -------------------------------------
-        economics = calculate_economics(cleaned, overrides=overrides)
+        # Surface live location intel to the economics engine so secondary
+        # revenue lines (lockers, hotel contracts) can be sized correctly.
+        cleaned_for_econ = dict(cleaned)
+        cleaned_for_econ["_location"] = location
+        economics = calculate_economics(cleaned_for_econ, overrides=overrides)
         score_result = score_property(
             {
                 "extracted": cleaned,
@@ -92,6 +120,7 @@ class LaundryPipelineService:
                 "economics": economics,
             },
             overrides=overrides,
+            filters=filters,
         )
 
         deal_status = assign_deal_status(score_result)
@@ -226,6 +255,7 @@ class LaundryPipelineService:
         url: str,
         *,
         overrides: Optional[Dict[str, Any]] = None,
+        filters: Optional[Dict[str, Any]] = None,
         user_id: Optional[UUID] = None,
         polish_with_llm: bool = False,
     ) -> Dict[str, Any]:
@@ -240,6 +270,7 @@ class LaundryPipelineService:
             extracted,
             source="url_auto",
             overrides=overrides,
+            filters=filters,
             user_id=user_id,
             polish_with_llm=polish_with_llm,
         )
@@ -254,6 +285,7 @@ class LaundryPipelineService:
         text: str,
         *,
         overrides: Optional[Dict[str, Any]] = None,
+        filters: Optional[Dict[str, Any]] = None,
         user_id: Optional[UUID] = None,
     ) -> Dict[str, Any]:
         extracted = await extract_listing(text)
@@ -262,6 +294,7 @@ class LaundryPipelineService:
             extracted,
             source="text_auto",
             overrides=overrides,
+            filters=filters,
             user_id=user_id,
         )
 

@@ -344,17 +344,23 @@ async def analyse_inline(
     db: Annotated[AsyncSession, Depends(get_db)],
     user: CurrentUser,
 ):
+    filters = dict(getattr(payload, "filters", None) or {})
     if payload.url:
         result = await pipeline_service.analyse_url(
             db,
             payload.url,
             overrides=payload.overrides,
+            filters=filters,
             user_id=user.id,
             polish_with_llm=payload.polish_with_llm,
         )
     elif payload.text:
         result = await pipeline_service.analyse_text(
-            db, payload.text, overrides=payload.overrides, user_id=user.id
+            db,
+            payload.text,
+            overrides=payload.overrides,
+            filters=filters,
+            user_id=user.id,
         )
     else:
         raise HTTPException(status_code=400, detail="Provide url or text")
@@ -373,10 +379,19 @@ async def launch_scan(
     db: Annotated[AsyncSession, Depends(get_db)],
     user: CurrentUser,
 ):
-    if payload.search_type == "manual_url" and not payload.search_url:
-        raise HTTPException(status_code=400, detail="manual_url scans require search_url")
-    if payload.search_type == "area_search" and not payload.search_url:
-        raise HTTPException(status_code=400, detail="area_search scans require search_url")
+    if payload.search_type == "manual_url" and not payload.listing_url:
+        raise HTTPException(status_code=400, detail="manual_url scans require listing_url")
+    if payload.search_type == "area_search" and not payload.listing_url:
+        raise HTTPException(status_code=400, detail="area_search scans require listing_url")
+    if (
+        payload.search_type == "automatic_scan"
+        and not payload.listing_url
+        and not (payload.overrides.get("seed_urls") or payload.filters.get("seed_urls"))
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="automatic_scan needs a seed listing_url or overrides.seed_urls list",
+        )
 
     job = await create_scan_job(
         db,
@@ -384,8 +399,8 @@ async def launch_scan(
         search_type=payload.search_type,
         property_type=payload.property_type,
         acquisition_type=payload.acquisition_type,
-        search_url=payload.search_url,
-        seed_text=payload.seed_text,
+        search_url=payload.listing_url,
+        seed_text=payload.raw_listing_text,
         filters=payload.filters,
         overrides=payload.overrides,
         listing_limit=payload.listing_limit,
@@ -393,7 +408,7 @@ async def launch_scan(
     )
     await db.commit()
 
-    if payload.async_mode:
+    if payload.run_in_background:
         pool = await create_pool(WorkerSettings.redis_settings)
         try:
             await pool.enqueue_job(
@@ -404,12 +419,22 @@ async def launch_scan(
         finally:
             await pool.close()
         incr("laundry_scans_started_total")
+        log.info(
+            "laundry.scan_queued",
+            job_id=str(job.id),
+            search_type=payload.search_type,
+            property_type=payload.property_type,
+            acquisition_type=payload.acquisition_type,
+            listing_limit=payload.listing_limit,
+            neighbourhood_filters=payload.neighbourhood_filters,
+            max_size_sqm=payload.max_size_sqm,
+        )
         return {
             "success": True,
             "async": True,
             "job_id": str(job.id),
+            "status": "queued",
             "websocket_url": f"/ws/laundry/{job.id}",
-            "status": job.status,
         }
 
     # Inline execution (small jobs only)
@@ -417,7 +442,24 @@ async def launch_scan(
 
     out = await run_laundry_scan(db, job_id=job.id, overrides=payload.overrides)
     incr("laundry_scans_started_total")
-    return {"success": True, "async": False, "job_id": str(job.id), "result": out}
+    return {
+        "success": True,
+        "async": False,
+        "job_id": str(job.id),
+        "status": "completed" if out.get("success") else "failed",
+        "result": out,
+    }
+
+
+# Back-compat alias for the original singular path. Deployed UIs that were
+# pinned to ``/laundry/scan`` keep working without any redirect cost.
+@router.post("/scan", include_in_schema=False)
+async def launch_scan_legacy(
+    payload: ScanLaunchPayload,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: CurrentUser,
+):
+    return await launch_scan(payload, db, user)
 
 
 @router.get("/scans")
