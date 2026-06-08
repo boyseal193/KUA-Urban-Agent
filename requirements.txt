@@ -1,13 +1,44 @@
-fastapi>=0.115
+# ---------------------------------------------------------------------------
+# K.U.A. production runtime — installed by the root Dockerfile.
+#
+# Two verticals share this image and a single FastAPI app (main.py):
+#   * Self-storage (legacy /main.py + /jobs/* + Supabase REST)
+#   * Laundromat acquisition vertical (/laundry/* — Supabase REST,
+#     reuses the storage job worker via job_type='laundry_scan')
+#
+# Everything the laundry router pulls in is already used by the storage
+# stack (fastapi, supabase, openai, requests, beautifulsoup4, lxml).
+# No new heavyweight dependencies are introduced for the laundry vertical.
+# ---------------------------------------------------------------------------
+
+# ---- web framework ----
+fastapi>=0.115,<0.130
 uvicorn[standard]>=0.32
+python-multipart>=0.0.18
+
+# ---- config / validation ----
 python-dotenv>=1.0
+pydantic>=2.10,<3.0
+
+# ---- Supabase REST + auth ----
 supabase>=2.9
-openai>=1.55
+postgrest>=0.16
+
+# ---- data / exports ----
 pandas>=2.2
 openpyxl>=3.1
+
+# ---- scraping + extraction ----
 requests>=2.32
 beautifulsoup4>=4.12
 lxml>=5.3
+openai>=1.55
+
+# ---- auth helpers (legacy kua_auth) ----
 passlib[bcrypt]>=1.7
 python-jose[cryptography]>=3.3
+bcrypt>=4.2,<5.0
+
+# ---- resilience ----
 tenacity>=9.0
+slowapi>=0.1.9,<0.2.0

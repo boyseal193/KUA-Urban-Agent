@@ -394,6 +394,18 @@ def run_job(job_id: str) -> dict:
     if job.get("status") == JOB_CANCELLED:
         return store.build_job_response(job_id)
 
+    # Dispatch laundry vertical jobs to their dedicated worker so the storage
+    # orchestrator below never sees foreign payload shapes.
+    if (job.get("job_type") or "").startswith("laundry_"):
+        try:
+            from laundry.worker import run_laundry_scan
+        except Exception as exc:
+            log.exception("Laundry worker import failed: %s", exc)
+            store.update_job(job_id, status=JOB_FAILED, error_message=f"laundry_worker_import_failed: {exc}",
+                              finished_at=store._now())
+            return store.build_job_response(job_id)
+        return run_laundry_scan(job_id)
+
     try:
         search_url = job.get("search_url") or ""
         limit = int(job.get("listing_limit") or 10)

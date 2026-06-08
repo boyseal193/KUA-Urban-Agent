@@ -110,6 +110,70 @@ async def request_id_middleware(request: Request, call_next):
 
 app.include_router(auth_router, prefix="/auth", tags=["auth"])
 
+# ---------------------------------------------------------------------------
+# K.U.A. Laundry Acquisition vertical
+#
+# The router already carries prefix="/laundry", so we MUST NOT pass prefix=
+# here — that would create /laundry/laundry/scans. Any import failure is
+# trapped and surfaced via GET /debug/routes + GET /laundry/_diag so a
+# missing dependency or table is diagnosable in production without shell
+# access.
+# ---------------------------------------------------------------------------
+_LAUNDRY_MOUNT: dict = {"ok": False, "error": None, "route_count": 0}
+try:
+    from laundry.api import router as laundry_router  # noqa: E402
+    app.include_router(laundry_router)
+    _LAUNDRY_MOUNT.update({
+        "ok": True,
+        "error": None,
+        "route_count": len(laundry_router.routes),
+        "prefix": getattr(laundry_router, "prefix", ""),
+    })
+    print(f"[laundry] OK — registered {_LAUNDRY_MOUNT['route_count']} routes under /laundry", flush=True)
+except Exception as _laundry_exc:  # noqa: BLE001 — must never crash boot
+    import traceback as _tb
+    _LAUNDRY_MOUNT.update({
+        "ok": False,
+        "error": f"{type(_laundry_exc).__name__}: {_laundry_exc}",
+        "traceback": _tb.format_exc(),
+    })
+    print(f"[laundry] FAILED to mount router: {_LAUNDRY_MOUNT['error']}", flush=True)
+    print(_LAUNDRY_MOUNT["traceback"], flush=True)
+
+    @app.get("/laundry/_diag", include_in_schema=False)
+    def _laundry_diag():
+        return JSONResponse(
+            status_code=503,
+            content={
+                "success": False,
+                "service": "kua-laundry",
+                "router_loaded": False,
+                "error": _LAUNDRY_MOUNT["error"],
+                "traceback": _LAUNDRY_MOUNT.get("traceback") if os.getenv("EXPOSE_LAUNDRY_TRACEBACK") else None,
+            },
+        )
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics: list every registered route in production for verification.
+# ---------------------------------------------------------------------------
+@app.get("/debug/routes", include_in_schema=False)
+def debug_routes():
+    routes = []
+    for r in app.router.routes:
+        path = getattr(r, "path", None)
+        if not path:
+            continue
+        methods = sorted(list(getattr(r, "methods", []) or []))
+        routes.append({"path": path, "methods": methods, "name": getattr(r, "name", None)})
+    routes.sort(key=lambda x: x["path"])
+    return {
+        "service": "kua-backend",
+        "total": len(routes),
+        "laundry_mount": _LAUNDRY_MOUNT,
+        "routes": routes,
+    }
+
 
 # ---------------------------------------------------------------------------
 # Root / liveness
