@@ -29,6 +29,7 @@ from app.api.v1.endpoints.notes import router as notes_router
 from app.api.v1.endpoints.property import router as property_router
 from app.api.v1.endpoints.scan import router as scan_router
 from app.auth.router import router as auth_router
+from app.laundry.api import laundry_router
 from app.core.config import get_settings
 from app.core.exceptions import AppError
 from app.core.limiter import limiter
@@ -126,6 +127,8 @@ def create_app() -> FastAPI:
     app.include_router(deals_router)
     app.include_router(property_router)
     app.include_router(notes_router)
+    # Independent laundry acquisition vertical (all routes under /laundry/*)
+    app.include_router(laundry_router)
 
     return app
 

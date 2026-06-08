@@ -8,6 +8,9 @@ from arq.connections import RedisSettings
 from app.core.config import get_settings
 from app.workers.tasks import run_idealista_scan_job
 
+# Laundry job lives in the second vertical and must coexist with storage.
+from app.laundry.workers.tasks import run_laundry_scan_job
+
 
 def _redis_settings() -> RedisSettings:
     raw = get_settings().REDIS_URL
@@ -26,6 +29,6 @@ def _redis_settings() -> RedisSettings:
 
 class WorkerSettings:
     redis_settings = _redis_settings()
-    functions = [run_idealista_scan_job]
+    functions = [run_idealista_scan_job, run_laundry_scan_job]
     max_tries = 3
     job_timeout = 3_600  # 1h — large Idealista batches
