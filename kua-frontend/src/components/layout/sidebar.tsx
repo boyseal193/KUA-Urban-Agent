@@ -5,32 +5,55 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { motion } from "framer-motion";
 import {
+  Activity,
+  BadgeCheck,
   BrainCircuit,
+  CheckCircle2,
   Columns3,
+  Download,
   History,
   LayoutGrid,
   MapPinned,
   Radar,
   Settings,
   ShieldCheck,
+  Sliders,
+  WashingMachine,
   Wrench,
+  XCircle,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { APP_NAME, APP_SHORT } from "@/lib/constants";
+import { VerticalSwitcher } from "@/components/layout/vertical-switcher";
+import { VERTICAL_META, verticalFromPathname } from "@/lib/vertical";
 
-const NAV = [
+type NavItem = {
+  href: string;
+  label: string;
+  icon: React.ComponentType<{ className?: string }>;
+  kbd?: string;
+};
+
+const STORAGE_NAV: NavItem[] = [
   { href: "/dashboard", label: "Command", icon: LayoutGrid, kbd: "1" },
   { href: "/pipeline", label: "Pipeline", icon: Columns3, kbd: "2" },
   { href: "/scan", label: "Live Scan", icon: Radar, kbd: "3" },
   { href: "/scans", label: "History", icon: History, kbd: "4" },
   { href: "/map", label: "Tactical Map", icon: MapPinned, kbd: "5" },
-  {
-    href: "/intelligence",
-    label: "Intelligence",
-    icon: BrainCircuit,
-    kbd: "6",
-  },
+  { href: "/intelligence", label: "Intelligence", icon: BrainCircuit, kbd: "6" },
   { href: "/admin", label: "Admin", icon: Wrench, kbd: "7" },
+];
+
+const LAUNDRY_NAV: NavItem[] = [
+  { href: "/laundry/dashboard", label: "Dashboard", icon: LayoutGrid, kbd: "1" },
+  { href: "/laundry/pipeline", label: "Pipeline", icon: Columns3, kbd: "2" },
+  { href: "/laundry/manual-review", label: "Manual Review", icon: Activity, kbd: "3" },
+  { href: "/laundry/approved", label: "Approved", icon: BadgeCheck, kbd: "4" },
+  { href: "/laundry/rejected", label: "Rejected", icon: XCircle, kbd: "5" },
+  { href: "/laundry/map", label: "Map", icon: MapPinned, kbd: "6" },
+  { href: "/laundry/scans", label: "Scans", icon: Radar, kbd: "7" },
+  { href: "/laundry/exports", label: "Exports", icon: Download, kbd: "8" },
+  { href: "/laundry/settings", label: "Settings", icon: Sliders, kbd: "9" },
 ];
 
 function Logo() {
@@ -72,6 +95,11 @@ interface SidebarShellProps {
 
 function SidebarShell({ className, layoutId = "active-nav-pill" }: SidebarShellProps) {
   const pathname = usePathname();
+  const vertical = verticalFromPathname(pathname);
+  const meta = VERTICAL_META[vertical];
+  const items = vertical === "laundry" ? LAUNDRY_NAV : STORAGE_NAV;
+  const sectionLabel =
+    vertical === "laundry" ? "Laundry Intelligence" : "Storage Operations";
 
   return (
     <div
@@ -92,9 +120,17 @@ function SidebarShell({ className, layoutId = "active-nav-pill" }: SidebarShellP
         </div>
       </div>
 
+      <div className="border-b border-border/60 px-3 py-3">
+        <VerticalSwitcher className="w-full justify-center" />
+        <div className="mt-2 flex items-center justify-between px-1 font-mono text-[9px] uppercase tracking-[0.18em] text-muted-foreground">
+          <span>Vertical</span>
+          <span style={{ color: meta.accent }}>{meta.short}</span>
+        </div>
+      </div>
+
       <nav className="flex flex-1 flex-col gap-1 p-3">
-        <div className="px-2 pb-2 pt-1 tactical-mono">Operations</div>
-        {NAV.map((item) => {
+        <div className="px-2 pb-2 pt-1 tactical-mono">{sectionLabel}</div>
+        {items.map((item) => {
           const active =
             pathname === item.href || pathname.startsWith(item.href + "/");
           const Icon = item.icon;
@@ -112,20 +148,26 @@ function SidebarShell({ className, layoutId = "active-nav-pill" }: SidebarShellP
               {active && (
                 <motion.span
                   layoutId={layoutId}
-                  className="absolute inset-y-1 left-0 w-[2px] rounded-r bg-primary shadow-glow"
+                  className="absolute inset-y-1 left-0 w-[2px] rounded-r shadow-glow"
+                  style={{ background: meta.accent }}
                   transition={{ type: "spring", stiffness: 380, damping: 32 }}
                 />
               )}
-              <Icon
+              <span
                 className={cn(
-                  "h-4 w-4 shrink-0 transition-colors",
-                  active ? "text-primary" : "text-muted-foreground"
+                  "shrink-0 transition-colors",
+                  active ? "text-foreground" : "text-muted-foreground"
                 )}
-              />
+                style={active ? { color: meta.accent } : undefined}
+              >
+                <Icon className="h-4 w-4" />
+              </span>
               <span className="flex-1">{item.label}</span>
-              <kbd className="hidden rounded border border-border/60 bg-white/[0.04] px-1.5 py-px font-mono text-[9px] text-muted-foreground group-hover:inline-block">
-                ⌘{item.kbd}
-              </kbd>
+              {item.kbd && (
+                <kbd className="hidden rounded border border-border/60 bg-white/[0.04] px-1.5 py-px font-mono text-[9px] text-muted-foreground group-hover:inline-block">
+                  ⌘{item.kbd}
+                </kbd>
+              )}
             </Link>
           );
         })}

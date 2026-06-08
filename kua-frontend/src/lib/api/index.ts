@@ -16,3 +16,25 @@ export type {
   RestorePropertyResponse,
   DuplicateCluster,
 } from "./properties";
+export { laundryApi } from "./laundry";
+export type {
+  LaundryProperty,
+  LaundryAnalysis,
+  LaundryEconomics,
+  LaundryScoreResult,
+  LaundryDueDiligence,
+  LaundryLocationIntel,
+  LaundryPropertyDetailResponse,
+  LaundryKpis,
+  LaundryScanJob,
+  LaundryScanStep,
+  LaundryScanResponse,
+  LaundryLaunchScanPayload,
+  LaundryExportRecord,
+  LaundrySettingsPayload,
+  LaundryMapMarker,
+  LaundryPropertyType,
+  LaundryAcquisitionType,
+  LaundrySearchType,
+  LaundryDealStatus,
+} from "./laundry";
