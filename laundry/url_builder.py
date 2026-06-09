@@ -1,23 +1,14 @@
 """
 K.U.A. — automatic search-URL generator for laundromat sourcing.
 
-Why this exists
----------------
-The laundromat scan form lets operators pick property type / buy-vs-rent /
-target neighbourhoods / max sqm. They should not have to hand-craft a portal
-search URL on top. This module converts those filters into a canonical
-search URL for a configurable real-estate provider.
+Acquisition sourcing prioritises *finding opportunities* over perfect filters.
+URLs are built progressively: start broad (city-wide commercial rentals), apply
+neighbourhood / size / ground-floor preferences in the pipeline — never stack
+every Idealista filter in a single URL.
 
-Architecture
-------------
-A *provider* is just a callable that accepts a :class:`UrlBuildRequest` and
-returns either a string (the URL) or raises :class:`UnsupportedFilterError`.
-Register more providers with :func:`register_provider`. The frontend selects
-which provider to use; the backend falls back to ``idealista`` when none is
-specified.
-
-This module is *pure-Python*: no I/O, no network, no SQL. Safe to import from
-the API layer, the worker, or unit tests.
+When a URL returns zero listings, ``resolve_search_url`` walks a fallback ladder
+(target neighbourhood → district → Barcelona → metropolitan area) and validates
+listing counts before the worker is queued.
 """
 from __future__ import annotations
 
@@ -25,7 +16,7 @@ import logging
 import re
 import unicodedata
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
 
 log = logging.getLogger("kua.laundry.url_builder")
@@ -38,17 +29,21 @@ class UnsupportedFilterError(ValueError):
     """A provider declines to build a URL for the given filter combination."""
 
 
+# Fallback hierarchy (narrow → wide). Used when escalating after 0 listings.
+FALLBACK_LEVELS = (
+    "target_neighbourhood",
+    "district",
+    "barcelona",
+    "metropolitan",
+)
+
+
 @dataclass
 class UrlBuildRequest:
-    """Inputs to the URL builder.
-
-    Mirrors the laundry scan-form fields 1:1 so the frontend can pass its
-    state object through with no remapping.
-    """
-    acquisition_type: str = "rent"              # buy | rent
-    property_type: str = "empty_commercial"     # see PROPERTY_TYPES
+    acquisition_type: str = "rent"
+    property_type: str = "empty_commercial"
     city: str = "Barcelona"
-    province: Optional[str] = None              # auto-filled to "Barcelona" when city is Barcelona
+    province: Optional[str] = None
     neighbourhoods: List[str] = field(default_factory=list)
     max_size_sqm: Optional[float] = 80.0
     min_size_sqm: Optional[float] = None
@@ -78,39 +73,114 @@ class UrlBuildRequest:
 
 
 @dataclass
+class SearchDiagnostics:
+    generated_url: str
+    listing_count: Optional[int] = None
+    fallback_level: str = "barcelona"
+    stage: int = 1
+    applied_filters: Dict[str, str] = field(default_factory=dict)
+    removed_filters: List[str] = field(default_factory=list)
+    pipeline_filters: Dict[str, Any] = field(default_factory=dict)
+    search_broadened: bool = False
+    broadening_reason: Optional[str] = None
+    attempts: List[Dict[str, Any]] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "generated_url": self.generated_url,
+            "listing_count": self.listing_count,
+            "fallback_level": self.fallback_level,
+            "stage": self.stage,
+            "applied_filters": self.applied_filters,
+            "removed_filters": self.removed_filters,
+            "pipeline_filters": self.pipeline_filters,
+            "search_broadened": self.search_broadened,
+            "broadening_reason": self.broadening_reason,
+            "attempts": self.attempts,
+        }
+
+
+@dataclass
 class UrlBuildResult:
     provider: str
     url: str
     description: str
     filters_applied: Dict[str, str]
     warnings: List[str] = field(default_factory=list)
+    diagnostics: Optional[SearchDiagnostics] = None
 
-    def to_dict(self) -> Dict:
-        return {
+    def to_dict(self) -> Dict[str, Any]:
+        out: Dict[str, Any] = {
             "provider": self.provider,
             "url": self.url,
             "description": self.description,
             "filters_applied": self.filters_applied,
             "warnings": self.warnings,
         }
+        if self.diagnostics:
+            out["search_diagnostics"] = self.diagnostics.to_dict()
+            out["search_broadened"] = self.diagnostics.search_broadened
+            out["broadening_reason"] = self.diagnostics.broadening_reason
+        return out
+
+
+@dataclass
+class _CandidateSpec:
+    fallback_level: str
+    stage: int
+    neighbourhood_slug: Optional[str] = None
+    max_size_sqm: Optional[float] = None
+    include_ground_floor: bool = False
+    include_price: bool = False
+    label: str = ""
+    removed: List[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 def _safe_float(v) -> Optional[float]:
-    if v is None or isinstance(v, bool): return None
-    try: return float(v)
-    except (TypeError, ValueError): return None
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
 
 
 def slugify(value: str) -> str:
-    """Idealista-style URL slug — lowercase ASCII, hyphenated, no diacritics."""
-    if not value: return ""
+    if not value:
+        return ""
     txt = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
     txt = txt.lower().replace("'", "").replace("&", "and")
     txt = re.sub(r"[^a-z0-9]+", "-", txt).strip("-")
     return txt
+
+
+def _first_neighbourhood_slug(req: UrlBuildRequest) -> Optional[str]:
+    for raw in req.neighbourhoods:
+        slug = _IDEALISTA_BCN_NEIGHBOURHOODS.get(raw.strip().lower())
+        if slug:
+            return slug
+    return None
+
+
+def _pipeline_filters(req: UrlBuildRequest) -> Dict[str, Any]:
+    """Filters applied downstream in the underwriting pipeline (not in URL)."""
+    pf: Dict[str, Any] = {}
+    if req.neighbourhoods:
+        pf["neighbourhoods"] = list(req.neighbourhoods)
+    if req.max_size_sqm:
+        pf["max_size_sqm"] = float(req.max_size_sqm)
+    if req.min_size_sqm:
+        pf["min_size_sqm"] = float(req.min_size_sqm)
+    if req.ground_floor_only:
+        pf["ground_floor_preference"] = True
+    if req.max_price_eur:
+        pf["max_price_eur"] = float(req.max_price_eur)
+    if req.max_rent_month_eur:
+        pf["max_rent_month_eur"] = float(req.max_rent_month_eur)
+    return pf
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +207,6 @@ def list_providers() -> List[Dict[str, str]]:
     return [{"key": k, "label": _PROVIDER_LABELS.get(k, k.title())} for k in sorted(_REGISTRY)]
 
 
-# Human-readable labels (frontend uses these in the dropdown).
 _PROVIDER_LABELS = {
     "idealista": "Idealista",
     "fotocasa": "Fotocasa",
@@ -148,10 +217,8 @@ _PROVIDER_LABELS = {
 
 
 # ---------------------------------------------------------------------------
-# Property type → Idealista vertical
+# Idealista constants
 # ---------------------------------------------------------------------------
-# All laundromat-friendly property types ultimately map to "locales" (commercial
-# units) on Idealista — except declared industrial units which use "naves".
 _IDEALISTA_VERTICAL = {
     "existing_laundromat": "locales",
     "empty_commercial": "locales",
@@ -160,8 +227,6 @@ _IDEALISTA_VERTICAL = {
     "industrial": "naves",
 }
 
-# Idealista city slugs — start with what we actually target. Operators can
-# extend via `extra_filters={"city_slug": "madrid-madrid"}`.
 _IDEALISTA_CITY_SLUGS = {
     "barcelona": "barcelona-barcelona",
     "l'hospitalet": "l-hospitalet-de-llobregat-barcelona",
@@ -171,8 +236,10 @@ _IDEALISTA_CITY_SLUGS = {
     "sevilla": "sevilla-sevilla",
 }
 
-# Mapping of operator-facing neighbourhood names → Idealista path slug.
-# Multi-neighbourhood searches degrade gracefully to a city-wide URL.
+_IDEALISTA_METRO_SLUGS = {
+    "barcelona": "barcelona-barcelona",
+}
+
 _IDEALISTA_BCN_NEIGHBOURHOODS = {
     "raval": "el-raval-barcelona",
     "el raval": "el-raval-barcelona",
@@ -191,9 +258,22 @@ _IDEALISTA_BCN_NEIGHBOURHOODS = {
 
 
 # ---------------------------------------------------------------------------
-# Provider: Idealista (canonical)
+# Idealista URL construction (progressive — never stack all filters)
 # ---------------------------------------------------------------------------
-def _build_idealista(req: UrlBuildRequest) -> UrlBuildResult:
+def _idealista_city_slug(req: UrlBuildRequest, *, fallback_level: str) -> str:
+    if fallback_level == "metropolitan":
+        return _IDEALISTA_METRO_SLUGS.get(
+            (req.city or "Barcelona").strip().lower(),
+            "barcelona-barcelona",
+        )
+    city_lookup = (req.city or "Barcelona").strip().lower()
+    slug = req.extra_filters.get("city_slug") or _IDEALISTA_CITY_SLUGS.get(city_lookup)
+    if not slug:
+        slug = slugify(req.city) or "barcelona-barcelona"
+    return slug
+
+
+def _build_idealista_from_spec(req: UrlBuildRequest, spec: _CandidateSpec) -> UrlBuildResult:
     warnings: List[str] = []
     applied: Dict[str, str] = {}
 
@@ -201,177 +281,281 @@ def _build_idealista(req: UrlBuildRequest) -> UrlBuildResult:
         raise UnsupportedFilterError(
             f"acquisition_type must be 'rent' or 'buy' (got {req.acquisition_type!r})"
         )
+
     section = "alquiler" if req.acquisition_type == "rent" else "venta"
     vertical = _IDEALISTA_VERTICAL.get(req.property_type, "locales")
     if req.property_type not in _IDEALISTA_VERTICAL:
-        warnings.append(f"unknown property_type '{req.property_type}', defaulted to commercial premises")
+        warnings.append(
+            f"unknown property_type '{req.property_type}', defaulted to commercial premises"
+        )
+
     applied["section"] = section
     applied["vertical"] = vertical
+    applied["fallback_level"] = spec.fallback_level
+    applied["stage"] = str(spec.stage)
 
-    base_segment = f"{section}-{vertical}"
-
-    city_lookup = (req.city or "Barcelona").strip().lower()
-    city_slug = req.extra_filters.get("city_slug") or _IDEALISTA_CITY_SLUGS.get(city_lookup)
-    if not city_slug:
-        city_slug = slugify(req.city) or "barcelona-barcelona"
-        warnings.append(f"city '{req.city}' not in built-in slug table, using '{city_slug}'")
+    city_slug = _idealista_city_slug(req, fallback_level=spec.fallback_level)
     applied["city_slug"] = city_slug
 
     neighbourhood_path = ""
-    if req.neighbourhoods:
-        nh_slugs = []
-        unknown = []
-        for raw in req.neighbourhoods:
-            slug = _IDEALISTA_BCN_NEIGHBOURHOODS.get(raw.strip().lower())
-            if slug: nh_slugs.append(slug)
-            else: unknown.append(raw)
-        if unknown:
-            warnings.append(
-                "neighbourhood(s) not in Idealista path table — pipeline-level filter will still apply: "
-                + ", ".join(unknown)
-            )
-        if len(nh_slugs) == 1:
-            neighbourhood_path = f"/{nh_slugs[0]}"
-            applied["neighbourhood"] = nh_slugs[0]
-        elif len(nh_slugs) > 1:
-            warnings.append(
-                f"{len(nh_slugs)} neighbourhoods selected — Idealista path supports one; "
-                "pipeline-level filter will narrow results"
-            )
-            applied["neighbourhoods_in_pipeline"] = ",".join(nh_slugs)
+    if spec.neighbourhood_slug:
+        neighbourhood_path = f"/{spec.neighbourhood_slug}"
+        applied["neighbourhood"] = spec.neighbourhood_slug
 
     filter_parts: List[str] = []
-    if req.max_size_sqm and req.max_size_sqm > 0:
-        filter_parts.append(f"metros-cuadrados-menos-de_{int(round(req.max_size_sqm))}")
-    if req.min_size_sqm and req.min_size_sqm > 0:
-        filter_parts.append(f"metros-cuadrados-mas-de_{int(round(req.min_size_sqm))}")
-    if req.acquisition_type == "buy" and req.max_price_eur and req.max_price_eur > 0:
-        filter_parts.append(f"precio-hasta_{int(round(req.max_price_eur))}")
-    if req.acquisition_type == "rent" and req.max_rent_month_eur and req.max_rent_month_eur > 0:
-        filter_parts.append(f"precio-hasta_{int(round(req.max_rent_month_eur))}")
-    if req.ground_floor_only and vertical == "locales":
+    if spec.max_size_sqm and spec.max_size_sqm > 0:
+        filter_parts.append(f"metros-cuadrados-menos-de_{int(round(spec.max_size_sqm))}")
+        applied["max_size_sqm"] = str(int(round(spec.max_size_sqm)))
+
+    if spec.include_price:
+        if req.acquisition_type == "buy" and req.max_price_eur and req.max_price_eur > 0:
+            filter_parts.append(f"precio-hasta_{int(round(req.max_price_eur))}")
+            applied["max_price_eur"] = str(int(round(req.max_price_eur)))
+        if req.acquisition_type == "rent" and req.max_rent_month_eur and req.max_rent_month_eur > 0:
+            filter_parts.append(f"precio-hasta_{int(round(req.max_rent_month_eur))}")
+            applied["max_rent_month_eur"] = str(int(round(req.max_rent_month_eur)))
+
+    # Ground floor is NEVER a hard URL filter — pipeline preference only.
+    if spec.include_ground_floor and vertical == "locales":
         filter_parts.append("planta-baja")
+        applied["ground_floor"] = "url_filter"
+    elif req.ground_floor_only:
+        applied["ground_floor"] = "pipeline_preference"
 
-    applied["filters"] = ",".join(filter_parts) if filter_parts else ""
+    if spec.removed:
+        applied["removed_from_url"] = ",".join(spec.removed)
 
-    filter_segment = ""
-    if filter_parts:
-        filter_segment = f"/con-{','.join(filter_parts)}"
-
+    filter_segment = f"/con-{','.join(filter_parts)}" if filter_parts else ""
     url = (
-        f"https://www.idealista.com/{base_segment}/{city_slug}{neighbourhood_path}"
-        f"{filter_segment}/"
+        f"https://www.idealista.com/{section}-{vertical}/{city_slug}"
+        f"{neighbourhood_path}{filter_segment}/"
     )
+
+    stage_labels = {
+        1: "city-wide commercial rentals",
+        2: "target neighbourhood",
+        3: "size filter",
+        4: "ground floor preference (pipeline)",
+    }
+    stage_hint = stage_labels.get(spec.stage, spec.label or spec.fallback_level)
 
     desc = (
         f"Idealista · {section.upper()} · "
         f"{'commercial premises' if vertical == 'locales' else 'industrial units'} · "
-        f"{req.city}"
-        + (f" · ≤{int(req.max_size_sqm)} m²" if req.max_size_sqm else "")
-        + (f" · ground floor" if req.ground_floor_only and vertical == 'locales' else "")
+        f"{req.city} · {stage_hint}"
     )
+    if spec.max_size_sqm:
+        desc += f" · ≤{int(spec.max_size_sqm)} m²"
+
+    pipeline = _pipeline_filters(req)
+    diagnostics = SearchDiagnostics(
+        generated_url=url,
+        fallback_level=spec.fallback_level,
+        stage=spec.stage,
+        applied_filters=dict(applied),
+        removed_filters=list(spec.removed),
+        pipeline_filters=pipeline,
+    )
+
+    if req.ground_floor_only and not spec.include_ground_floor:
+        warnings.append(
+            "Ground floor is a pipeline preference — not enforced in the search URL."
+        )
+    if req.neighbourhoods and not spec.neighbourhood_slug:
+        warnings.append(
+            "Neighbourhood targeting applied in the pipeline — URL stays city-wide for coverage."
+        )
+    if req.max_size_sqm and not spec.max_size_sqm:
+        warnings.append(
+            f"Max size ({int(req.max_size_sqm)} m²) applied in the pipeline — not in the URL."
+        )
+
     return UrlBuildResult(
-        provider="idealista", url=url, description=desc,
-        filters_applied=applied, warnings=warnings,
+        provider="idealista",
+        url=url,
+        description=desc,
+        filters_applied=applied,
+        warnings=warnings,
+        diagnostics=diagnostics,
     )
+
+
+def _idealista_escalation_ladder(req: UrlBuildRequest) -> List[_CandidateSpec]:
+    """Ordered from narrowest intent to widest fallback (for 0-listing escalation)."""
+    operator_max = int(req.max_size_sqm or 80)
+    nh_slug = _first_neighbourhood_slug(req)
+    ladder: List[_CandidateSpec] = []
+
+    if nh_slug:
+        ladder.append(_CandidateSpec(
+            fallback_level="target_neighbourhood",
+            stage=3,
+            neighbourhood_slug=nh_slug,
+            max_size_sqm=float(operator_max),
+            include_ground_floor=False,
+            label="neighbourhood + size",
+        ))
+        ladder.append(_CandidateSpec(
+            fallback_level="target_neighbourhood",
+            stage=3,
+            neighbourhood_slug=nh_slug,
+            max_size_sqm=100.0,
+            include_ground_floor=False,
+            removed=["ground_floor"],
+            label="neighbourhood + max 100 m²",
+        ))
+        ladder.append(_CandidateSpec(
+            fallback_level="target_neighbourhood",
+            stage=3,
+            neighbourhood_slug=nh_slug,
+            max_size_sqm=120.0,
+            include_ground_floor=False,
+            removed=["ground_floor", f"max_size_{operator_max}"],
+            label="neighbourhood + max 120 m²",
+        ))
+        ladder.append(_CandidateSpec(
+            fallback_level="target_neighbourhood",
+            stage=2,
+            neighbourhood_slug=nh_slug,
+            removed=["ground_floor", "max_size"],
+            label="neighbourhood only",
+        ))
+
+    ladder.append(_CandidateSpec(
+        fallback_level="district",
+        stage=2,
+        max_size_sqm=120.0,
+        removed=["ground_floor", "neighbourhood", f"max_size_{operator_max}"],
+        label="district / city + max 120 m²",
+    ))
+    ladder.append(_CandidateSpec(
+        fallback_level="district",
+        stage=2,
+        max_size_sqm=100.0,
+        removed=["ground_floor", "neighbourhood"],
+        label="district / city + max 100 m²",
+    ))
+    ladder.append(_CandidateSpec(
+        fallback_level="barcelona",
+        stage=1,
+        removed=["ground_floor", "neighbourhood", "max_size"],
+        label="Barcelona commercial rentals",
+    ))
+    ladder.append(_CandidateSpec(
+        fallback_level="metropolitan",
+        stage=1,
+        removed=["ground_floor", "neighbourhood", "max_size", "district"],
+        label="metropolitan area",
+    ))
+    return ladder
+
+
+def _idealista_widening_only_ladder(req: UrlBuildRequest) -> List[_CandidateSpec]:
+    """Steps broader than the default city-wide search."""
+    return [
+        _CandidateSpec(
+            fallback_level="metropolitan",
+            stage=1,
+            removed=["ground_floor", "neighbourhood", "max_size", "district"],
+            label="metropolitan area",
+        ),
+    ]
+
+
+def _idealista_primary_spec(req: UrlBuildRequest) -> _CandidateSpec:
+    """Stage 1 — broad Barcelona commercial rentals (never stack all filters)."""
+    return _CandidateSpec(
+        fallback_level="barcelona",
+        stage=1,
+        label="Barcelona commercial rentals (broad)",
+    )
+
+
+def _build_idealista(req: UrlBuildRequest) -> UrlBuildResult:
+    return _build_idealista_from_spec(req, _idealista_primary_spec(req))
 
 
 # ---------------------------------------------------------------------------
-# Provider: Fotocasa (canonical)
+# Other providers (broad-first, no ground-floor hard filter)
 # ---------------------------------------------------------------------------
 def _build_fotocasa(req: UrlBuildRequest) -> UrlBuildResult:
     if req.acquisition_type not in ("rent", "buy"):
         raise UnsupportedFilterError("acquisition_type must be 'rent' or 'buy'")
     section = "alquiler" if req.acquisition_type == "rent" else "comprar"
     vertical = "locales-comerciales" if req.property_type != "industrial" else "naves-industriales"
-
     city_slug = slugify(req.city) or "barcelona-capital"
-    nh_segment = ""
-    if len(req.neighbourhoods) == 1:
-        nh_segment = "/" + slugify(req.neighbourhoods[0])
-
-    query: List[Tuple[str, str]] = []
-    if req.max_size_sqm and req.max_size_sqm > 0:
-        query.append(("maxSurface", str(int(req.max_size_sqm))))
-    if req.min_size_sqm and req.min_size_sqm > 0:
-        query.append(("minSurface", str(int(req.min_size_sqm))))
-    if req.acquisition_type == "buy" and req.max_price_eur:
-        query.append(("maxPrice", str(int(req.max_price_eur))))
-    if req.acquisition_type == "rent" and req.max_rent_month_eur:
-        query.append(("maxPrice", str(int(req.max_rent_month_eur))))
-    if req.ground_floor_only:
-        query.append(("floors", "ground"))
-
-    qs = ("?" + "&".join(f"{quote_plus(k)}={quote_plus(v)}" for k, v in query)) if query else ""
-    url = f"https://www.fotocasa.es/es/{section}/{vertical}/{city_slug}{nh_segment}/todas-las-zonas/l{qs}"
-
-    warnings: List[str] = []
+    url = f"https://www.fotocasa.es/es/{section}/{vertical}/{city_slug}/todas-las-zonas/l"
+    warnings = [
+        "Fotocasa URL is city-wide — neighbourhood, size and floor preferences run in the pipeline.",
+    ]
     if len(req.neighbourhoods) > 1:
-        warnings.append("Fotocasa URL only encodes one neighbourhood; pipeline filter handles the rest")
-
-    desc = f"Fotocasa · {section.upper()} · {vertical.replace('-', ' ')} · {req.city}"
+        warnings.append("Multiple neighbourhoods → pipeline filter only.")
+    diagnostics = SearchDiagnostics(
+        generated_url=url,
+        fallback_level="barcelona",
+        stage=1,
+        applied_filters={"section": section, "vertical": vertical, "city_slug": city_slug},
+        pipeline_filters=_pipeline_filters(req),
+    )
     return UrlBuildResult(
-        provider="fotocasa", url=url, description=desc,
-        filters_applied={
-            "section": section, "vertical": vertical, "city_slug": city_slug,
-            "query": "&".join(f"{k}={v}" for k, v in query),
-        },
+        provider="fotocasa",
+        url=url,
+        description=f"Fotocasa · {section.upper()} · {vertical.replace('-', ' ')} · {req.city} (broad)",
+        filters_applied={"section": section, "vertical": vertical, "city_slug": city_slug},
         warnings=warnings,
+        diagnostics=diagnostics,
     )
 
 
-# ---------------------------------------------------------------------------
-# Provider: Habitaclia
-# ---------------------------------------------------------------------------
 def _build_habitaclia(req: UrlBuildRequest) -> UrlBuildResult:
     if req.acquisition_type not in ("rent", "buy"):
         raise UnsupportedFilterError("acquisition_type must be 'rent' or 'buy'")
     section = "alquiler-locales-comerciales" if req.acquisition_type == "rent" else "locales-comerciales"
     city_slug = slugify(req.city) or "barcelona"
-    nh_segment = ""
-    if len(req.neighbourhoods) == 1:
-        nh_segment = "-" + slugify(req.neighbourhoods[0])
-    parts: List[str] = []
-    if req.max_size_sqm: parts.append(f"superficie-max-{int(req.max_size_sqm)}")
-    if req.min_size_sqm: parts.append(f"superficie-min-{int(req.min_size_sqm)}")
-    if req.acquisition_type == "buy" and req.max_price_eur:
-        parts.append(f"precio-max-{int(req.max_price_eur)}")
-    if req.acquisition_type == "rent" and req.max_rent_month_eur:
-        parts.append(f"precio-max-{int(req.max_rent_month_eur)}")
-    filter_segment = ("-" + "-".join(parts)) if parts else ""
-    url = f"https://www.habitaclia.com/{section}-en-{city_slug}{nh_segment}{filter_segment}.htm"
-    desc = f"Habitaclia · {section.replace('-', ' ').upper()} · {req.city}"
-    warnings = (["Habitaclia URL only encodes one neighbourhood; pipeline filter handles the rest"]
-                if len(req.neighbourhoods) > 1 else [])
+    url = f"https://www.habitaclia.com/{section}-en-{city_slug}.htm"
+    warnings = ["Habitaclia URL is city-wide — filters run in the pipeline."]
+    diagnostics = SearchDiagnostics(
+        generated_url=url,
+        fallback_level="barcelona",
+        stage=1,
+        applied_filters={"section": section, "city_slug": city_slug},
+        pipeline_filters=_pipeline_filters(req),
+    )
     return UrlBuildResult(
-        provider="habitaclia", url=url, description=desc,
-        filters_applied={"section": section, "city_slug": city_slug, "filters": "-".join(parts)},
+        provider="habitaclia",
+        url=url,
+        description=f"Habitaclia · {section.replace('-', ' ').upper()} · {req.city} (broad)",
+        filters_applied={"section": section, "city_slug": city_slug},
         warnings=warnings,
+        diagnostics=diagnostics,
     )
 
 
-# ---------------------------------------------------------------------------
-# Provider: Google Maps (research / on-the-ground discovery)
-# ---------------------------------------------------------------------------
 def _build_google_maps(req: UrlBuildRequest) -> UrlBuildResult:
     if req.property_type == "existing_laundromat":
         keyword = "laundromat OR lavandería autoservicio"
     else:
-        keyword = "local comercial planta baja" if req.acquisition_type == "rent" else "local comercial venta"
-    area = ", ".join(req.neighbourhoods) if req.neighbourhoods else req.city or "Barcelona"
+        keyword = "local comercial" if req.acquisition_type == "rent" else "local comercial venta"
+    area = req.city or "Barcelona"
     query = f"{keyword} {area}".strip()
     url = f"https://www.google.com/maps/search/{quote_plus(query)}"
+    diagnostics = SearchDiagnostics(
+        generated_url=url,
+        fallback_level="barcelona",
+        stage=1,
+        applied_filters={"keyword": keyword, "area": area},
+        pipeline_filters=_pipeline_filters(req),
+    )
     return UrlBuildResult(
-        provider="google_maps", url=url,
+        provider="google_maps",
+        url=url,
         description=f"Google Maps · search '{query}'",
         filters_applied={"keyword": keyword, "area": area},
         warnings=["Google Maps is for human research — scraper will skip non-listing URLs"],
+        diagnostics=diagnostics,
     )
 
 
-# ---------------------------------------------------------------------------
-# Provider: Custom (operator-supplied template)
-# ---------------------------------------------------------------------------
 def _build_custom(req: UrlBuildRequest) -> UrlBuildResult:
     template = req.extra_filters.get("template")
     if not template:
@@ -389,14 +573,22 @@ def _build_custom(req: UrlBuildRequest) -> UrlBuildResult:
         .replace("{max_size}", str(int(req.max_size_sqm) if req.max_size_sqm else 80))
         .replace("{neighbourhood}", nh)
     )
+    diagnostics = SearchDiagnostics(
+        generated_url=url,
+        fallback_level="custom",
+        stage=1,
+        applied_filters={"template": template},
+        pipeline_filters=_pipeline_filters(req),
+    )
     return UrlBuildResult(
-        provider="custom", url=url,
+        provider="custom",
+        url=url,
         description=f"Custom template · {req.acquisition_type.upper()} · {req.city}",
         filters_applied={"template": template},
+        diagnostics=diagnostics,
     )
 
 
-# Register the canonical providers at import time.
 register_provider("idealista", _build_idealista)
 register_provider("fotocasa", _build_fotocasa)
 register_provider("habitaclia", _build_habitaclia)
@@ -405,20 +597,203 @@ register_provider("custom", _build_custom)
 
 
 # ---------------------------------------------------------------------------
-# Public entrypoint
+# Listing-count validation + fallback resolution
 # ---------------------------------------------------------------------------
-def build_search_url(filters: Dict, provider: Optional[str] = None) -> UrlBuildResult:
-    """Generate a provider-specific search URL from operator filters.
+def _estimate_count(url: str) -> int:
+    try:
+        from laundry import scanner
+        return scanner.estimate_listing_count(url)
+    except Exception as exc:
+        log.warning("listing count estimate failed for %s: %s", url, exc)
+        return 0
 
-    Raises :class:`UnsupportedFilterError` with a human-readable message if
-    the filter combination cannot be turned into a URL.
-    """
+
+def _attach_validation(
+    result: UrlBuildResult,
+    *,
+    count: int,
+    search_broadened: bool,
+    broadening_reason: Optional[str],
+    attempts: List[Dict[str, Any]],
+) -> UrlBuildResult:
+    diag = result.diagnostics or SearchDiagnostics(generated_url=result.url)
+    diag.listing_count = count
+    diag.search_broadened = search_broadened
+    diag.broadening_reason = broadening_reason
+    diag.attempts = attempts
+    result.diagnostics = diag
+    if search_broadened:
+        result.warnings = list(result.warnings) + [
+            "Search broadened automatically — "
+            + (broadening_reason or "No listings found under original constraints")
+        ]
+    return result
+
+
+def resolve_search_url(
+    filters: Dict,
+    provider: Optional[str] = None,
+    *,
+    validate: bool = True,
+    min_listings: int = 1,
+) -> UrlBuildResult:
+    """Build a search URL and optionally validate listing count with auto-broadening."""
+    provider_key, _ = get_provider(provider)
+    req = UrlBuildRequest.from_dict(filters or {})
+
+    if provider_key != "idealista":
+        primary_fn = _REGISTRY[provider_key]
+        primary = primary_fn(req)
+        if not validate:
+            return primary
+        count = _estimate_count(primary.url)
+        attempts = [{"url": primary.url, "count": count, "fallback_level": "barcelona", "stage": 1}]
+        return _attach_validation(
+            primary,
+            count=count,
+            search_broadened=False,
+            broadening_reason=None,
+            attempts=attempts,
+        )
+
+    primary_spec = _idealista_primary_spec(req)
+    primary = _build_idealista_from_spec(req, primary_spec)
+    attempts: List[Dict[str, Any]] = []
+
+    if not validate:
+        return primary
+
+    # Pre-launch: start broad (stage 1), widen only if count == 0.
+    candidates = [primary_spec] + _idealista_widening_only_ladder(req)
+    original_url = primary.url
+    chosen: Optional[UrlBuildResult] = None
+    chosen_count = 0
+    seen_urls: set[str] = set()
+
+    for spec in candidates:
+        built = _build_idealista_from_spec(req, spec)
+        if built.url in seen_urls:
+            continue
+        seen_urls.add(built.url)
+        count = _estimate_count(built.url)
+        attempts.append({
+            "url": built.url,
+            "count": count,
+            "fallback_level": spec.fallback_level,
+            "stage": spec.stage,
+            "removed_filters": spec.removed,
+        })
+        log.info(
+            "URL validation level=%s stage=%s count=%s url=%s",
+            spec.fallback_level, spec.stage, count, built.url,
+        )
+        if count >= min_listings:
+            chosen = built
+            chosen_count = count
+            break
+
+    if chosen is None:
+        last_spec = candidates[-1]
+        chosen = _build_idealista_from_spec(req, last_spec)
+        chosen_count = attempts[-1]["count"] if attempts else 0
+
+    broadened = chosen.url != original_url
+    reason = "No listings found under original constraints" if broadened else None
+
+    if chosen.diagnostics:
+        chosen.diagnostics.listing_count = chosen_count
+
+    return _attach_validation(
+        chosen,
+        count=chosen_count,
+        search_broadened=broadened,
+        broadening_reason=reason,
+        attempts=attempts,
+    )
+
+
+def discover_with_fallback(
+    search_url: str,
+    filters: Dict,
+    provider: Optional[str] = None,
+    *,
+    limit: int = 20,
+) -> Tuple[List[str], UrlBuildResult]:
+    """Discover listing URLs; if the search URL yields 0, walk toward broader searches."""
+    from laundry import scanner
+
+    req = UrlBuildRequest.from_dict(filters or {})
+    urls = scanner.discover_listing_urls(search_url, limit=limit)
+
+    if urls:
+        built = _build_idealista_from_spec(req, _idealista_primary_spec(req))
+        if built.diagnostics:
+            built.diagnostics.listing_count = len(urls)
+            built.diagnostics.generated_url = search_url
+        return urls, built
+
+    log.info("Discovery returned 0 for %s — walking fallback ladder", search_url)
+
+    if (provider or "idealista").lower() != "idealista":
+        resolved = resolve_search_url(filters, provider=provider, validate=True, min_listings=1)
+        urls = scanner.discover_listing_urls(resolved.url, limit=limit)
+        if urls and resolved.diagnostics:
+            resolved.diagnostics.listing_count = len(urls)
+        return urls, resolved
+
+    attempts: List[Dict[str, Any]] = []
+    seen_urls: set[str] = {search_url}
+
+    candidate_specs: List[_CandidateSpec] = (
+        [_idealista_primary_spec(req)]
+        + _idealista_widening_only_ladder(req)
+        + _idealista_escalation_ladder(req)
+    )
+
+    for spec in candidate_specs:
+        built = _build_idealista_from_spec(req, spec)
+        if built.url in seen_urls:
+            continue
+        seen_urls.add(built.url)
+        count = _estimate_count(built.url)
+        attempts.append({
+            "url": built.url,
+            "count": count,
+            "fallback_level": spec.fallback_level,
+            "stage": spec.stage,
+            "removed_filters": spec.removed,
+        })
+        if count >= 1:
+            urls = scanner.discover_listing_urls(built.url, limit=limit)
+            if urls:
+                if built.diagnostics:
+                    built.diagnostics.listing_count = len(urls)
+                    built.diagnostics.search_broadened = built.url != search_url
+                    built.diagnostics.broadening_reason = (
+                        "No listings found under original constraints"
+                        if built.url != search_url else None
+                    )
+                    built.diagnostics.attempts = attempts
+                return urls, built
+
+    last = _build_idealista_from_spec(req, candidate_specs[-1])
+    if last.diagnostics:
+        last.diagnostics.search_broadened = last.url != search_url
+        last.diagnostics.broadening_reason = (
+            "No listings found under original constraints" if last.url != search_url else None
+        )
+        last.diagnostics.attempts = attempts
+    return [], last
+
+
+def build_search_url(filters: Dict, provider: Optional[str] = None) -> UrlBuildResult:
+    """Generate a provider-specific search URL (broad-first, no stacked filters)."""
     provider_key, fn = get_provider(provider)
     req = UrlBuildRequest.from_dict(filters or {})
     try:
         return fn(req)
     except UnsupportedFilterError:
         raise
-    except Exception as exc:  # pragma: no cover — defensive
+    except Exception as exc:
         log.exception("URL builder %s crashed: %s", provider_key, exc)
         raise UnsupportedFilterError(f"{provider_key} URL builder failed: {exc}") from exc

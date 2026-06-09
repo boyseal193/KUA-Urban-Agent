@@ -7,6 +7,7 @@ import { ArrowLeft, AlertCircle } from "lucide-react";
 import { PageHeader } from "@/components/common/page-header";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { useLaundryScan } from "@/hooks/use-laundry";
+import type { LaundrySearchDiagnostics } from "@/lib/api";
 
 const STATUS_COLOR: Record<string, string> = {
   pending: "#94A3B8",
@@ -43,6 +44,7 @@ export default function LaundryScanDetailPage({
 
   const job = q.data?.job;
   const steps = q.data?.steps ?? [];
+  const searchDiagnostics = q.data?.search_diagnostics ?? null;
 
   // Show job-level steps first, then per-listing steps. The backend already
   // orders by (listing_index, step_order); we just preserve that.
@@ -91,6 +93,17 @@ export default function LaundryScanDetailPage({
                 </p>
               )}
             </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {searchDiagnostics && (
+        <Card>
+          <CardHeader>
+            <CardTitle>Search diagnostics</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <SearchDiagnosticsDetail diagnostics={searchDiagnostics} />
           </CardContent>
         </Card>
       )}
@@ -207,6 +220,59 @@ function Row({ k, v, mono }: { k: string; v: string; mono?: boolean }) {
       >
         {v}
       </span>
+    </div>
+  );
+}
+
+function SearchDiagnosticsDetail({
+  diagnostics,
+}: {
+  diagnostics: LaundrySearchDiagnostics;
+}) {
+  const applied = Object.entries(diagnostics.applied_filters ?? {});
+  const removed = diagnostics.removed_filters ?? [];
+
+  return (
+    <div className="space-y-3 text-xs">
+      {diagnostics.search_broadened && (
+        <div className="rounded-md border border-amber-400/30 bg-amber-400/[0.06] p-3">
+          <p className="font-mono uppercase tracking-widest text-amber-200">
+            Search broadened automatically
+          </p>
+          <p className="mt-1 text-muted-foreground">
+            Reason: {diagnostics.broadening_reason ?? "No listings found under original constraints"}
+          </p>
+        </div>
+      )}
+      <Row k="Generated URL" v={diagnostics.generated_url} mono />
+      <Row
+        k="Listing count"
+        v={diagnostics.listing_count != null ? String(diagnostics.listing_count) : "—"}
+      />
+      <Row k="Fallback level" v={diagnostics.fallback_level.replace(/_/g, " ")} />
+      <Row k="Stage" v={String(diagnostics.stage)} />
+      {applied.length > 0 && (
+        <div>
+          <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+            Applied filters
+          </p>
+          <ul className="mt-1 list-disc pl-4 text-muted-foreground">
+            {applied.map(([k, v]) => (
+              <li key={k}>
+                {k}: {v != null && v !== "" ? String(v) : "—"}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {removed.length > 0 && (
+        <div>
+          <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+            Removed filters
+          </p>
+          <p className="text-muted-foreground">{removed.join(", ")}</p>
+        </div>
+      )}
     </div>
   );
 }

@@ -143,6 +143,7 @@ class SearchUrlPayload(BaseModel):
     listing_limit: int = 20
     provider: Optional[str] = "idealista"
     extra_filters: Dict[str, str] = Field(default_factory=dict)
+    validate_listing_count: bool = True
 
     class Config:
         extra = "ignore"
@@ -156,7 +157,12 @@ def list_search_providers() -> Dict[str, Any]:
 @router.post("/search-url")
 def generate_search_url(payload: SearchUrlPayload) -> Dict[str, Any]:
     try:
-        built = url_builder.build_search_url(payload.model_dump(), provider=payload.provider)
+        if payload.validate_listing_count:
+            built = url_builder.resolve_search_url(
+                payload.model_dump(), provider=payload.provider, validate=True,
+            )
+        else:
+            built = url_builder.build_search_url(payload.model_dump(), provider=payload.provider)
     except url_builder.UnsupportedFilterError as exc:
         raise HTTPException(
             status_code=400,
@@ -192,20 +198,48 @@ def launch_scan(payload: ScanPayload, request: Request) -> JSONResponse:
     text = payload.resolved_text()
 
     auto_generated: Optional[Dict[str, Any]] = None
+    search_diagnostics: Optional[Dict[str, Any]] = None
     needs_url = (payload.search_type in ("automatic_scan", "area_search", None)) or bool(text is None)
     if not url and not text and needs_url and payload.auto_generate_url:
         try:
-            built = url_builder.build_search_url(
-                payload.to_url_builder_payload(), provider=payload.search_provider,
+            built = url_builder.resolve_search_url(
+                payload.to_url_builder_payload(),
+                provider=payload.search_provider,
+                validate=True,
             )
             url = built.url
             auto_generated = built.to_dict()
-            log.info("Auto-generated search URL via %s: %s", built.provider, url)
+            search_diagnostics = (built.diagnostics.to_dict() if built.diagnostics else None)
+            log.info(
+                "Auto-generated search URL via %s (level=%s count=%s broadened=%s): %s",
+                built.provider,
+                (search_diagnostics or {}).get("fallback_level"),
+                (search_diagnostics or {}).get("listing_count"),
+                (search_diagnostics or {}).get("search_broadened"),
+                url,
+            )
         except url_builder.UnsupportedFilterError as exc:
             raise HTTPException(
                 status_code=400,
                 detail=f"Unable to generate search URL from selected filters. {exc}",
             )
+    elif needs_url and payload.search_type in ("automatic_scan", "area_search", None):
+        try:
+            built = url_builder.resolve_search_url(
+                payload.to_url_builder_payload(),
+                provider=payload.search_provider,
+                validate=True,
+            )
+            if built.url != url:
+                log.info(
+                    "Replacing search URL with validated/broader URL: %s → %s",
+                    url, built.url,
+                )
+                url = built.url
+            auto_generated = auto_generated or built.to_dict()
+            search_diagnostics = (built.diagnostics.to_dict() if built.diagnostics else search_diagnostics)
+        except url_builder.UnsupportedFilterError:
+            pass
 
     if not url and not text:
         raise HTTPException(
@@ -257,7 +291,9 @@ def launch_scan(payload: ScanPayload, request: Request) -> JSONResponse:
         "llm_memo_polish": payload.llm_memo_polish or bool(payload.polish_with_llm),
         "listing_limit": payload.listing_limit,
         "search_type": payload.search_type or ("area_search" if filters.get("search_type") == "area_search" else "manual_url"),
+        "search_provider": payload.search_provider or "idealista",
         "auto_generated_url": auto_generated,
+        "search_diagnostics": search_diagnostics,
     }
 
     ok, job, err = store.create_scan_job(
@@ -279,6 +315,8 @@ def launch_scan(payload: ScanPayload, request: Request) -> JSONResponse:
     }
     if auto_generated:
         response["auto_generated_url"] = auto_generated
+    if search_diagnostics:
+        response["search_diagnostics"] = search_diagnostics
     return JSONResponse(status_code=202, content=response)
 
 
@@ -300,8 +338,36 @@ def get_scan(job_id: str) -> Dict[str, Any]:
     job = store.get_scan_job(job_id)
     if not job: raise HTTPException(status_code=404, detail="job_not_found")
     steps = store.list_pipeline_steps(job_id)
-    return {"success": True, "job": job, "steps": steps,
-            "properties": job.get("properties", [])}
+    payload = job.get("payload") or {}
+    if isinstance(payload, str):
+        try:
+            import json
+            payload = json.loads(payload)
+        except Exception:
+            payload = {}
+    search_diagnostics = None
+    if isinstance(payload, dict):
+        search_diagnostics = payload.get("search_diagnostics")
+        discover_step = next(
+            (s for s in steps if s.get("step_key") == "laundry_discover_urls"), None
+        )
+        if discover_step:
+            out = (
+                discover_step.get("output_data")
+                or discover_step.get("result")
+                or discover_step.get("output")
+                or discover_step.get("payload")
+                or {}
+            )
+            if isinstance(out, dict) and out.get("search_diagnostics"):
+                search_diagnostics = out["search_diagnostics"]
+    return {
+        "success": True,
+        "job": job,
+        "steps": steps,
+        "properties": job.get("properties", []),
+        "search_diagnostics": search_diagnostics,
+    }
 
 
 @router.post("/scans/{job_id}/resume")

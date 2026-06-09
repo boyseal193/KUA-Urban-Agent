@@ -30,7 +30,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from jobs import store as job_store
 from jobs.constants import JOB_CANCELLED, JOB_FAILED, JOB_RUNNING, JOB_SUCCESS
 
-from laundry import pipeline, scanner, store as laundry_store
+from laundry import pipeline, scanner, store as laundry_store, url_builder
 
 log = logging.getLogger("kua.laundry.worker")
 
@@ -162,8 +162,24 @@ def run_laundry_scan(job_id: str) -> Dict[str, Any]:
         else:  # area_discover
             laundry_store.start_step(job_id, laundry_store.JOB_STEP_DISCOVER,
                                        listing_url=listing_url)
+            search_diagnostics = payload.get("search_diagnostics") or {}
+            search_provider = payload.get("search_provider") or "idealista"
             try:
-                urls = scanner.discover_listing_urls(listing_url, limit=listing_limit)
+                urls, resolved = url_builder.discover_with_fallback(
+                    listing_url,
+                    filters,
+                    provider=search_provider,
+                    limit=listing_limit,
+                )
+                if resolved.diagnostics:
+                    search_diagnostics = resolved.diagnostics.to_dict()
+                if resolved.url != listing_url:
+                    listing_url = resolved.url
+                    laundry_store.update_job(job_id, search_url=listing_url)
+                    try:
+                        job_store.update_job(job_id, search_url=listing_url)
+                    except Exception:
+                        pass
             except Exception as exc:
                 log.exception("URL discovery crashed: %s", exc)
                 laundry_store.finish_step(
@@ -174,20 +190,33 @@ def run_laundry_scan(job_id: str) -> Dict[str, Any]:
                 _finalize_failed(job_id, error=f"discovery_crashed: {exc}", counters=counters)
                 return _final_response(job_id, JOB_FAILED)
 
-            log.info("laundry.scan step=discover_urls discovered=%s job_id=%s", len(urls), job_id)
+            log.info(
+                "laundry.scan step=discover_urls discovered=%s job_id=%s url=%s broadened=%s",
+                len(urls), job_id, listing_url,
+                (search_diagnostics or {}).get("search_broadened"),
+            )
+            discover_output: Dict[str, Any] = {
+                "discovered_count": len(urls),
+                "search_url": listing_url,
+                "urls": urls[:20],
+            }
+            if search_diagnostics:
+                discover_output["search_diagnostics"] = search_diagnostics
             laundry_store.finish_step(
                 job_id, laundry_store.JOB_STEP_DISCOVER,
                 status=laundry_store.STEP_SUCCESS if urls else laundry_store.STEP_FAILED,
-                output={"discovered_count": len(urls), "search_url": listing_url, "urls": urls[:20]},
-                error_message=None if urls else "No listings discovered from the generated search URL.",
+                output=discover_output,
+                error_message=None if urls else (
+                    "No listings discovered even after automatic search broadening."
+                ),
             )
             if not urls:
                 _finalize_no_results(
                     job_id,
                     reason=(
-                        "Generated search URL returned 0 listings. "
-                        "Try widening the filters (max size, neighbourhoods) or use Area Search "
-                        "with a custom URL."
+                        "No listings found even after broadening the search URL "
+                        "(neighbourhood → district → Barcelona → metropolitan). "
+                        "Try a different provider or paste a custom search URL."
                     ),
                     counters=counters,
                 )

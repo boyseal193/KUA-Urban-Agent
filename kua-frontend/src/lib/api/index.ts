@@ -45,5 +45,6 @@ export type {
   LaundrySearchProvider,
   LaundrySearchUrlPayload,
   LaundrySearchUrlResult,
+  LaundrySearchDiagnostics,
   LaundrySearchProviderInfo,
 } from "./laundry";

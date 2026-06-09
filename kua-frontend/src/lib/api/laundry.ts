@@ -218,6 +218,7 @@ export interface LaundryScanJob {
   created_at?: string | null;
   started_at?: string | null;
   finished_at?: string | null;
+  payload?: Record<string, unknown> | null;
 }
 
 export interface LaundryScanStep {
@@ -238,6 +239,7 @@ export interface LaundryScanResponse {
   success: boolean;
   job: LaundryScanJob;
   steps: LaundryScanStep[];
+  search_diagnostics?: LaundrySearchDiagnostics | null;
 }
 
 export interface LaundryLaunchScanPayload {
@@ -295,6 +297,25 @@ export interface LaundrySearchUrlPayload {
   extra_filters?: Record<string, string>;
 }
 
+export interface LaundrySearchDiagnostics {
+  generated_url: string;
+  listing_count?: number | null;
+  fallback_level: string;
+  stage: number;
+  applied_filters: Record<string, string>;
+  removed_filters: string[];
+  pipeline_filters?: Record<string, unknown>;
+  search_broadened?: boolean;
+  broadening_reason?: string | null;
+  attempts?: Array<{
+    url: string;
+    count: number;
+    fallback_level: string;
+    stage: number;
+    removed_filters?: string[];
+  }>;
+}
+
 export interface LaundrySearchUrlResult {
   success: boolean;
   provider: string;
@@ -302,6 +323,9 @@ export interface LaundrySearchUrlResult {
   description: string;
   filters_applied: Record<string, string>;
   warnings: string[];
+  search_diagnostics?: LaundrySearchDiagnostics;
+  search_broadened?: boolean;
+  broadening_reason?: string | null;
 }
 
 export interface LaundrySearchProviderInfo {
@@ -447,6 +471,7 @@ export const laundryApi = {
       websocket_url?: string;
       search_url?: string;
       auto_generated_url?: LaundrySearchUrlResult;
+      search_diagnostics?: LaundrySearchDiagnostics;
       result?: Record<string, unknown>;
     }>(`/laundry/scans`, { method: "POST", body: payload, timeoutMs: 600_000 }),
 
@@ -469,6 +494,7 @@ export const laundryApi = {
       success: boolean;
       job: LaundryScanJob;
       steps: LaundryScanStep[];
+      search_diagnostics?: LaundrySearchDiagnostics | null;
     }>(`/laundry/scans/${id}`),
   resumeScan: (id: string) =>
     api<{ success: boolean; job_id: string; status: string }>(

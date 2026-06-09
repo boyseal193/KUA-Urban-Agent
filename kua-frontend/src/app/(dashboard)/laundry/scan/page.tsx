@@ -29,6 +29,7 @@ import {
   type LaundrySearchProvider,
   type LaundrySearchType,
   type LaundrySearchUrlResult,
+  type LaundrySearchDiagnostics,
 } from "@/lib/api";
 
 const PROPERTY_TYPES: { value: LaundryPropertyType; label: string }[] = [
@@ -114,6 +115,12 @@ export default function LaundryScanPage() {
       setGeneratedUrl(res);
       if (!silent) {
         toast.success(`Generated ${res.provider} search URL`);
+        if (res.search_broadened) {
+          toast.message("Search broadened automatically", {
+            description:
+              res.broadening_reason ?? "No listings found under original constraints",
+          });
+        }
         if (res.warnings?.length) {
           res.warnings.forEach((w) => toast.message(w));
         }
@@ -269,7 +276,7 @@ export default function LaundryScanPage() {
                   </SelectContent>
                 </Select>
                 <p className="mt-2 text-[11px] text-muted-foreground">
-                  Default Idealista. Pipeline-level filtering still applies regardless of provider.
+                  Broad city-wide search first — neighbourhood, size and ground floor run in the pipeline.
                 </p>
               </div>
             </div>
@@ -283,8 +290,8 @@ export default function LaundryScanPage() {
                       Auto-generate URL from filters
                     </Label>
                     <p className="text-[11px] text-muted-foreground">
-                      Build a {LAUNDRY_SEARCH_PROVIDERS.find(p => p.value === provider)?.label} search URL from
-                      acquisition type, target neighbourhoods and max size when no URL is provided.
+                      Build a broad {LAUNDRY_SEARCH_PROVIDERS.find(p => p.value === provider)?.label} search URL
+                      from acquisition type and target neighbourhoods. Filters are applied progressively — never all at once in the URL.
                     </p>
                   </div>
                 </div>
@@ -346,6 +353,7 @@ export default function LaundryScanPage() {
                   <code className="block break-all rounded bg-black/30 p-2 font-mono text-[11px] text-foreground">
                     {generatedUrl.url}
                   </code>
+                  <SearchDiagnosticsPanel diagnostics={generatedUrl.search_diagnostics} />
                   {generatedUrl.warnings.length > 0 && (
                     <ul className="list-disc pl-4 text-[10px] text-amber-300/80">
                       {generatedUrl.warnings.map((w, i) => (
@@ -411,8 +419,7 @@ export default function LaundryScanPage() {
                 })}
               </div>
               <p className="mt-2 text-[11px] text-muted-foreground">
-                One selected → embedded in the path. Multiple selected → URL stays city-wide and the pipeline
-                filter narrows results.
+                Multiple selected → URL stays city-wide; pipeline narrows to preferred neighbourhoods.
               </p>
             </div>
 
@@ -492,6 +499,64 @@ export default function LaundryScanPage() {
           </form>
         </CardContent>
       </Card>
+    </div>
+  );
+}
+
+function SearchDiagnosticsPanel({
+  diagnostics,
+}: {
+  diagnostics?: LaundrySearchDiagnostics | null;
+}) {
+  if (!diagnostics) return null;
+
+  const applied = Object.entries(diagnostics.applied_filters ?? {});
+  const removed = diagnostics.removed_filters ?? [];
+
+  return (
+    <div className="mt-2 space-y-2 rounded border border-amber-400/20 bg-amber-400/[0.04] p-3 text-[11px]">
+      {diagnostics.search_broadened && (
+        <div>
+          <p className="font-mono uppercase tracking-widest text-amber-200">
+            Search broadened automatically
+          </p>
+          <p className="text-muted-foreground">
+            Reason: {diagnostics.broadening_reason ?? "No listings found under original constraints"}
+          </p>
+        </div>
+      )}
+      <div className="grid gap-2 sm:grid-cols-2">
+        <div>
+          <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">Listing count</p>
+          <p>{diagnostics.listing_count ?? "—"}</p>
+        </div>
+        <div>
+          <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">Fallback level</p>
+          <p className="capitalize">{diagnostics.fallback_level.replace(/_/g, " ")}</p>
+        </div>
+        <div>
+          <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">Stage</p>
+          <p>{diagnostics.stage}</p>
+        </div>
+      </div>
+      {applied.length > 0 && (
+        <div>
+          <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">Applied filters (URL)</p>
+          <ul className="mt-1 list-disc pl-4 text-muted-foreground">
+            {applied.map(([k, v]) => (
+              <li key={k}>
+                {k}: {v != null && v !== "" ? String(v) : "—"}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {removed.length > 0 && (
+        <div>
+          <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">Removed filters</p>
+          <p className="text-muted-foreground">{removed.join(", ")}</p>
+        </div>
+      )}
     </div>
   );
 }
