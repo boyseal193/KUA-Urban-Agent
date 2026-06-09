@@ -3,20 +3,25 @@
 Endpoints (prefix ``/laundry``):
 
 * ``GET    /laundry/health``
-* ``POST   /laundry/scans``            — launch async or inline scan
-* ``GET    /laundry/scans/{id}``       — job status snapshot
-* ``GET    /laundry/jobs``             — list laundry jobs
-* ``GET    /laundry/jobs/{id}``        — job detail (alias of scans/{id})
-* ``DELETE /laundry/jobs/{id}``        — cancel a job
-* ``POST   /laundry/analyse``          — synchronous one-shot underwriting
-* ``GET    /laundry/properties``       — list scored properties
-* ``GET    /laundry/properties/{id}``  — property + latest memo
-* ``DELETE /laundry/properties/{id}``  — soft delete
+* ``GET    /laundry/search-providers``        — list provider keys for the URL builder
+* ``POST   /laundry/search-url``              — generate a portal search URL from filters
+* ``POST   /laundry/scans``                   — launch async or inline scan
+* ``GET    /laundry/scans``                   — list laundry jobs (frontend alias)
+* ``GET    /laundry/scans/{id}``              — job status + steps + properties
+* ``POST   /laundry/scans/{id}/resume``       — re-queue a finished/failed job
+* ``GET    /laundry/jobs``                    — alias of /laundry/scans
+* ``GET    /laundry/jobs/{id}``               — job row
+* ``DELETE /laundry/jobs/{id}``               — cancel a job
+* ``POST   /laundry/analyse``                 — synchronous one-shot underwriting
+* ``GET    /laundry/properties``              — list scored properties
+* ``GET    /laundry/properties/{id}``         — property + latest memo
+* ``DELETE /laundry/properties/{id}``         — soft delete
 * ``POST   /laundry/properties/{id}/restore``
 * ``GET    /laundry/deals/top``
 * ``GET    /laundry/deals/manual-review``
 * ``GET    /laundry/deals/approved``
 * ``GET    /laundry/deals/rejected``
+* ``GET    /laundry/settings/assumptions``
 """
 from __future__ import annotations
 
@@ -38,7 +43,7 @@ router = APIRouter(prefix="/laundry", tags=["laundry"])
 # Schemas
 # ---------------------------------------------------------------------------
 class ScanPayload(BaseModel):
-    property_type: Optional[str] = Field(default=None, description="existing_laundromat | empty_commercial | retail | mixed_use")
+    property_type: Optional[str] = Field(default=None, description="existing_laundromat | empty_commercial | retail | mixed_use | industrial")
     acquisition_type: Optional[str] = Field(default=None, description="buy | rent")
     search_type: Optional[str] = Field(default=None, description="automatic_scan | manual_url | area_search")
 
@@ -106,7 +111,6 @@ class ScanPayload(BaseModel):
         return merged
 
     def to_url_builder_payload(self) -> Dict[str, Any]:
-        """Slice the scan payload into the shape expected by laundry.url_builder."""
         return {
             "acquisition_type": self.acquisition_type or "rent",
             "property_type": self.property_type or "empty_commercial",
@@ -151,11 +155,6 @@ def list_search_providers() -> Dict[str, Any]:
 
 @router.post("/search-url")
 def generate_search_url(payload: SearchUrlPayload) -> Dict[str, Any]:
-    """Build a provider search URL from the operator's filters.
-
-    Returns 400 with a helpful `detail` if the filter combination cannot be
-    translated into a URL for the chosen provider.
-    """
     try:
         built = url_builder.build_search_url(payload.model_dump(), provider=payload.provider)
     except url_builder.UnsupportedFilterError as exc:
@@ -179,7 +178,7 @@ def laundry_health() -> Dict[str, Any]:
     return {
         "success": True,
         "service": "kua-laundry",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "supabase": "configured" if sb_ok else "missing",
     }
 
@@ -225,10 +224,16 @@ def launch_scan(payload: ScanPayload, request: Request) -> JSONResponse:
     if not payload.resolved_async():
         try:
             if url and not text:
-                result = pipeline.analyse_url(
-                    url=url, overrides=overrides, filters=filters,
-                    use_llm=payload.use_llm_extraction, persist=True,
-                )
+                if payload.search_type in ("automatic_scan", "area_search"):
+                    result = pipeline.analyse_area(
+                        search_url=url, limit=payload.listing_limit,
+                        overrides=overrides, filters=filters,
+                    )
+                else:
+                    result = pipeline.analyse_url(
+                        url=url, overrides=overrides, filters=filters,
+                        use_llm=payload.use_llm_extraction, persist=True,
+                    )
             else:
                 result = pipeline.analyse_listing(
                     raw_text=text or "", listing_url=url, source="manual_text",
@@ -237,7 +242,9 @@ def launch_scan(payload: ScanPayload, request: Request) -> JSONResponse:
                 )
             return JSONResponse(
                 status_code=200,
-                content={"success": True, "async": False, "status": "completed", "result": result},
+                content={"success": True, "async": False, "status": "completed",
+                          "search_url": url, "auto_generated_url": auto_generated,
+                          "result": result},
             )
         except Exception as exc:
             log.exception("Inline scan failed: %s", exc)
@@ -249,7 +256,7 @@ def launch_scan(payload: ScanPayload, request: Request) -> JSONResponse:
         "use_llm_extraction": payload.use_llm_extraction,
         "llm_memo_polish": payload.llm_memo_polish or bool(payload.polish_with_llm),
         "listing_limit": payload.listing_limit,
-        "search_type": payload.search_type or ("area_search" if filters.get("search_type") == "area_search" else None),
+        "search_type": payload.search_type or ("area_search" if filters.get("search_type") == "area_search" else "manual_url"),
         "auto_generated_url": auto_generated,
     }
 
@@ -266,8 +273,8 @@ def launch_scan(payload: ScanPayload, request: Request) -> JSONResponse:
     response: Dict[str, Any] = {
         "success": True, "async": True,
         "job_id": job["id"], "status": job["status"],
-        "message": "Laundry scan queued. Poll GET /laundry/jobs/{job_id}.",
-        "poll_url": f"/laundry/jobs/{job['id']}",
+        "message": "Laundry scan queued. Poll GET /laundry/scans/{job_id}.",
+        "poll_url": f"/laundry/scans/{job['id']}",
         "search_url": url,
     }
     if auto_generated:
@@ -283,7 +290,7 @@ def launch_scan_legacy(payload: ScanPayload, request: Request) -> JSONResponse:
 
 @router.get("/scans")
 def list_scans(limit: int = 50, status: Optional[str] = None) -> Dict[str, Any]:
-    """List laundry scan jobs (alias of /laundry/jobs, matches existing frontend client)."""
+    """List laundry scan jobs (matches existing frontend client)."""
     scans = store.list_laundry_jobs(limit=limit, status=status)
     return {"success": True, "scans": scans, "jobs": scans}
 
@@ -292,20 +299,26 @@ def list_scans(limit: int = 50, status: Optional[str] = None) -> Dict[str, Any]:
 def get_scan(job_id: str) -> Dict[str, Any]:
     job = store.get_scan_job(job_id)
     if not job: raise HTTPException(status_code=404, detail="job_not_found")
-    return {"success": True, "job": job, "steps": [], "properties": job.get("properties", [])}
+    steps = store.list_pipeline_steps(job_id)
+    return {"success": True, "job": job, "steps": steps,
+            "properties": job.get("properties", [])}
 
 
 @router.post("/scans/{job_id}/resume")
 def resume_scan(job_id: str) -> Dict[str, Any]:
-    """Re-queue a finished/failed laundry scan."""
+    """Re-queue a finished/failed laundry scan so the worker picks it up again."""
     job = store.get_scan_job(job_id)
     if not job: raise HTTPException(status_code=404, detail="job_not_found")
     try:
         from jobs.constants import JOB_QUEUED
     except Exception:
         JOB_QUEUED = "queued"
-    store.update_job_progress(job_id, status=JOB_QUEUED, error_message=None,
-                                started_at=None, finished_at=None, progress_pct=0)
+    store.update_job(
+        job_id, status=JOB_QUEUED, error_message=None,
+        started_at=None, finished_at=None, progress_pct=0,
+        listings_done=0, listings_failed=0,
+        approved_count=0, manual_review_count=0, rejected_count=0,
+    )
     return {"success": True, "job_id": job_id, "status": JOB_QUEUED}
 
 

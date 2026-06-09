@@ -2,7 +2,7 @@
 
 import { use } from "react";
 import Link from "next/link";
-import { ArrowLeft } from "lucide-react";
+import { ArrowLeft, AlertCircle } from "lucide-react";
 
 import { PageHeader } from "@/components/common/page-header";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -10,13 +10,28 @@ import { useLaundryScan } from "@/hooks/use-laundry";
 
 const STATUS_COLOR: Record<string, string> = {
   pending: "#94A3B8",
+  queued: "#94A3B8",
   running: "#A78BFA",
   success: "#7CFAB3",
   completed: "#7CFAB3",
+  no_results: "#FACC15",
   failed: "#FB7185",
+  cancelled: "#FB7185",
+  timeout: "#FB7185",
   skipped: "#FACC15",
   retrying: "#38BDF8",
 };
+
+const STATUS_LABEL: Record<string, string> = {
+  no_results: "NO RESULTS",
+  success: "SUCCESS",
+};
+
+const LISTING_STEP_KEY = "laundry_process_listing";
+
+function statusLabel(status: string): string {
+  return STATUS_LABEL[status] ?? status.replace(/_/g, " ").toUpperCase();
+}
 
 export default function LaundryScanDetailPage({
   params,
@@ -29,6 +44,14 @@ export default function LaundryScanDetailPage({
   const job = q.data?.job;
   const steps = q.data?.steps ?? [];
 
+  // Show job-level steps first, then per-listing steps. The backend already
+  // orders by (listing_index, step_order); we just preserve that.
+  const jobSteps = steps.filter((s) => (s.listing_index ?? -1) < 0);
+  const listingSteps = steps.filter((s) => (s.listing_index ?? -1) >= 0);
+
+  const isNoResults = job?.status === "no_results";
+  const isFailed = job?.status === "failed";
+
   return (
     <div className="space-y-6">
       <PageHeader
@@ -36,7 +59,7 @@ export default function LaundryScanDetailPage({
         title={job ? `Scan ${job.id.slice(0, 8)}` : "Scan"}
         subtitle={
           job
-            ? `Status ${job.status.toUpperCase()} · ${Math.round(job.progress_pct)}% · ${job.listings_done}/${job.listings_total} listings`
+            ? `Status ${statusLabel(job.status)} · ${Math.round(job.progress_pct)}% · ${job.listings_done ?? 0}/${job.listings_total ?? 0} listings`
             : "Loading…"
         }
         rightSlot={
@@ -49,12 +72,36 @@ export default function LaundryScanDetailPage({
         }
       />
 
+      {(isNoResults || isFailed) && job?.error_message && (
+        <Card>
+          <CardContent className="flex gap-3 p-4">
+            <AlertCircle
+              className={`mt-0.5 h-4 w-4 flex-shrink-0 ${isFailed ? "text-rose-300" : "text-amber-300"}`}
+            />
+            <div className="space-y-1 text-xs">
+              <p
+                className={`font-mono uppercase tracking-widest ${isFailed ? "text-rose-200" : "text-amber-200"}`}
+              >
+                {isFailed ? "Scan failed" : "No listings found"}
+              </p>
+              <p className="text-muted-foreground">{job.error_message}</p>
+              {job.search_url && (
+                <p className="break-all font-mono text-[11px] text-muted-foreground">
+                  Search URL: {job.search_url}
+                </p>
+              )}
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
       <div className="grid gap-4 lg:grid-cols-3">
         <Card>
           <CardHeader>
             <CardTitle>Summary</CardTitle>
           </CardHeader>
           <CardContent className="space-y-2 text-xs">
+            <Row k="Status" v={statusLabel(job?.status ?? "—")} />
             <Row k="Search type" v={job?.search_type ?? "—"} />
             <Row k="Property type" v={job?.property_type ?? "—"} />
             <Row k="Acquisition" v={job?.acquisition_type ?? "—"} />
@@ -64,17 +111,12 @@ export default function LaundryScanDetailPage({
             <Row k="Review" v={String(job?.manual_review_count ?? 0)} />
             <Row k="Rejected" v={String(job?.rejected_count ?? 0)} />
             <Row k="Failed" v={String(job?.listings_failed ?? 0)} />
-            {job?.error_message && (
-              <div className="rounded-md border border-rose-400/40 bg-rose-400/10 p-2 font-mono text-[10px] text-rose-200">
-                {job.error_message}
-              </div>
-            )}
           </CardContent>
         </Card>
 
         <Card className="lg:col-span-2">
           <CardHeader>
-            <CardTitle>Steps</CardTitle>
+            <CardTitle>Pipeline</CardTitle>
           </CardHeader>
           <CardContent>
             <div className="max-h-[640px] overflow-y-auto">
@@ -84,26 +126,44 @@ export default function LaundryScanDetailPage({
                     <th className="py-2 pr-2">#</th>
                     <th className="py-2 pr-2">Step</th>
                     <th className="py-2 pr-2">Status</th>
-                    <th className="py-2 pr-2">URL</th>
+                    <th className="py-2 pr-2">URL / detail</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {steps.map((s) => {
+                  {jobSteps.map((s) => {
                     const c = STATUS_COLOR[s.status] ?? "#94A3B8";
                     return (
                       <tr key={s.id} className="border-b border-border/40">
                         <td className="py-2 pr-2 font-mono text-[10px]">{s.step_order}</td>
-                        <td className="py-2 pr-2">{s.step_key}</td>
+                        <td className="py-2 pr-2">{s.step_key.replace(/^laundry_/, "")}</td>
                         <td className="py-2 pr-2">
-                          <span
-                            className="rounded-md px-2 py-0.5 font-mono text-[10px] uppercase"
-                            style={{ color: c, background: `${c}1A`, border: `1px solid ${c}55` }}
-                          >
-                            {s.status}
-                          </span>
+                          <StatusBadge status={s.status} />
                         </td>
                         <td className="py-2 pr-2 truncate max-w-[420px] font-mono text-[10px] text-muted-foreground">
-                          {s.listing_url ?? "—"}
+                          {s.error_message ?? s.listing_url ?? "—"}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                  {listingSteps.length > 0 && (
+                    <tr>
+                      <td colSpan={4} className="pt-3 pb-1 font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+                        Per-listing
+                      </td>
+                    </tr>
+                  )}
+                  {listingSteps.map((s) => {
+                    const c = STATUS_COLOR[s.status] ?? "#94A3B8";
+                    const label = s.step_key === LISTING_STEP_KEY ? "process listing" : s.step_key;
+                    return (
+                      <tr key={s.id} className="border-b border-border/40">
+                        <td className="py-2 pr-2 font-mono text-[10px]">{(s.listing_index ?? 0) + 1}</td>
+                        <td className="py-2 pr-2">{label}</td>
+                        <td className="py-2 pr-2">
+                          <StatusBadge status={s.status} />
+                        </td>
+                        <td className="py-2 pr-2 truncate max-w-[420px] font-mono text-[10px] text-muted-foreground">
+                          {s.error_message ?? s.listing_url ?? "—"}
                         </td>
                       </tr>
                     );
@@ -120,6 +180,18 @@ export default function LaundryScanDetailPage({
         </Card>
       </div>
     </div>
+  );
+}
+
+function StatusBadge({ status }: { status: string }) {
+  const c = STATUS_COLOR[status] ?? "#94A3B8";
+  return (
+    <span
+      className="rounded-md px-2 py-0.5 font-mono text-[10px] uppercase"
+      style={{ color: c, background: `${c}1A`, border: `1px solid ${c}55` }}
+    >
+      {statusLabel(status)}
+    </span>
   );
 }
 

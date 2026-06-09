@@ -13,13 +13,25 @@ import { timeAgo } from "@/lib/format";
 
 const STATUS_COLOR: Record<string, string> = {
   pending: "#94A3B8",
+  queued: "#94A3B8",
   running: "#A78BFA",
   success: "#7CFAB3",
   completed: "#7CFAB3",
+  no_results: "#FACC15",
   failed: "#FB7185",
   cancelled: "#FB7185",
   timeout: "#FB7185",
 };
+
+const STATUS_LABEL: Record<string, string> = {
+  no_results: "NO RESULTS",
+};
+
+const RESUMABLE = new Set(["failed", "cancelled", "timeout", "no_results"]);
+
+function statusLabel(status: string): string {
+  return STATUS_LABEL[status] ?? status.replace(/_/g, " ").toUpperCase();
+}
 
 export default function LaundryScansPage() {
   const scans = useLaundryScans(50);
@@ -82,7 +94,7 @@ export default function LaundryScansPage() {
                           </Link>
                         </td>
                         <td className="py-2 pr-2 uppercase tracking-widest text-[10px] text-muted-foreground">
-                          {s.search_type.replace("_", " ")}
+                          {(s.search_type ?? "").replace(/_/g, " ")}
                         </td>
                         <td className="py-2 pr-2">
                           <span
@@ -93,7 +105,7 @@ export default function LaundryScansPage() {
                               border: `1px solid ${color}55`,
                             }}
                           >
-                            {s.status}
+                            {statusLabel(s.status)}
                           </span>
                         </td>
                         <td className="py-2 pr-2 font-mono tabular-nums">
@@ -108,7 +120,7 @@ export default function LaundryScansPage() {
                         </td>
                         <td className="py-2 pr-2 text-muted-foreground">{timeAgo(s.created_at)}</td>
                         <td className="py-2 pr-2">
-                          {["failed", "cancelled", "timeout"].includes(s.status) && (
+                          {RESUMABLE.has(s.status) && (
                             <button
                               className="inline-flex items-center gap-1 rounded border border-border/60 px-2 py-0.5 font-mono text-[10px] uppercase tracking-widest hover:border-violet-400/50 hover:text-violet-300"
                               onClick={async () => {
