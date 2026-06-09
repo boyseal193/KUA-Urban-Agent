@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import { useRouter } from "next/navigation";
-import { Flame, Loader2 } from "lucide-react";
+import { Flame, Loader2, Sparkles, ExternalLink, Wand2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { PageHeader } from "@/components/common/page-header";
@@ -22,9 +22,13 @@ import { useLaunchLaundryScan } from "@/hooks/use-laundry";
 import {
   LAUNDRY_DEFAULT_MAX_SQM,
   LAUNDRY_PREFERRED_NEIGHBOURHOODS,
+  LAUNDRY_SEARCH_PROVIDERS,
+  laundryApi,
   type LaundryAcquisitionType,
   type LaundryPropertyType,
+  type LaundrySearchProvider,
   type LaundrySearchType,
+  type LaundrySearchUrlResult,
 } from "@/lib/api";
 
 const PROPERTY_TYPES: { value: LaundryPropertyType; label: string }[] = [
@@ -54,7 +58,7 @@ const SEARCH_TYPES: { value: LaundrySearchType; label: string; help: string }[] 
   {
     value: "automatic_scan",
     label: "Automatic scan",
-    help: "Run the configured seed sweep across allowed sources.",
+    help: "Generate the search URL from your filters and sweep every result.",
   },
 ];
 
@@ -67,7 +71,7 @@ export default function LaundryScanPage() {
   const [acquisitionType, setAcquisitionType] =
     React.useState<LaundryAcquisitionType>("rent");
   const [searchType, setSearchType] =
-    React.useState<LaundrySearchType>("manual_url");
+    React.useState<LaundrySearchType>("automatic_scan");
   const [listingUrl, setListingUrl] = React.useState("");
   const [rawListingText, setRawListingText] = React.useState("");
   const [listingLimit, setListingLimit] = React.useState(20);
@@ -75,33 +79,90 @@ export default function LaundryScanPage() {
   const [llmMemoPolish, setLlmMemoPolish] = React.useState(false);
   const [maxSizeSqm, setMaxSizeSqm] = React.useState<number>(LAUNDRY_DEFAULT_MAX_SQM);
   const [neighbourhoodFilters, setNeighbourhoodFilters] = React.useState<string[]>([]);
+  const [autoGenerateUrl, setAutoGenerateUrl] = React.useState(true);
+  const [provider, setProvider] = React.useState<LaundrySearchProvider>("idealista");
+  const [city] = React.useState("Barcelona");
+  const [groundFloorOnly, setGroundFloorOnly] = React.useState(true);
+
+  const [generatingUrl, setGeneratingUrl] = React.useState(false);
+  const [generatedUrl, setGeneratedUrl] = React.useState<LaundrySearchUrlResult | null>(null);
 
   const helper = SEARCH_TYPES.find((s) => s.value === searchType)?.help ?? "";
+  const requiresUrl = searchType === "manual_url" || searchType === "area_search";
+  const canAutoGenerate = !requiresUrl || searchType === "area_search";
 
   function toggleNeighbourhood(label: string) {
     setNeighbourhoodFilters((prev) =>
       prev.includes(label) ? prev.filter((n) => n !== label) : [...prev, label],
     );
+    setGeneratedUrl(null);
+  }
+
+  async function handleGenerateUrl(silent = false): Promise<LaundrySearchUrlResult | null> {
+    setGeneratingUrl(true);
+    try {
+      const res = await laundryApi.generateSearchUrl({
+        acquisition_type: acquisitionType,
+        property_type: propertyType,
+        city,
+        neighbourhoods: neighbourhoodFilters,
+        max_size_sqm: maxSizeSqm > 0 ? maxSizeSqm : null,
+        ground_floor_only: groundFloorOnly,
+        listing_limit: listingLimit,
+        provider,
+      });
+      setGeneratedUrl(res);
+      if (!silent) {
+        toast.success(`Generated ${res.provider} search URL`);
+        if (res.warnings?.length) {
+          res.warnings.forEach((w) => toast.message(w));
+        }
+      }
+      return res;
+    } catch (err) {
+      const msg = (err as Error).message || "Unable to generate search URL from selected filters.";
+      if (!silent) toast.error(msg);
+      return null;
+    } finally {
+      setGeneratingUrl(false);
+    }
   }
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if ((searchType === "manual_url" || searchType === "area_search") && !listingUrl.trim()) {
-      toast.error("Provide a listing URL for this scan type.");
+
+    let effectiveUrl = listingUrl.trim();
+
+    if (!effectiveUrl && canAutoGenerate && autoGenerateUrl && !rawListingText.trim()) {
+      const built = await handleGenerateUrl(true);
+      if (built) effectiveUrl = built.url;
+    }
+
+    if (requiresUrl && !effectiveUrl) {
+      toast.error("Provide a listing URL for this scan type (or enable Auto-generate).");
       return;
     }
+    if (!effectiveUrl && !rawListingText.trim() && !autoGenerateUrl) {
+      toast.error("Enable Auto-generate URL or provide a listing URL / raw text.");
+      return;
+    }
+
     try {
       const res = await launch.mutateAsync({
         property_type: propertyType,
         acquisition_type: acquisitionType,
         search_type: searchType,
-        listing_url: listingUrl.trim() || null,
+        listing_url: effectiveUrl || null,
         raw_listing_text: rawListingText.trim() || null,
         listing_limit: listingLimit,
         run_in_background: runInBackground,
         llm_memo_polish: llmMemoPolish,
         neighbourhood_filters: neighbourhoodFilters,
         max_size_sqm: maxSizeSqm > 0 ? maxSizeSqm : null,
+        city,
+        ground_floor_only: groundFloorOnly,
+        auto_generate_url: autoGenerateUrl,
+        search_provider: provider,
       });
       toast.success(`Scan ${res.status} — job ${res.job_id.slice(0, 8)}`);
       router.push(`/laundry/scans/${res.job_id}`);
@@ -110,12 +171,18 @@ export default function LaundryScanPage() {
     }
   }
 
+  // Reset preview when any URL-shaping field changes so the operator can't
+  // launch a scan with a stale URL on screen.
+  React.useEffect(() => {
+    setGeneratedUrl(null);
+  }, [propertyType, acquisitionType, provider, maxSizeSqm, groundFloorOnly, city]);
+
   return (
     <div className="space-y-6">
       <PageHeader
         eyebrow="LAUNDRY · NEW SCAN"
         title="Initiate Acquisition Scan"
-        subtitle="Configure property type, acquisition mode and source — the AI underwrites every listing end-to-end."
+        subtitle="Configure property type, acquisition mode and target neighbourhoods — the AI builds the search URL and underwrites every listing end-to-end."
       />
 
       <Card className="max-w-3xl">
@@ -168,37 +235,144 @@ export default function LaundryScanPage() {
               </div>
             </div>
 
-            <div>
-              <Label className="tactical-mono mb-2 inline-block">Search type</Label>
-              <Select value={searchType} onValueChange={(v) => setSearchType(v as LaundrySearchType)}>
-                <SelectTrigger className="max-w-sm">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {SEARCH_TYPES.map((s) => (
-                    <SelectItem key={s.value} value={s.value}>
-                      {s.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              {helper && (
-                <p className="mt-2 text-[11px] text-muted-foreground">{helper}</p>
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <div>
+                <Label className="tactical-mono mb-2 inline-block">Search type</Label>
+                <Select value={searchType} onValueChange={(v) => setSearchType(v as LaundrySearchType)}>
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {SEARCH_TYPES.map((s) => (
+                      <SelectItem key={s.value} value={s.value}>
+                        {s.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                {helper && (
+                  <p className="mt-2 text-[11px] text-muted-foreground">{helper}</p>
+                )}
+              </div>
+              <div>
+                <Label className="tactical-mono mb-2 inline-block">Search provider</Label>
+                <Select value={provider} onValueChange={(v) => setProvider(v as LaundrySearchProvider)}>
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {LAUNDRY_SEARCH_PROVIDERS.map((p) => (
+                      <SelectItem key={p.value} value={p.value}>
+                        {p.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="mt-2 text-[11px] text-muted-foreground">
+                  Default Idealista. Pipeline-level filtering still applies regardless of provider.
+                </p>
+              </div>
+            </div>
+
+            <div className="space-y-2 rounded-md border border-violet-400/20 bg-violet-400/[0.04] p-4">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-3">
+                  <Sparkles className="h-4 w-4 text-violet-300" />
+                  <div>
+                    <Label htmlFor="auto-gen" className="text-xs uppercase tracking-widest text-violet-200">
+                      Auto-generate URL from filters
+                    </Label>
+                    <p className="text-[11px] text-muted-foreground">
+                      Build a {LAUNDRY_SEARCH_PROVIDERS.find(p => p.value === provider)?.label} search URL from
+                      acquisition type, target neighbourhoods and max size when no URL is provided.
+                    </p>
+                  </div>
+                </div>
+                <Switch
+                  id="auto-gen"
+                  checked={autoGenerateUrl}
+                  onCheckedChange={setAutoGenerateUrl}
+                />
+              </div>
+              <div className="flex flex-wrap items-center gap-2 pt-2">
+                <Button
+                  type="button"
+                  variant="tactical"
+                  size="sm"
+                  onClick={() => handleGenerateUrl(false)}
+                  disabled={generatingUrl}
+                  className="bg-violet-500/10 text-violet-300 hover:bg-violet-500/20"
+                >
+                  {generatingUrl ? (
+                    <>
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" /> Generating…
+                    </>
+                  ) : (
+                    <>
+                      <Wand2 className="h-3.5 w-3.5" /> Generate Search URL
+                    </>
+                  )}
+                </Button>
+                {generatedUrl && (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => {
+                      setListingUrl(generatedUrl.url);
+                      toast.success("Generated URL copied into the URL field.");
+                    }}
+                  >
+                    Use as URL
+                  </Button>
+                )}
+              </div>
+
+              {generatedUrl && (
+                <div className="mt-2 space-y-2 rounded-md border border-violet-400/30 bg-background/40 p-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-[11px] uppercase tracking-widest text-violet-300">
+                      {generatedUrl.description}
+                    </p>
+                    <a
+                      href={generatedUrl.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1 text-[11px] text-violet-300 hover:underline"
+                    >
+                      Open <ExternalLink className="h-3 w-3" />
+                    </a>
+                  </div>
+                  <code className="block break-all rounded bg-black/30 p-2 font-mono text-[11px] text-foreground">
+                    {generatedUrl.url}
+                  </code>
+                  {generatedUrl.warnings.length > 0 && (
+                    <ul className="list-disc pl-4 text-[10px] text-amber-300/80">
+                      {generatedUrl.warnings.map((w, i) => (
+                        <li key={i}>{w}</li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
               )}
             </div>
 
-            {(searchType === "manual_url" || searchType === "area_search" || searchType === "automatic_scan") && (
-              <div className="space-y-2">
-                <Label className="tactical-mono">Listing URL</Label>
-                <Input
-                  type="url"
-                  required={searchType !== "automatic_scan"}
-                  value={listingUrl}
-                  onChange={(e) => setListingUrl(e.target.value)}
-                  placeholder="https://www.idealista.com/en/local-…/"
-                />
-              </div>
-            )}
+            <div className="space-y-2">
+              <Label className="tactical-mono">
+                Listing URL {requiresUrl ? "(required)" : "(optional override)"}
+              </Label>
+              <Input
+                type="url"
+                required={requiresUrl && !autoGenerateUrl}
+                value={listingUrl}
+                onChange={(e) => setListingUrl(e.target.value)}
+                placeholder={
+                  autoGenerateUrl
+                    ? "Leave empty to auto-generate from filters"
+                    : "https://www.idealista.com/en/local-…/"
+                }
+              />
+            </div>
 
             <div className="space-y-2">
               <Label className="tactical-mono">Raw listing text (optional)</Label>
@@ -237,7 +411,8 @@ export default function LaundryScanPage() {
                 })}
               </div>
               <p className="mt-2 text-[11px] text-muted-foreground">
-                When at least one is selected only listings matching the address/city/neighbourhood pass.
+                One selected → embedded in the path. Multiple selected → URL stays city-wide and the pipeline
+                filter narrows results.
               </p>
             </div>
 
@@ -267,20 +442,29 @@ export default function LaundryScanPage() {
               </div>
               <div className="flex items-center gap-3 pt-7">
                 <Switch
+                  checked={groundFloorOnly}
+                  onCheckedChange={setGroundFloorOnly}
+                  id="ground-floor"
+                />
+                <Label htmlFor="ground-floor" className="text-xs">Ground floor only</Label>
+              </div>
+              <div className="flex items-center gap-3 pt-7">
+                <Switch
                   checked={runInBackground}
                   onCheckedChange={setRunInBackground}
                   id="async-mode"
                 />
                 <Label htmlFor="async-mode" className="text-xs">Run in background</Label>
               </div>
-              <div className="flex items-center gap-3 pt-7">
-                <Switch
-                  checked={llmMemoPolish}
-                  onCheckedChange={setLlmMemoPolish}
-                  id="polish-llm"
-                />
-                <Label htmlFor="polish-llm" className="text-xs">LLM memo polish</Label>
-              </div>
+            </div>
+
+            <div className="flex items-center gap-3">
+              <Switch
+                checked={llmMemoPolish}
+                onCheckedChange={setLlmMemoPolish}
+                id="polish-llm"
+              />
+              <Label htmlFor="polish-llm" className="text-xs">LLM memo polish</Label>
             </div>
 
             <div className="flex items-center gap-3 border-t border-border/60 pt-4">
@@ -302,6 +486,7 @@ export default function LaundryScanPage() {
               </Button>
               <p className="text-[11px] text-muted-foreground">
                 Async jobs persist across page reload, worker restart and browser close.
+                {autoGenerateUrl && !listingUrl.trim() ? " The backend will auto-generate the URL on submit if the field is empty." : ""}
               </p>
             </div>
           </form>

@@ -20,6 +20,7 @@ export {
   laundryApi,
   LAUNDRY_PREFERRED_NEIGHBOURHOODS,
   LAUNDRY_DEFAULT_MAX_SQM,
+  LAUNDRY_SEARCH_PROVIDERS,
 } from "./laundry";
 export type {
   LaundryProperty,
@@ -41,4 +42,8 @@ export type {
   LaundryAcquisitionType,
   LaundrySearchType,
   LaundryDealStatus,
+  LaundrySearchProvider,
+  LaundrySearchUrlPayload,
+  LaundrySearchUrlResult,
+  LaundrySearchProviderInfo,
 } from "./laundry";

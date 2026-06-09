@@ -27,7 +27,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from laundry import pipeline, store
+from laundry import pipeline, store, url_builder
 
 log = logging.getLogger("kua.laundry.api")
 
@@ -57,6 +57,16 @@ class ScanPayload(BaseModel):
 
     neighbourhood_filters: List[str] = Field(default_factory=list)
     max_size_sqm: Optional[float] = Field(default=80.0, ge=10, le=2000)
+    min_size_sqm: Optional[float] = Field(default=None, ge=0, le=2000)
+    max_price_eur: Optional[float] = Field(default=None, ge=0)
+    max_rent_month_eur: Optional[float] = Field(default=None, ge=0)
+    city: Optional[str] = "Barcelona"
+    ground_floor_only: bool = True
+
+    auto_generate_url: bool = True
+    search_provider: Optional[str] = Field(default="idealista", description="idealista | fotocasa | habitaclia | google_maps | custom")
+    search_provider_extras: Dict[str, str] = Field(default_factory=dict)
+
     scoring_overrides: Dict[str, Any] = Field(default_factory=dict)
     filters: Dict[str, Any] = Field(default_factory=dict)
     overrides: Dict[str, Any] = Field(default_factory=dict)
@@ -79,6 +89,11 @@ class ScanPayload(BaseModel):
         merged: Dict[str, Any] = dict(self.filters or {})
         if self.neighbourhood_filters: merged["neighbourhood_filters"] = list(self.neighbourhood_filters)
         if self.max_size_sqm: merged["max_size_sqm"] = float(self.max_size_sqm)
+        if self.min_size_sqm: merged["min_size_sqm"] = float(self.min_size_sqm)
+        if self.max_price_eur: merged["max_price_eur"] = float(self.max_price_eur)
+        if self.max_rent_month_eur: merged["max_rent_month_eur"] = float(self.max_rent_month_eur)
+        if self.city: merged["city"] = self.city
+        merged["ground_floor_only"] = bool(self.ground_floor_only)
         if self.property_type: merged["property_type"] = self.property_type
         if self.acquisition_type: merged["acquisition_type"] = self.acquisition_type
         if self.search_type: merged["search_type"] = self.search_type
@@ -89,6 +104,66 @@ class ScanPayload(BaseModel):
         if self.scoring_overrides:
             merged.setdefault("scoring_weights", self.scoring_overrides)
         return merged
+
+    def to_url_builder_payload(self) -> Dict[str, Any]:
+        """Slice the scan payload into the shape expected by laundry.url_builder."""
+        return {
+            "acquisition_type": self.acquisition_type or "rent",
+            "property_type": self.property_type or "empty_commercial",
+            "city": self.city or "Barcelona",
+            "neighbourhoods": list(self.neighbourhood_filters or []),
+            "max_size_sqm": float(self.max_size_sqm) if self.max_size_sqm else None,
+            "min_size_sqm": float(self.min_size_sqm) if self.min_size_sqm else None,
+            "max_price_eur": float(self.max_price_eur) if self.max_price_eur else None,
+            "max_rent_month_eur": float(self.max_rent_month_eur) if self.max_rent_month_eur else None,
+            "ground_floor_only": bool(self.ground_floor_only),
+            "listing_limit": int(self.listing_limit or 20),
+            "extra_filters": dict(self.search_provider_extras or {}),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Search URL builder
+# ---------------------------------------------------------------------------
+class SearchUrlPayload(BaseModel):
+    acquisition_type: str = Field(default="rent", description="buy | rent")
+    property_type: str = Field(default="empty_commercial",
+                                description="existing_laundromat | empty_commercial | retail | mixed_use | industrial")
+    city: str = "Barcelona"
+    neighbourhoods: List[str] = Field(default_factory=list)
+    max_size_sqm: Optional[float] = 80.0
+    min_size_sqm: Optional[float] = None
+    max_price_eur: Optional[float] = None
+    max_rent_month_eur: Optional[float] = None
+    ground_floor_only: bool = True
+    listing_limit: int = 20
+    provider: Optional[str] = "idealista"
+    extra_filters: Dict[str, str] = Field(default_factory=dict)
+
+    class Config:
+        extra = "ignore"
+
+
+@router.get("/search-providers")
+def list_search_providers() -> Dict[str, Any]:
+    return {"success": True, "providers": url_builder.list_providers()}
+
+
+@router.post("/search-url")
+def generate_search_url(payload: SearchUrlPayload) -> Dict[str, Any]:
+    """Build a provider search URL from the operator's filters.
+
+    Returns 400 with a helpful `detail` if the filter combination cannot be
+    translated into a URL for the chosen provider.
+    """
+    try:
+        built = url_builder.build_search_url(payload.model_dump(), provider=payload.provider)
+    except url_builder.UnsupportedFilterError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unable to generate search URL from selected filters. {exc}",
+        )
+    return {"success": True, **built.to_dict()}
 
 
 # ---------------------------------------------------------------------------
@@ -116,10 +191,30 @@ def laundry_health() -> Dict[str, Any]:
 def launch_scan(payload: ScanPayload, request: Request) -> JSONResponse:
     url = payload.resolved_url()
     text = payload.resolved_text()
+
+    auto_generated: Optional[Dict[str, Any]] = None
+    needs_url = (payload.search_type in ("automatic_scan", "area_search", None)) or bool(text is None)
+    if not url and not text and needs_url and payload.auto_generate_url:
+        try:
+            built = url_builder.build_search_url(
+                payload.to_url_builder_payload(), provider=payload.search_provider,
+            )
+            url = built.url
+            auto_generated = built.to_dict()
+            log.info("Auto-generated search URL via %s: %s", built.provider, url)
+        except url_builder.UnsupportedFilterError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unable to generate search URL from selected filters. {exc}",
+            )
+
     if not url and not text:
         raise HTTPException(
             status_code=400,
-            detail="Provide either `listing_url`/`search_url` or `raw_listing_text`/`seed_text`.",
+            detail=(
+                "Provide either `listing_url`/`search_url` or `raw_listing_text`, "
+                "or enable `auto_generate_url` so the backend builds one from the filters."
+            ),
         )
 
     filters = payload.resolved_filters()
@@ -155,6 +250,7 @@ def launch_scan(payload: ScanPayload, request: Request) -> JSONResponse:
         "llm_memo_polish": payload.llm_memo_polish or bool(payload.polish_with_llm),
         "listing_limit": payload.listing_limit,
         "search_type": payload.search_type or ("area_search" if filters.get("search_type") == "area_search" else None),
+        "auto_generated_url": auto_generated,
     }
 
     ok, job, err = store.create_scan_job(
@@ -167,15 +263,16 @@ def launch_scan(payload: ScanPayload, request: Request) -> JSONResponse:
             detail=f"Could not queue laundry scan job: {err or 'unknown'}. Run the SQL migration in laundry/schema.sql.",
         )
 
-    return JSONResponse(
-        status_code=202,
-        content={
-            "success": True, "async": True,
-            "job_id": job["id"], "status": job["status"],
-            "message": "Laundry scan queued. Poll GET /laundry/jobs/{job_id}.",
-            "poll_url": f"/laundry/jobs/{job['id']}",
-        },
-    )
+    response: Dict[str, Any] = {
+        "success": True, "async": True,
+        "job_id": job["id"], "status": job["status"],
+        "message": "Laundry scan queued. Poll GET /laundry/jobs/{job_id}.",
+        "poll_url": f"/laundry/jobs/{job['id']}",
+        "search_url": url,
+    }
+    if auto_generated:
+        response["auto_generated_url"] = auto_generated
+    return JSONResponse(status_code=202, content=response)
 
 
 @router.post("/scan", include_in_schema=False)

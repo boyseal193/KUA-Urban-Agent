@@ -257,10 +257,56 @@ export interface LaundryLaunchScanPayload {
   neighbourhood_filters?: string[];
   /** Soft upper bound on floor area (m²) — oversized hits land in manual_review. */
   max_size_sqm?: number | null;
+  min_size_sqm?: number | null;
+  max_price_eur?: number | null;
+  max_rent_month_eur?: number | null;
+  city?: string | null;
+  ground_floor_only?: boolean;
+  /** When true and no listing_url provided, the backend auto-generates one from the filters. */
+  auto_generate_url?: boolean;
+  /** idealista | fotocasa | habitaclia | google_maps | custom */
+  search_provider?: LaundrySearchProvider | null;
+  search_provider_extras?: Record<string, string>;
   /** Shortcut to push weights/thresholds into ``overrides``. */
   scoring_overrides?: Record<string, unknown>;
   filters?: Record<string, unknown>;
   overrides?: Record<string, unknown>;
+}
+
+export type LaundrySearchProvider =
+  | "idealista"
+  | "fotocasa"
+  | "habitaclia"
+  | "google_maps"
+  | "custom";
+
+export interface LaundrySearchUrlPayload {
+  acquisition_type: LaundryAcquisitionType;
+  property_type: LaundryPropertyType;
+  city?: string;
+  neighbourhoods?: string[];
+  max_size_sqm?: number | null;
+  min_size_sqm?: number | null;
+  max_price_eur?: number | null;
+  max_rent_month_eur?: number | null;
+  ground_floor_only?: boolean;
+  listing_limit?: number;
+  provider?: LaundrySearchProvider;
+  extra_filters?: Record<string, string>;
+}
+
+export interface LaundrySearchUrlResult {
+  success: boolean;
+  provider: string;
+  url: string;
+  description: string;
+  filters_applied: Record<string, string>;
+  warnings: string[];
+}
+
+export interface LaundrySearchProviderInfo {
+  key: LaundrySearchProvider | string;
+  label: string;
 }
 
 export const LAUNDRY_PREFERRED_NEIGHBOURHOODS = [
@@ -272,6 +318,14 @@ export const LAUNDRY_PREFERRED_NEIGHBOURHOODS = [
 ] as const;
 
 export const LAUNDRY_DEFAULT_MAX_SQM = 80;
+
+export const LAUNDRY_SEARCH_PROVIDERS: { value: LaundrySearchProvider; label: string }[] = [
+  { value: "idealista", label: "Idealista" },
+  { value: "fotocasa", label: "Fotocasa" },
+  { value: "habitaclia", label: "Habitaclia" },
+  { value: "google_maps", label: "Google Maps (research)" },
+  { value: "custom", label: "Custom template" },
+];
 
 export interface LaundryExportRecord {
   id: string;
@@ -391,8 +445,22 @@ export const laundryApi = {
       job_id: string;
       status: string;
       websocket_url?: string;
+      search_url?: string;
+      auto_generated_url?: LaundrySearchUrlResult;
       result?: Record<string, unknown>;
     }>(`/laundry/scans`, { method: "POST", body: payload, timeoutMs: 600_000 }),
+
+  generateSearchUrl: (payload: LaundrySearchUrlPayload) =>
+    api<LaundrySearchUrlResult>(`/laundry/search-url`, {
+      method: "POST",
+      body: payload,
+      timeoutMs: 30_000,
+    }),
+
+  listSearchProviders: () =>
+    api<{ success: boolean; providers: LaundrySearchProviderInfo[] }>(
+      `/laundry/search-providers`,
+    ),
 
   listScans: (limit = 50) =>
     api<{ scans: LaundryScanJob[] }>(`/laundry/scans`, { query: { limit } }),
