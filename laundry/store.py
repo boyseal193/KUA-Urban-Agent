@@ -19,14 +19,23 @@ from __future__ import annotations
 
 import json
 import logging
-import time
+import math
+import traceback
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 from database import supabase
+from laundry import normalization
 
 log = logging.getLogger("kua.laundry.store")
+
+T = TypeVar("T")
+
+try:
+    from postgrest.exceptions import APIError as PostgrestAPIError
+except Exception:  # pragma: no cover
+    PostgrestAPIError = Exception  # type: ignore
 
 
 # ---------------------------------------------------------------------------
@@ -67,54 +76,178 @@ def _now() -> str:
 
 def _json_safe(payload):
     try:
-        return json.loads(json.dumps(payload, default=str))
+        return json.loads(json.dumps(payload, default=str, allow_nan=False))
     except (TypeError, ValueError):
         return None
+
+
+def _finite_float(v) -> Optional[float]:
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(f):
+        return None
+    return f
+
+
+def _safe_int(v, default: int = 0) -> int:
+    if v is None or isinstance(v, bool):
+        return default
+    try:
+        return int(round(float(v)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _execute_write(
+    fn: Callable[[], T],
+    *,
+    table: str,
+    operation: str,
+    context: Optional[Dict[str, Any]] = None,
+) -> T:
+    """Run a Supabase write and log full details on failure (never swallow)."""
+    try:
+        return fn()
+    except PostgrestAPIError as exc:
+        detail = getattr(exc, "message", None) or str(exc)
+        if isinstance(detail, dict):
+            detail = detail.get("message") or detail.get("hint") or str(detail)
+        log.error(
+            "Supabase %s failed on %s: %s | context=%s",
+            operation,
+            table,
+            detail,
+            context or {},
+            exc_info=True,
+        )
+        raise RuntimeError(f"{table}.{operation}_failed: {detail}") from exc
+    except Exception as exc:
+        log.error(
+            "Supabase %s crashed on %s: %s | context=%s\n%s",
+            operation,
+            table,
+            exc,
+            context or {},
+            traceback.format_exc(),
+        )
+        raise
 
 
 # ---------------------------------------------------------------------------
 # Properties
 # ---------------------------------------------------------------------------
+def check_laundry_schema() -> Tuple[bool, Optional[str]]:
+    """Verify laundry tables are reachable before persisting underwriting output."""
+    if supabase is None:
+        return False, "supabase_client_not_initialised"
+    for table in ("laundry_properties", "laundry_analyses"):
+        try:
+            supabase.table(table).select("id").limit(1).execute()
+        except Exception as exc:
+            msg = f"{table} unavailable: {exc}"
+            log.error("check_laundry_schema: %s", msg)
+            return False, msg
+    return True, None
+
+
 def upsert_property(*, extracted: Dict[str, Any], economics: Dict[str, Any],
                      scoring: Dict[str, Any], location: Dict[str, Any],
                      dedupe_key: str, listing_url: Optional[str],
                      source: str = "scan", job_id: Optional[str] = None) -> Tuple[bool, Optional[Dict], Optional[str]]:
     if supabase is None:
         return False, None, "supabase_client_not_initialised"
-    try:
-        existing = (
-            supabase.table("laundry_properties")
-            .select("id, score, deal_status, created_at, dedupe_key")
-            .eq("dedupe_key", dedupe_key)
-            .is_("deleted_at", "null")
-            .limit(1)
-            .execute()
-        )
-        if existing.data:
-            property_id = existing.data[0]["id"]
-            update_payload = _row_from_inputs(
-                extracted=extracted, economics=economics, scoring=scoring,
-                location=location, listing_url=listing_url, source=source,
-                job_id=job_id, dedupe_key=dedupe_key,
-            )
-            update_payload.pop("id", None)
-            update_payload.pop("created_at", None)
-            update_payload["updated_at"] = _now()
-            supabase.table("laundry_properties").update(update_payload).eq("id", property_id).execute()
-            return True, {"id": property_id, "duplicate": True}, None
+    if not dedupe_key:
+        return False, None, "missing_dedupe_key"
 
-        property_id = str(uuid.uuid4())
+    ok_schema, schema_err = check_laundry_schema()
+    if not ok_schema:
+        return False, None, schema_err
+
+    ctx = {
+        "job_id": job_id,
+        "listing_url": listing_url,
+        "dedupe_key": dedupe_key[:12],
+        "table": "laundry_properties",
+    }
+    log.info("property.insert start job_id=%s url=%s dedupe=%s", job_id, listing_url, dedupe_key[:12])
+
+    try:
+        existing = _execute_write(
+            lambda: (
+                supabase.table("laundry_properties")
+                .select("id, score, deal_status, created_at, dedupe_key, job_id")
+                .eq("dedupe_key", dedupe_key)
+                .is_("deleted_at", "null")
+                .limit(1)
+                .execute()
+            ),
+            table="laundry_properties",
+            operation="select_dedupe",
+            context=ctx,
+        )
         row = _row_from_inputs(
             extracted=extracted, economics=economics, scoring=scoring,
             location=location, listing_url=listing_url, source=source,
             job_id=job_id, dedupe_key=dedupe_key,
         )
+
+        if existing.data:
+            property_id = existing.data[0]["id"]
+            update_payload = dict(row)
+            update_payload.pop("id", None)
+            update_payload.pop("created_at", None)
+            update_payload["updated_at"] = _now()
+            log.info("property.update job_id=%s property_id=%s url=%s", job_id, property_id, listing_url)
+            res = _execute_write(
+                lambda: (
+                    supabase.table("laundry_properties")
+                    .update(update_payload)
+                    .eq("id", property_id)
+                    .select("id, job_id, listing_url, deal_status, score")
+                    .execute()
+                ),
+                table="laundry_properties",
+                operation="update",
+                context={**ctx, "property_id": property_id, "payload_keys": sorted(update_payload.keys())},
+            )
+            if not res.data:
+                return False, None, f"property_update_returned_no_rows property_id={property_id}"
+            log.info(
+                "property.update OK job_id=%s property_id=%s deal_status=%s score=%s",
+                job_id, property_id, res.data[0].get("deal_status"), res.data[0].get("score"),
+            )
+            return True, {"id": property_id, "duplicate": True}, None
+
+        property_id = str(uuid.uuid4())
         row["id"] = property_id
         row["created_at"] = _now()
-        supabase.table("laundry_properties").insert(row).execute()
+        log.info("property.insert job_id=%s property_id=%s url=%s", job_id, property_id, listing_url)
+        res = _execute_write(
+            lambda: supabase.table("laundry_properties").insert(row).select(
+                "id, job_id, listing_url, deal_status, score"
+            ).execute(),
+            table="laundry_properties",
+            operation="insert",
+            context={**ctx, "property_id": property_id, "payload_keys": sorted(row.keys())},
+        )
+        if not res.data:
+            return False, None, f"property_insert_returned_no_rows property_id={property_id}"
+        log.info(
+            "property.insert OK job_id=%s property_id=%s deal_status=%s score=%s",
+            job_id, property_id, res.data[0].get("deal_status"), res.data[0].get("score"),
+        )
         return True, {"id": property_id, "duplicate": False}, None
+    except RuntimeError as exc:
+        return False, None, str(exc)
     except Exception as exc:
-        log.exception("upsert_property failed: %s", exc)
+        log.exception(
+            "upsert_property failed job_id=%s url=%s dedupe=%s",
+            job_id, listing_url, dedupe_key[:12],
+        )
         return False, None, str(exc)
 
 
@@ -128,20 +261,20 @@ def _row_from_inputs(*, extracted, economics, scoring, location, listing_url,
         "address": extracted.get("address"),
         "city": extracted.get("city") or location.get("city") or "Barcelona",
         "neighbourhood": extracted.get("neighbourhood") or location.get("neighbourhood"),
-        "lat": location.get("lat"),
-        "lng": location.get("lng"),
+        "lat": _finite_float(location.get("lat")),
+        "lng": _finite_float(location.get("lng")),
         "property_type": extracted.get("property_type"),
         "acquisition_type": extracted.get("acquisition_type") or economics.get("acquisition_type"),
-        "floor_area_m2": economics.get("floor_area_m2") or extracted.get("floor_area_m2"),
-        "asking_price": extracted.get("asking_price"),
-        "asking_rent_month": extracted.get("asking_rent_month"),
-        "washer_count": economics.get("washer_count"),
-        "dryer_count": economics.get("dryer_count"),
-        "expected_revenue_eur": economics.get("expected_revenue_eur"),
-        "ebitda_eur": economics.get("ebitda_eur"),
-        "operating_margin": economics.get("operating_margin"),
-        "payback_years": economics.get("payback_years"),
-        "score": scoring.get("score", 0),
+        "floor_area_m2": _finite_float(economics.get("floor_area_m2") or extracted.get("floor_area_m2")),
+        "asking_price": _finite_float(extracted.get("asking_price")),
+        "asking_rent_month": _finite_float(extracted.get("asking_rent_month")),
+        "washer_count": _safe_int(economics.get("washer_count"), 0) if economics.get("washer_count") is not None else None,
+        "dryer_count": _safe_int(economics.get("dryer_count"), 0) if economics.get("dryer_count") is not None else None,
+        "expected_revenue_eur": _finite_float(economics.get("expected_revenue_eur")),
+        "ebitda_eur": _finite_float(economics.get("ebitda_eur")),
+        "operating_margin": _finite_float(economics.get("operating_margin")),
+        "payback_years": _finite_float(economics.get("payback_years")),
+        "score": _safe_int(scoring.get("score", 0), 0),
         "verdict": scoring.get("verdict"),
         "classification": scoring.get("classification"),
         "deal_status": scoring.get("deal_status", "rejected"),
@@ -156,23 +289,164 @@ def insert_analysis(*, property_id: str, extracted, economics, scoring,
                      assumptions_version: str) -> Tuple[bool, Optional[str], Optional[str]]:
     if supabase is None:
         return False, None, "supabase_client_not_initialised"
+    if not property_id:
+        return False, None, "missing_property_id"
+
+    analysis_id = str(uuid.uuid4())
+    payload = {
+        "id": analysis_id,
+        "property_id": property_id,
+        "extracted": _json_safe(extracted),
+        "economics": _json_safe(economics),
+        "scoring": _json_safe(scoring),
+        "location": _json_safe(location),
+        "due_diligence": _json_safe(due_diligence),
+        "memo_md": memo_md or "",
+        "assumptions_version": assumptions_version,
+        "created_at": _now(),
+    }
+    ctx = {"property_id": property_id, "analysis_id": analysis_id, "table": "laundry_analyses"}
+    log.info("analysis.insert start property_id=%s analysis_id=%s", property_id, analysis_id)
     try:
-        analysis_id = str(uuid.uuid4())
-        supabase.table("laundry_analyses").insert({
-            "id": analysis_id,
-            "property_id": property_id,
-            "extracted": _json_safe(extracted),
-            "economics": _json_safe(economics),
-            "scoring": _json_safe(scoring),
-            "location": _json_safe(location),
-            "due_diligence": _json_safe(due_diligence),
-            "memo_md": memo_md,
-            "assumptions_version": assumptions_version,
-            "created_at": _now(),
-        }).execute()
+        res = _execute_write(
+            lambda: supabase.table("laundry_analyses").insert(payload).select("id, property_id").execute(),
+            table="laundry_analyses",
+            operation="insert",
+            context=ctx,
+        )
+        if not res.data:
+            return False, None, f"analysis_insert_returned_no_rows property_id={property_id}"
+        log.info(
+            "analysis.insert OK property_id=%s analysis_id=%s memo_len=%s",
+            property_id, analysis_id, len(memo_md or ""),
+        )
         return True, analysis_id, None
+    except RuntimeError as exc:
+        return False, None, str(exc)
     except Exception as exc:
-        log.exception("insert_analysis failed: %s", exc)
+        log.exception(
+            "insert_analysis failed property_id=%s analysis_id=%s: %s",
+            property_id, analysis_id, exc,
+        )
+        return False, None, str(exc)
+
+
+def create_partial_property(
+    *,
+    listing_url: str,
+    job_id: Optional[str],
+    extracted: Optional[Dict[str, Any]] = None,
+    error: Optional[str] = None,
+    source: str = "url_scan",
+) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
+    """Persist a minimal property row when detail scrape/extraction fails."""
+    if supabase is None:
+        return False, None, "supabase_client_not_initialised"
+    if not listing_url:
+        return False, None, "missing_listing_url"
+
+    ok_schema, schema_err = check_laundry_schema()
+    if not ok_schema:
+        return False, None, schema_err
+
+    extracted = dict(extracted or {})
+    dedupe_key = normalization.make_dedupe_key(
+        listing_url=listing_url,
+        address=extracted.get("address"),
+        city=extracted.get("city"),
+        floor_area_m2=extracted.get("floor_area_m2"),
+    )
+    ctx = {
+        "job_id": job_id,
+        "listing_url": listing_url,
+        "dedupe_key": dedupe_key[:12],
+        "table": "laundry_properties",
+        "deal_status": "extraction_failed",
+    }
+    verdict = (error or "Listing detail could not be extracted")[:500]
+    row = {
+        "source": source,
+        "job_id": job_id,
+        "listing_url": listing_url,
+        "dedupe_key": dedupe_key,
+        "address": extracted.get("address"),
+        "city": extracted.get("city") or "Barcelona",
+        "neighbourhood": extracted.get("neighbourhood"),
+        "property_type": extracted.get("property_type"),
+        "acquisition_type": extracted.get("acquisition_type"),
+        "floor_area_m2": _finite_float(extracted.get("floor_area_m2")),
+        "asking_price": _finite_float(extracted.get("asking_price")),
+        "asking_rent_month": _finite_float(extracted.get("asking_rent_month")),
+        "score": 0,
+        "verdict": verdict,
+        "classification": "extraction_failed",
+        "deal_status": "extraction_failed",
+        "raw_extracted": _json_safe({**extracted, "description": extracted.get("description")}),
+    }
+
+    try:
+        existing = _execute_write(
+            lambda: (
+                supabase.table("laundry_properties")
+                .select("id, job_id, listing_url, deal_status")
+                .eq("dedupe_key", dedupe_key)
+                .is_("deleted_at", "null")
+                .limit(1)
+                .execute()
+            ),
+            table="laundry_properties",
+            operation="select_dedupe",
+            context=ctx,
+        )
+        if existing.data:
+            property_id = existing.data[0]["id"]
+            update_payload = dict(row)
+            update_payload["updated_at"] = _now()
+            log.info(
+                "partial_property.update job_id=%s property_id=%s url=%s",
+                job_id, property_id, listing_url,
+            )
+            res = _execute_write(
+                lambda: (
+                    supabase.table("laundry_properties")
+                    .update(update_payload)
+                    .eq("id", property_id)
+                    .select("id, job_id, listing_url, deal_status")
+                    .execute()
+                ),
+                table="laundry_properties",
+                operation="update",
+                context={**ctx, "property_id": property_id},
+            )
+            if not res.data:
+                return False, None, f"partial_property_update_empty property_id={property_id}"
+            return True, {"id": property_id, "duplicate": True}, None
+
+        property_id = str(uuid.uuid4())
+        row["id"] = property_id
+        row["created_at"] = _now()
+        log.info(
+            "partial_property.insert job_id=%s property_id=%s url=%s dedupe=%s",
+            job_id, property_id, listing_url, dedupe_key[:12],
+        )
+        res = _execute_write(
+            lambda: supabase.table("laundry_properties").insert(row).select(
+                "id, job_id, listing_url, deal_status"
+            ).execute(),
+            table="laundry_properties",
+            operation="insert",
+            context={**ctx, "property_id": property_id},
+        )
+        if not res.data:
+            return False, None, f"partial_property_insert_empty property_id={property_id}"
+        return True, {"id": property_id, "duplicate": False}, None
+    except RuntimeError as exc:
+        return False, None, str(exc)
+    except Exception as exc:
+        log.exception(
+            "create_partial_property failed job_id=%s url=%s: %s",
+            job_id, listing_url, exc,
+        )
         return False, None, str(exc)
 
 
@@ -206,6 +480,14 @@ def normalize_property_row(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, 
     if out.get("lng") is not None:
         out["longitude"] = out["lng"]
     out.setdefault("status", out.get("deal_status") or "unknown")
+    raw = out.get("raw_extracted")
+    if isinstance(raw, dict):
+        if not out.get("description") and raw.get("description"):
+            out["description"] = raw.get("description")
+        if not out.get("address") and raw.get("address"):
+            out["address"] = raw.get("address")
+        if not out.get("title") and raw.get("title"):
+            out["title"] = raw.get("title")
     scoring = out.pop("scoring", None) if isinstance(out.get("scoring"), dict) else None
     if scoring and not out.get("confidence_band"):
         conf = scoring.get("confidence") or {}
@@ -423,7 +705,30 @@ def list_job_properties(job_id: str) -> List[Dict[str, Any]]:
             .limit(200)
             .execute()
         )
-        rows = res.data or []
+        rows = list(res.data or [])
+
+        if not rows:
+            listing_rows = get_listing_results(job_id)
+            property_ids = [
+                r["property_id"] for r in listing_rows
+                if r.get("property_id")
+                and r.get("status") in ("success", "extraction_failed", "failed")
+            ]
+            if property_ids:
+                log.info(
+                    "list_job_properties fallback via scan_listing_results job_id=%s ids=%s",
+                    job_id, property_ids,
+                )
+                res = (
+                    supabase.table("laundry_properties")
+                    .select("*")
+                    .in_("id", property_ids)
+                    .is_("deleted_at", "null")
+                    .order("score", desc=True)
+                    .execute()
+                )
+                rows = list(res.data or [])
+
         if not rows:
             return []
         prop_ids = [r["id"] for r in rows if r.get("id")]
@@ -480,33 +785,97 @@ def get_job_memos(job_id: str) -> List[Dict[str, Any]]:
     return memos
 
 
+def listing_row_to_property_card(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Synthesize a property card from scan_listing_results when DB row is missing."""
+    if not row:
+        return None
+    result = row.get("result") or {}
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except Exception:
+            result = {}
+    if not isinstance(result, dict):
+        result = {}
+    property_id = row.get("property_id") or result.get("property_id")
+    if not property_id:
+        return None
+    deal_status = row.get("deal_status") or result.get("deal_status") or row.get("status")
+    return {
+        "id": property_id,
+        "job_id": row.get("job_id"),
+        "listing_url": row.get("listing_url"),
+        "address": row.get("address") or result.get("address"),
+        "city": row.get("city") or result.get("city") or "Barcelona",
+        "neighbourhood": row.get("neighbourhood") or result.get("neighbourhood"),
+        "title": row.get("title") or result.get("title"),
+        "description": row.get("description") or result.get("description"),
+        "floor_area_m2": result.get("floor_area_m2"),
+        "asking_price": result.get("asking_price"),
+        "asking_rent_month": result.get("asking_rent_month"),
+        "score": row.get("score") or result.get("score") or 0,
+        "verdict": result.get("verdict") or row.get("error_message"),
+        "deal_status": deal_status,
+        "status": deal_status or "unknown",
+        "extraction_error": row.get("error_message"),
+    }
+
+
+def merge_scan_properties(
+    properties: List[Dict[str, Any]],
+    listings: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Ensure every persisted listing result appears as a pipeline card."""
+    by_id = {p["id"]: p for p in properties if p.get("id")}
+    merged = list(properties)
+    for row in listings:
+        pid = row.get("property_id")
+        if not pid or pid in by_id:
+            continue
+        card = listing_row_to_property_card(row)
+        if card:
+            merged.append(normalize_property_row(card) or card)
+            by_id[pid] = card
+    merged.sort(key=lambda p: (p.get("deal_status") == "extraction_failed", -(p.get("score") or 0)))
+    return merged
+
+
 def build_scan_summary(
     job: Dict[str, Any],
     listings: List[Dict[str, Any]],
     properties: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     """Aggregate scan counters + deal buckets for the frontend."""
-    successful = [r for r in listings if r.get("status") == "success" and r.get("property_id")]
-    failed_rows = [r for r in listings if r.get("status") == "failed"]
+    persisted_rows = [r for r in listings if r.get("property_id")]
+    scored_rows = [r for r in listings if r.get("status") == "success" and r.get("property_id")]
+    extraction_failed_rows = [
+        r for r in listings
+        if r.get("status") == "extraction_failed" or r.get("deal_status") == "extraction_failed"
+    ]
+    failed_rows = [r for r in listings if r.get("status") == "failed" and not r.get("property_id")]
     skipped_rows = [r for r in listings if r.get("status") == "skipped"]
     approved = [p for p in properties if p.get("deal_status") == "approved_candidate"]
     manual = [p for p in properties if p.get("deal_status") == "manual_review"]
     rejected = [p for p in properties if p.get("deal_status") == "rejected"]
+    extraction_failed_props = [p for p in properties if p.get("deal_status") == "extraction_failed"]
+    persisted_count = len(persisted_rows) or len(properties)
     return {
         "scanned_count": job.get("listings_done") or len(listings),
         "listings_total": job.get("listings_total") or len(listings),
         "listings_done": job.get("listings_done") or 0,
         "listings_failed": job.get("listings_failed") or len(failed_rows),
+        "extraction_failed_count": len(extraction_failed_rows) or len(extraction_failed_props),
         "approved_count": job.get("approved_count") or len(approved),
         "manual_review_count": job.get("manual_review_count") or len(manual),
         "rejected_count": job.get("rejected_count") or len(rejected),
         "skipped_count": len(skipped_rows),
-        "persisted_count": len(successful),
+        "persisted_count": persisted_count,
         "property_count": len(properties),
         "listing_result_count": len(listings),
         "approved_candidates": approved,
         "manual_review_deals": manual,
         "rejected_deals": rejected,
+        "extraction_failed_deals": extraction_failed_props,
         "results_missing": (
             (job.get("listings_done") or 0) > 0
             and len(listings) == 0
@@ -514,7 +883,7 @@ def build_scan_summary(
         ),
         "summary_property_mismatch": (
             (job.get("listings_done") or 0) > 0
-            and len(properties) == 0
+            and persisted_count == 0
         ),
     }
 
@@ -527,6 +896,7 @@ def build_scan_response(job_id: str) -> Optional[Dict[str, Any]]:
     steps = list_pipeline_steps(job_id)
     listings = get_listing_results(job_id)
     properties = job.get("properties") or list_job_properties(job_id)
+    properties = merge_scan_properties(properties, listings)
     memos = get_job_memos(job_id)
     summary = build_scan_summary(job, listings, properties)
 
@@ -744,28 +1114,51 @@ def record_listing_result(job_id: str, listing_index: int, *,
                            property_id: Optional[str] = None,
                            deal_status: Optional[str] = None,
                            score: Optional[int] = None,
-                           error_message: Optional[str] = None) -> bool:
+                           error_message: Optional[str] = None,
+                           address: Optional[str] = None,
+                           city: Optional[str] = None,
+                           neighbourhood: Optional[str] = None,
+                           title: Optional[str] = None,
+                           description: Optional[str] = None) -> bool:
     if supabase is None:
         log.warning("record_listing_result skipped — supabase unavailable job_id=%s", job_id)
         return False
-    payload = {
+
+    merged_result = {
+        **(result or {}),
+        "property_id": property_id,
+        "deal_status": deal_status,
+        "score": score,
+        "address": address or (result or {}).get("address"),
+        "city": city or (result or {}).get("city"),
+        "neighbourhood": neighbourhood or (result or {}).get("neighbourhood"),
+        "title": title or (result or {}).get("title"),
+        "description": description or (result or {}).get("description"),
+    }
+    payload: Dict[str, Any] = {
         "job_id": job_id,
         "listing_index": listing_index,
         "listing_url": listing_url,
         "status": status,
-        "result": _json_safe({
-            **(result or {}),
-            "property_id": property_id,
-            "deal_status": deal_status,
-            "score": score,
-        }),
+        "result": _json_safe(merged_result),
         "property_id": property_id,
         "deal_status": deal_status,
         "score": score,
         "error_message": (error_message or "")[:2000] if error_message else None,
         "updated_at": _now(),
     }
-    try:
+    if address is not None:
+        payload["address"] = address
+    if city is not None:
+        payload["city"] = city
+    if neighbourhood is not None:
+        payload["neighbourhood"] = neighbourhood
+    if title is not None:
+        payload["title"] = title
+    if description is not None:
+        payload["description"] = description
+
+    def _write(data: Dict[str, Any]) -> None:
         existing = (
             supabase.table("scan_listing_results")
             .select("id")
@@ -775,16 +1168,43 @@ def record_listing_result(job_id: str, listing_index: int, *,
             .execute()
         )
         if existing.data:
-            supabase.table("scan_listing_results").update(payload).eq("id", existing.data[0]["id"]).execute()
+            supabase.table("scan_listing_results").update(data).eq("id", existing.data[0]["id"]).execute()
         else:
-            payload["created_at"] = _now()
-            supabase.table("scan_listing_results").insert(payload).execute()
+            data["created_at"] = _now()
+            supabase.table("scan_listing_results").insert(data).execute()
+
+    try:
+        _write(payload)
         log.info(
-            "record_listing_result OK job_id=%s idx=%s property_id=%s url=%s status=%s",
-            job_id, listing_index, property_id, listing_url, status,
+            "record_listing_result OK job_id=%s idx=%s property_id=%s url=%s status=%s "
+            "address=%s city=%s",
+            job_id, listing_index, property_id, listing_url, status, address, city,
         )
+        if property_id:
+            log.info(
+                "property_id saved job_id=%s idx=%s property_id=%s listing_url=%s",
+                job_id, listing_index, property_id, listing_url,
+            )
         return True
     except Exception as exc:
+        # Optional top-level columns may be missing on older DBs — retry without them.
+        msg = str(exc).lower()
+        if any(k in msg for k in ("address", "city", "neighbourhood", "title", "description", "column")):
+            for key in ("address", "city", "neighbourhood", "title", "description"):
+                payload.pop(key, None)
+            try:
+                _write(payload)
+                log.info(
+                    "record_listing_result OK (json only) job_id=%s idx=%s property_id=%s",
+                    job_id, listing_index, property_id,
+                )
+                return True
+            except Exception as retry_exc:
+                log.warning(
+                    "record_listing_result failed job_id=%s idx=%s property_id=%s: %s",
+                    job_id, listing_index, property_id, retry_exc,
+                )
+                return False
         log.warning(
             "record_listing_result failed job_id=%s idx=%s property_id=%s: %s",
             job_id, listing_index, property_id, exc,

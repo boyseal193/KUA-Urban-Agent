@@ -26,6 +26,7 @@ export type LaundryDealStatus =
   | "approved_candidate"
   | "manual_review"
   | "rejected"
+  | "extraction_failed"
   | "deleted"
   | (string & {});
 
@@ -230,6 +231,7 @@ export interface LaundryScanSummary {
   manual_review_count?: number;
   rejected_count?: number;
   skipped_count?: number;
+  extraction_failed_count?: number;
   persisted_count?: number;
   property_count?: number;
   listing_result_count?: number;
@@ -238,6 +240,7 @@ export interface LaundryScanSummary {
   approved_candidates?: LaundryProperty[];
   manual_review_deals?: LaundryProperty[];
   rejected_deals?: LaundryProperty[];
+  extraction_failed_deals?: LaundryProperty[];
 }
 
 export interface LaundryScanMemoRef {

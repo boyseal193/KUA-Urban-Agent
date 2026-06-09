@@ -23,6 +23,11 @@ const STATUS_META: Record<
     color: "#FB7185",
     chipClass: "border-rose-400/40 bg-rose-400/10 text-rose-300",
   },
+  extraction_failed: {
+    label: "EXTRACTION FAILED",
+    color: "#FACC15",
+    chipClass: "border-amber-400/40 bg-amber-400/10 text-amber-200",
+  },
   deleted: {
     label: "DELETED",
     color: "#9CA3AF",

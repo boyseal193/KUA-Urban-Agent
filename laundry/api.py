@@ -181,11 +181,14 @@ def laundry_health() -> Dict[str, Any]:
         sb_ok = sb is not None
     except Exception:
         sb_ok = False
+    schema_ok, schema_err = store.check_laundry_schema() if sb_ok else (False, "supabase_missing")
     return {
         "success": True,
         "service": "kua-laundry",
-        "version": "2.1.0",
+        "version": "2.2.0",
         "supabase": "configured" if sb_ok else "missing",
+        "laundry_schema": "ready" if schema_ok else "missing",
+        "laundry_schema_error": None if schema_ok else schema_err,
     }
 
 

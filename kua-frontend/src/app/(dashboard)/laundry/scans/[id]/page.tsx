@@ -181,6 +181,7 @@ export default function LaundryScanDetailPage({
             <Row k="Approved" v={String(summary?.approved_count ?? job?.approved_count ?? 0)} />
             <Row k="Review" v={String(summary?.manual_review_count ?? job?.manual_review_count ?? 0)} />
             <Row k="Rejected" v={String(summary?.rejected_count ?? job?.rejected_count ?? 0)} />
+            <Row k="Extraction failed" v={String(summary?.extraction_failed_count ?? 0)} />
             <Row k="Failed" v={String(summary?.listings_failed ?? job?.listings_failed ?? 0)} />
             <Row k="Persisted" v={String(summary?.persisted_count ?? properties.length)} />
           </CardContent>

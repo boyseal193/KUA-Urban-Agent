@@ -10,11 +10,14 @@ Orchestration order:
     7. Due diligence
     8. Memo (Markdown)
     9. Persist (laundry_properties + laundry_analyses)
+
+Worker entrypoint for URL scans: ``process_listing_url`` — always produces a
+property row (full underwriting or ``extraction_failed`` partial card).
 """
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from laundry import (
     due_diligence as dd_mod,
@@ -30,11 +33,14 @@ from laundry import (
 
 log = logging.getLogger("kua.laundry.pipeline")
 
+EXTRACTION_FAILED = "extraction_failed"
+
 
 def _matches_neighbourhood_filter(extracted: Dict[str, Any], location: Dict[str, Any],
                                     filters: Dict[str, Any]) -> bool:
     requested = [n.strip().lower() for n in (filters.get("neighbourhood_filters") or []) if n]
-    if not requested: return True
+    if not requested:
+        return True
     candidates = " ".join(
         str(v or "").lower() for v in (
             extracted.get("neighbourhood"), extracted.get("address"),
@@ -42,6 +48,174 @@ def _matches_neighbourhood_filter(extracted: Dict[str, Any], location: Dict[str,
         )
     )
     return any(r in candidates for r in requested)
+
+
+def _log_extracted_fields(job_id: Optional[str], url: Optional[str], extracted: Dict[str, Any]) -> None:
+    log.info(
+        "pipeline.extracted_fields job_id=%s url=%s address=%s city=%s neighbourhood=%s "
+        "size=%s rent=%s price=%s title=%s desc_len=%s",
+        job_id,
+        url,
+        extracted.get("address"),
+        extracted.get("city"),
+        extracted.get("neighbourhood"),
+        extracted.get("floor_area_m2"),
+        extracted.get("asking_rent_month"),
+        extracted.get("asking_price"),
+        (extracted.get("title") or "")[:80] or None,
+        len(extracted.get("description") or ""),
+    )
+
+
+def _persist_underwriting(
+    *,
+    result: Dict[str, Any],
+    extracted: Dict[str, Any],
+    economics: Dict[str, Any],
+    scoring: Dict[str, Any],
+    location: Dict[str, Any],
+    due_diligence: Dict[str, Any],
+    memo_md: str,
+    listing_url: Optional[str],
+    source: str,
+    job_id: Optional[str],
+) -> Tuple[bool, Optional[str]]:
+    """Write property + analysis rows. Returns (ok, error_message)."""
+    dedupe = normalization.make_dedupe_key(
+        listing_url=listing_url,
+        address=extracted.get("address"),
+        city=extracted.get("city"),
+        floor_area_m2=extracted.get("floor_area_m2"),
+    )
+    log.info(
+        "pipeline.persist start job_id=%s url=%s dedupe=%s score=%s deal_status=%s",
+        job_id,
+        listing_url,
+        dedupe[:12],
+        scoring.get("score"),
+        scoring.get("deal_status"),
+    )
+
+    ok, prop, err = store.upsert_property(
+        extracted=extracted,
+        economics=economics,
+        scoring=scoring,
+        location=location,
+        dedupe_key=dedupe,
+        listing_url=listing_url,
+        source=source,
+        job_id=job_id,
+    )
+    if not ok or not prop:
+        msg = err or "property_upsert_failed"
+        log.error(
+            "pipeline.persist property FAILED job_id=%s url=%s error=%s",
+            job_id, listing_url, msg,
+        )
+        return False, msg
+
+    property_id = prop["id"]
+    result["property_id"] = property_id
+    result["duplicate"] = prop.get("duplicate", False)
+    log.info(
+        "pipeline.property_created job_id=%s property_id=%s url=%s duplicate=%s",
+        job_id, property_id, listing_url, prop.get("duplicate"),
+    )
+
+    ana_ok, ana_id, ana_err = store.insert_analysis(
+        property_id=property_id,
+        extracted=extracted,
+        economics=economics,
+        scoring=scoring,
+        location=location,
+        due_diligence=due_diligence,
+        memo_md=memo_md,
+        assumptions_version=economics.get("assumptions_version", "2.0.0"),
+    )
+    if not ana_ok or not ana_id:
+        msg = ana_err or "analysis_insert_failed"
+        log.error(
+            "pipeline.persist analysis FAILED job_id=%s property_id=%s error=%s",
+            job_id, property_id, msg,
+        )
+        result["persist_warning"] = msg
+        return False, msg
+
+    result["analysis_id"] = ana_id
+    log.info(
+        "pipeline.persist complete job_id=%s property_id=%s analysis_id=%s memo_len=%s",
+        job_id, property_id, ana_id, len(memo_md or ""),
+    )
+    return True, None
+
+
+def _persist_extraction_failed(
+    *,
+    listing_url: str,
+    job_id: Optional[str],
+    extracted: Optional[Dict[str, Any]],
+    error: Optional[str],
+    source: str = "url_scan",
+) -> Dict[str, Any]:
+    """Create a partial property row when scrape/extraction/underwriting fails."""
+    extracted = dict(extracted or {})
+    ok, prop, err = store.create_partial_property(
+        listing_url=listing_url,
+        job_id=job_id,
+        extracted=extracted,
+        error=error,
+        source=source,
+    )
+    if not ok or not prop:
+        log.error(
+            "pipeline.extraction_failed persist FAILED job_id=%s url=%s error=%s",
+            job_id, listing_url, err,
+        )
+        return {
+            "success": False,
+            "extraction_failed": True,
+            "url": listing_url,
+            "error": err or error or "partial_property_failed",
+            "extracted": extracted,
+        }
+
+    property_id = prop["id"]
+    log.info(
+        "pipeline.property_created job_id=%s property_id=%s url=%s status=%s",
+        job_id, property_id, listing_url, EXTRACTION_FAILED,
+    )
+    scoring = {
+        "deal_status": EXTRACTION_FAILED,
+        "score": 0,
+        "verdict": error or "Listing detail could not be extracted",
+    }
+    return {
+        "success": True,
+        "extraction_failed": True,
+        "property_id": property_id,
+        "url": listing_url,
+        "error": error,
+        "extracted": extracted,
+        "scoring": scoring,
+    }
+
+
+def persist_extraction_failed(
+    *,
+    listing_url: str,
+    job_id: Optional[str],
+    extracted: Optional[Dict[str, Any]] = None,
+    error: Optional[str] = None,
+    source: str = "url_scan",
+) -> Dict[str, Any]:
+    """Public wrapper used by the worker on catastrophic listing errors."""
+    return _persist_extraction_failed(
+        listing_url=listing_url,
+        job_id=job_id,
+        extracted=extracted,
+        error=error,
+        source=source,
+    )
 
 
 def analyse_listing(
@@ -54,11 +228,20 @@ def analyse_listing(
     use_llm: bool = True,
     job_id: Optional[str] = None,
     persist: bool = True,
+    html: Optional[str] = None,
 ) -> Dict[str, Any]:
     overrides = overrides or {}
     filters = filters or {}
 
-    extracted = normalization.normalize_extracted(extraction.extract_from_text(raw_text or "", use_llm=use_llm))
+    log.info(
+        "pipeline.analyse_listing start job_id=%s url=%s text_len=%s persist=%s",
+        job_id, listing_url, len(raw_text or ""), persist,
+    )
+
+    extracted = normalization.normalize_extracted(
+        extraction.extract_listing(raw_text or "", html=html, use_llm=use_llm)
+    )
+    _log_extracted_fields(job_id, listing_url, extracted)
 
     if filters.get("property_type"):
         extracted["property_type"] = extracted.get("property_type") or filters["property_type"]
@@ -78,6 +261,10 @@ def analyse_listing(
     )
 
     if not _matches_neighbourhood_filter(extracted, location, filters):
+        log.info(
+            "pipeline.analyse_listing skipped neighbourhood_filter job_id=%s url=%s",
+            job_id, listing_url,
+        )
         return {
             "success": True, "skipped": True,
             "reason": "neighbourhood_filter_no_match",
@@ -109,41 +296,105 @@ def analyse_listing(
     }
 
     if persist:
-        dedupe = normalization.make_dedupe_key(
-            listing_url=listing_url, address=extracted.get("address"),
-            city=extracted.get("city"), floor_area_m2=extracted.get("floor_area_m2"),
+        ok, err = _persist_underwriting(
+            result=result,
+            extracted=extracted,
+            economics=economics,
+            scoring=scoring,
+            location=location,
+            due_diligence=due_diligence,
+            memo_md=memo_md,
+            listing_url=listing_url,
+            source=source,
+            job_id=job_id,
         )
-        ok, prop, err = store.upsert_property(
-            extracted=extracted, economics=economics, scoring=scoring, location=location,
-            dedupe_key=dedupe, listing_url=listing_url, source=source, job_id=job_id,
-        )
-        if ok and prop:
-            result["property_id"] = prop["id"]
-            result["duplicate"] = prop.get("duplicate", False)
-            ana_ok, ana_id, ana_err = store.insert_analysis(
-                property_id=prop["id"], extracted=extracted, economics=economics,
-                scoring=scoring, location=location, due_diligence=due_diligence,
-                memo_md=memo_md, assumptions_version=economics.get("assumptions_version", "2.0.0"),
-            )
-            if ana_ok: result["analysis_id"] = ana_id
-            else: result["persist_warning"] = ana_err
-        else:
-            result["persist_warning"] = err or "property_upsert_failed"
+        if not ok:
+            if listing_url:
+                return _persist_extraction_failed(
+                    listing_url=listing_url,
+                    job_id=job_id,
+                    extracted=extracted,
+                    error=err,
+                    source=source,
+                )
+            result["success"] = False
+            result["error"] = err
+            result["persist_warning"] = err
 
     return result
+
+
+def process_listing_url(
+    *,
+    url: str,
+    overrides: Optional[Dict[str, Any]] = None,
+    filters: Optional[Dict[str, Any]] = None,
+    use_llm: bool = True,
+    job_id: Optional[str] = None,
+    persist: bool = True,
+) -> Dict[str, Any]:
+    """Scrape listing detail → extract → persist property (or extraction_failed card)."""
+    log.info("pipeline.found_listing_url job_id=%s url=%s", job_id, url)
+
+    fetched = scanner.fetch_listing_text(url)
+    if not fetched.get("success"):
+        err = fetched.get("error") or "scrape_failed"
+        log.warning("pipeline.scrape_failed job_id=%s url=%s error=%s", job_id, url, err)
+        return _persist_extraction_failed(
+            listing_url=url,
+            job_id=job_id,
+            extracted={},
+            error=err,
+        )
+
+    raw_text = fetched.get("raw_text") or ""
+    html = fetched.get("html") or ""
+    log.info(
+        "pipeline.scraped_listing job_id=%s url=%s text_len=%s html_len=%s source=%s",
+        job_id, url, len(raw_text), len(html), fetched.get("source"),
+    )
+
+    extracted = normalization.normalize_extracted(
+        extraction.extract_listing(raw_text, html=html, use_llm=use_llm)
+    )
+    _log_extracted_fields(job_id, url, extracted)
+
+    if not extraction.has_usable_fields(extracted):
+        log.warning(
+            "pipeline.insufficient_fields job_id=%s url=%s — creating extraction_failed card",
+            job_id, url,
+        )
+        return _persist_extraction_failed(
+            listing_url=url,
+            job_id=job_id,
+            extracted=extracted,
+            error="insufficient_extracted_fields",
+        )
+
+    return analyse_listing(
+        raw_text=raw_text,
+        html=html,
+        listing_url=url,
+        source="url_scan",
+        overrides=overrides,
+        filters=filters,
+        use_llm=False,  # already extracted above
+        job_id=job_id,
+        persist=persist,
+    )
 
 
 def analyse_url(*, url: str, overrides=None, filters=None,
                  use_llm: bool = True, job_id: Optional[str] = None,
                  persist: bool = True) -> Dict[str, Any]:
-    fetched = scanner.fetch_listing_text(url)
-    if not fetched.get("success"):
-        return {"success": False, "error": fetched.get("error") or "scrape_failed", "url": url}
-    return analyse_listing(
-        raw_text=fetched.get("raw_text") or "",
-        listing_url=url, source="url_scan",
-        overrides=overrides, filters=filters,
-        use_llm=use_llm, job_id=job_id, persist=persist,
+    """Back-compat wrapper — prefer ``process_listing_url`` in the worker."""
+    return process_listing_url(
+        url=url,
+        overrides=overrides,
+        filters=filters,
+        use_llm=use_llm,
+        job_id=job_id,
+        persist=persist,
     )
 
 
@@ -151,18 +402,30 @@ def analyse_area(*, search_url: str, limit: int = 20, overrides=None,
                   filters=None, job_id: Optional[str] = None) -> Dict[str, Any]:
     urls = scanner.discover_listing_urls(search_url, limit=limit)
     results = []
-    approved = manual = rejected = failed = skipped = 0
+    approved = manual = rejected = failed = skipped = extraction_failed = 0
     for url in urls:
         try:
-            res = analyse_url(url=url, overrides=overrides, filters=filters,
-                              job_id=job_id, persist=True)
+            res = process_listing_url(
+                url=url, overrides=overrides, filters=filters,
+                job_id=job_id, persist=True,
+            )
             results.append(res)
-            if not res.get("success"): failed += 1; continue
-            if res.get("skipped"): skipped += 1; continue
+            if res.get("extraction_failed"):
+                extraction_failed += 1
+                continue
+            if not res.get("success"):
+                failed += 1
+                continue
+            if res.get("skipped"):
+                skipped += 1
+                continue
             ds = (res.get("scoring") or {}).get("deal_status")
-            if ds == "approved_candidate": approved += 1
-            elif ds == "manual_review": manual += 1
-            else: rejected += 1
+            if ds == "approved_candidate":
+                approved += 1
+            elif ds == "manual_review":
+                manual += 1
+            else:
+                rejected += 1
         except Exception as exc:
             log.exception("Area analyse failed for %s: %s", url, exc)
             failed += 1
@@ -173,5 +436,6 @@ def analyse_area(*, search_url: str, limit: int = 20, overrides=None,
         "summary": {
             "approved": approved, "manual_review": manual,
             "rejected": rejected, "skipped": skipped, "failed": failed,
+            "extraction_failed": extraction_failed,
         },
     }

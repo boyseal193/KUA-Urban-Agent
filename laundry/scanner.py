@@ -34,12 +34,14 @@ def fetch_listing_text(url: str) -> Dict[str, Any]:
     try:
         try:
             from scraper import scrape_listing_text  # type: ignore
+
             res = scrape_listing_text(url)
             if isinstance(res, dict) and res.get("success"):
                 return {
                     "success": True,
                     "url": url,
                     "raw_text": res.get("raw_text") or res.get("text") or "",
+                    "html": res.get("html") or res.get("raw_html") or "",
                     "source": "storage_scraper",
                 }
         except Exception as exc:
@@ -56,7 +58,13 @@ def fetch_listing_text(url: str) -> Dict[str, Any]:
         for tag in soup(["script", "style", "noscript"]):
             tag.decompose()
         text = " ".join(soup.get_text(" ").split())
-        return {"success": True, "url": url, "raw_text": text, "source": "generic_html"}
+        return {
+            "success": True,
+            "url": url,
+            "raw_text": text,
+            "html": r.text,
+            "source": "generic_html",
+        }
     except Exception as exc:
         log.warning("Scrape failed for %s: %s", url, exc)
         return {"success": False, "url": url, "error": str(exc)}
@@ -102,6 +110,7 @@ def discover_listing_urls(search_url: str, *, limit: int = 20) -> List[str]:
     try:
         try:
             from scraper import scrape_idealista_search_urls  # type: ignore
+
             res = scrape_idealista_search_urls(search_url, limit=limit)
             if isinstance(res, dict) and res.get("success"):
                 return list(res.get("urls") or [])[:limit]
@@ -128,6 +137,7 @@ def estimate_listing_count(search_url: str, *, probe_limit: int = 5) -> int:
     try:
         try:
             from scraper import scrape_idealista_search_urls  # type: ignore
+
             res = scrape_idealista_search_urls(search_url, limit=probe_limit)
             if isinstance(res, dict) and res.get("success"):
                 urls = list(res.get("urls") or [])

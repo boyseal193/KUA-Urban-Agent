@@ -108,8 +108,15 @@ create table if not exists public.laundry_settings (
     updated_at    timestamptz not null default now()
 );
 
-create unique index if not exists idx_laundry_settings_operator
-    on public.laundry_settings (operator_id);
+-- Force PostgREST to reload its schema cache and grant service-role access.
+grant usage on schema public to postgres, anon, authenticated, service_role;
+grant select, insert, update, delete on public.laundry_properties to service_role;
+grant select, insert, update, delete on public.laundry_analyses to service_role;
+grant select, insert, update, delete on public.laundry_settings to service_role;
+alter table public.laundry_properties disable row level security;
+alter table public.laundry_analyses disable row level security;
+alter table public.laundry_settings disable row level security;
+notify pgrst, 'reload schema';
 
 
 -- ----------------------------------------------------------------------------
@@ -125,3 +132,14 @@ alter table public.scan_jobs add column if not exists summary jsonb;
 --  search_url, filters, payload, listing_limit, generate_excel, request_id,
 --  started_at, finished_at, worker_id, progress_pct, listings_total,
 --  listings_processed, error_message, created_at, heartbeat_at.)
+
+-- ----------------------------------------------------------------------------
+-- scan_listing_results — denormalized listing fields for laundry UI cards
+-- ----------------------------------------------------------------------------
+alter table public.scan_listing_results add column if not exists address text;
+alter table public.scan_listing_results add column if not exists city text;
+alter table public.scan_listing_results add column if not exists neighbourhood text;
+alter table public.scan_listing_results add column if not exists title text;
+alter table public.scan_listing_results add column if not exists description text;
+
+notify pgrst, 'reload schema';
