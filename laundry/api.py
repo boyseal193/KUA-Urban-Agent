@@ -335,39 +335,10 @@ def list_scans(limit: int = 50, status: Optional[str] = None) -> Dict[str, Any]:
 
 @router.get("/scans/{job_id}")
 def get_scan(job_id: str) -> Dict[str, Any]:
-    job = store.get_scan_job(job_id)
-    if not job: raise HTTPException(status_code=404, detail="job_not_found")
-    steps = store.list_pipeline_steps(job_id)
-    payload = job.get("payload") or {}
-    if isinstance(payload, str):
-        try:
-            import json
-            payload = json.loads(payload)
-        except Exception:
-            payload = {}
-    search_diagnostics = None
-    if isinstance(payload, dict):
-        search_diagnostics = payload.get("search_diagnostics")
-        discover_step = next(
-            (s for s in steps if s.get("step_key") == "laundry_discover_urls"), None
-        )
-        if discover_step:
-            out = (
-                discover_step.get("output_data")
-                or discover_step.get("result")
-                or discover_step.get("output")
-                or discover_step.get("payload")
-                or {}
-            )
-            if isinstance(out, dict) and out.get("search_diagnostics"):
-                search_diagnostics = out["search_diagnostics"]
-    return {
-        "success": True,
-        "job": job,
-        "steps": steps,
-        "properties": job.get("properties", []),
-        "search_diagnostics": search_diagnostics,
-    }
+    response = store.build_scan_response(job_id)
+    if not response:
+        raise HTTPException(status_code=404, detail="job_not_found")
+    return response
 
 
 @router.post("/scans/{job_id}/resume")
@@ -451,8 +422,14 @@ def list_properties_endpoint(deal_status: Optional[str] = None, limit: int = 100
 @router.get("/properties/{property_id}")
 def get_property_endpoint(property_id: str) -> Dict[str, Any]:
     prop = store.get_property(property_id)
-    if not prop: raise HTTPException(status_code=404, detail="property_not_found")
-    return {"success": True, "property": prop}
+    if not prop:
+        raise HTTPException(status_code=404, detail="property_not_found")
+    latest = prop.pop("latest_analysis", None)
+    return {
+        "success": True,
+        "property": prop,
+        "latest_analysis": latest,
+    }
 
 
 @router.delete("/properties/{property_id}")
@@ -471,22 +448,26 @@ def restore_property_endpoint(property_id: str) -> Dict[str, Any]:
 
 @router.get("/deals/top")
 def deals_top(limit: int = 20) -> Dict[str, Any]:
-    return {"deals": store.list_properties(limit=limit)}
+    rows = store.list_properties(limit=limit)
+    return {"success": True, "deals": rows, "top_deals": rows}
 
 
 @router.get("/deals/manual-review")
 def deals_manual(limit: int = 50) -> Dict[str, Any]:
-    return {"deals": store.list_properties(deal_status="manual_review", limit=limit)}
+    rows = store.list_properties(deal_status="manual_review", limit=limit)
+    return {"success": True, "deals": rows, "manual_review_deals": rows}
 
 
 @router.get("/deals/approved")
 def deals_approved(limit: int = 50) -> Dict[str, Any]:
-    return {"deals": store.list_properties(deal_status="approved_candidate", limit=limit)}
+    rows = store.list_properties(deal_status="approved_candidate", limit=limit)
+    return {"success": True, "deals": rows, "approved_candidates": rows}
 
 
 @router.get("/deals/rejected")
 def deals_rejected(limit: int = 50) -> Dict[str, Any]:
-    return {"deals": store.list_properties(deal_status="rejected", limit=limit)}
+    rows = store.list_properties(deal_status="rejected", limit=limit)
+    return {"success": True, "deals": rows, "rejected_deals": rows}
 
 
 # ---------------------------------------------------------------------------

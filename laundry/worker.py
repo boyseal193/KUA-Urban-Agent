@@ -64,13 +64,30 @@ def _detect_mode(*, listing_url: Optional[str], raw_text: Optional[str],
 def _classify_result(res: Dict[str, Any]) -> str:
     """Bucket a pipeline analyse_url/analyse_listing result into one of:
     'approved', 'manual_review', 'rejected', 'skipped', 'failed'."""
-    if not isinstance(res, dict): return "failed"
-    if not res.get("success"): return "failed"
-    if res.get("skipped"): return "skipped"
+    if not isinstance(res, dict):
+        return "failed"
+    if not res.get("success"):
+        return "failed"
+    if res.get("skipped"):
+        return "skipped"
+    if res.get("persist_warning") or not res.get("property_id"):
+        return "failed"
     ds = (res.get("scoring") or {}).get("deal_status")
-    if ds == "approved_candidate": return "approved"
-    if ds == "manual_review": return "manual_review"
+    if ds == "approved_candidate":
+        return "approved"
+    if ds == "manual_review":
+        return "manual_review"
     return "rejected"
+
+
+def _listing_row_status(res: Dict[str, Any]) -> str:
+    if not isinstance(res, dict):
+        return "failed"
+    if res.get("skipped"):
+        return "skipped"
+    if res.get("success") and res.get("property_id") and not res.get("persist_warning"):
+        return "success"
+    return "failed"
 
 
 # ---------------------------------------------------------------------------
@@ -276,19 +293,28 @@ def run_laundry_scan(job_id: str) -> Dict[str, Any]:
                         "traceback": _tb.format_exc(limit=8)}
 
             bucket = _classify_result(res)
-            counters[bucket] = counters.get(bucket, 0) + 1
+            if bucket == "failed" and res.get("success") and not res.get("skipped"):
+                counters["failed"] = counters.get("failed", 0) + 1
+            else:
+                counters[bucket] = counters.get(bucket, 0) + 1
             counters["done"] = idx + 1
             results.append(res)
 
-            laundry_store.record_listing_result(
+            row_status = _listing_row_status(res)
+            row_error = (
+                res.get("error")
+                or res.get("reason")
+                or res.get("persist_warning")
+                or ("persist_failed_no_property_id" if row_status == "failed" else None)
+            )
+            saved = laundry_store.record_listing_result(
                 job_id, idx,
                 listing_url=url,
-                status=("success" if res.get("success") and not res.get("skipped") else
-                        "skipped" if res.get("skipped") else "failed"),
+                status=row_status,
                 property_id=res.get("property_id"),
                 deal_status=(res.get("scoring") or {}).get("deal_status"),
                 score=(res.get("scoring") or {}).get("score"),
-                error_message=res.get("error") or res.get("reason"),
+                error_message=row_error,
                 result={
                     "verdict": (res.get("scoring") or {}).get("verdict"),
                     "classification": (res.get("scoring") or {}).get("classification"),
@@ -297,13 +323,24 @@ def run_laundry_scan(job_id: str) -> Dict[str, Any]:
                     "floor_area_m2": (res.get("economics") or {}).get("floor_area_m2"),
                     "ebitda_eur": (res.get("economics") or {}).get("ebitda_eur"),
                     "payback_years": (res.get("economics") or {}).get("payback_years"),
+                    "analysis_id": res.get("analysis_id"),
                 },
             )
+            if res.get("property_id"):
+                log.info(
+                    "laundry.scan saved property_id=%s listing_url=%s analysis_id=%s persisted_row=%s",
+                    res.get("property_id"), url, res.get("analysis_id"), saved,
+                )
+            elif not res.get("skipped"):
+                log.warning(
+                    "laundry.scan persist missing property_id job_id=%s url=%s warning=%s",
+                    job_id, url, res.get("persist_warning") or res.get("error"),
+                )
 
             step_ms = int((time.monotonic() - step_started) * 1000)
             listing_status = (
-                laundry_store.STEP_SUCCESS if res.get("success") and not res.get("skipped")
-                else laundry_store.STEP_SKIPPED if res.get("skipped")
+                laundry_store.STEP_SUCCESS if row_status == "success"
+                else laundry_store.STEP_SKIPPED if row_status == "skipped"
                 else laundry_store.STEP_FAILED
             )
             laundry_store.finish_step(
@@ -342,8 +379,24 @@ def run_laundry_scan(job_id: str) -> Dict[str, Any]:
         # STEP 4 — summarize
         # ----------------------------------------------------------------
         laundry_store.start_step(job_id, laundry_store.JOB_STEP_SUMMARY)
+        listing_rows = laundry_store.get_listing_results(job_id)
+        persisted_count = len([
+            r for r in listing_rows
+            if r.get("status") == "success" and r.get("property_id")
+        ])
         scored_anything = (counters["approved"] + counters["manual_review"] + counters["rejected"]) > 0
-        final_status = JOB_SUCCESS if scored_anything else JOB_NO_RESULTS
+        if counters["done"] > 0 and persisted_count == 0 and counters.get("skipped", 0) < counters["done"]:
+            final_status = JOB_FAILED
+            finish_error = (
+                "Scan processed listings but no property rows were persisted. "
+                "Check Supabase connectivity and laundry/schema.sql migrations."
+            )
+        elif scored_anything:
+            final_status = JOB_SUCCESS
+            finish_error = None
+        else:
+            final_status = JOB_NO_RESULTS
+            finish_error = "Worker processed listings but every one was skipped or failed to score."
 
         summary = {
             "approved_count": counters["approved"],
@@ -352,6 +405,8 @@ def run_laundry_scan(job_id: str) -> Dict[str, Any]:
             "failed_count": counters["failed"],
             "skipped_count": counters["skipped"],
             "total": counters["total"],
+            "persisted_count": persisted_count,
+            "listing_result_count": len(listing_rows),
             "elapsed_sec": round(time.monotonic() - started, 2),
         }
         laundry_store.finish_step(
@@ -363,8 +418,8 @@ def run_laundry_scan(job_id: str) -> Dict[str, Any]:
             status=final_status,
             progress_pct=100,
             finished_at=job_store._now(),
-            error_message=(None if scored_anything else
-                            "Worker processed listings but every one was skipped or failed to score."),
+            summary=summary,
+            error_message=finish_error,
         )
         log.info(
             "laundry.scan finished job_id=%s status=%s approved=%s review=%s rejected=%s failed=%s",

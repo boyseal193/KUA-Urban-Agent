@@ -47,4 +47,7 @@ export type {
   LaundrySearchUrlResult,
   LaundrySearchDiagnostics,
   LaundrySearchProviderInfo,
+  LaundryScanListingResult,
+  LaundryScanSummary,
+  LaundryScanMemoRef,
 } from "./laundry";

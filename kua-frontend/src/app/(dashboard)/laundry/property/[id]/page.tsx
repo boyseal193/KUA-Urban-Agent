@@ -62,6 +62,9 @@ export default function LaundryPropertyPage({
   const e = a?.economics;
   const dd = a?.due_diligence;
   const s = a?.score;
+  const confidenceBand =
+    p?.confidence_band ??
+    (typeof s?.confidence === "object" ? s?.confidence?.band : undefined);
 
   if (!p) {
     return (
@@ -102,7 +105,7 @@ export default function LaundryPropertyPage({
               <div className="space-y-1">
                 <LaundryStatusBadge status={p.deal_status} />
                 <div className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-                  Confidence {p.confidence_band ?? "—"}
+                  Confidence {confidenceBand ?? "—"}
                 </div>
                 <div className="text-foreground">{p.verdict ?? "—"}</div>
               </div>

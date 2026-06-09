@@ -2,10 +2,12 @@
 
 import { use } from "react";
 import Link from "next/link";
-import { ArrowLeft, AlertCircle } from "lucide-react";
+import { ArrowLeft, AlertCircle, AlertTriangle } from "lucide-react";
 
 import { PageHeader } from "@/components/common/page-header";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { EmptyState } from "@/components/common/empty-state";
+import { LaundryScanListingCard } from "@/components/laundry/laundry-scan-listing-card";
 import { useLaundryScan } from "@/hooks/use-laundry";
 import type { LaundrySearchDiagnostics } from "@/lib/api";
 
@@ -44,15 +46,21 @@ export default function LaundryScanDetailPage({
 
   const job = q.data?.job;
   const steps = q.data?.steps ?? [];
+  const properties = q.data?.properties ?? [];
+  const listings = q.data?.listings ?? [];
+  const summary = q.data?.summary;
   const searchDiagnostics = q.data?.search_diagnostics ?? null;
 
-  // Show job-level steps first, then per-listing steps. The backend already
-  // orders by (listing_index, step_order); we just preserve that.
   const jobSteps = steps.filter((s) => (s.listing_index ?? -1) < 0);
   const listingSteps = steps.filter((s) => (s.listing_index ?? -1) >= 0);
 
   const isNoResults = job?.status === "no_results";
   const isFailed = job?.status === "failed";
+  const showMismatchWarning = Boolean(
+    summary?.summary_property_mismatch ||
+      summary?.results_missing ||
+      ((job?.listings_done ?? 0) > 0 && properties.length === 0),
+  );
 
   return (
     <div className="space-y-6">
@@ -73,6 +81,24 @@ export default function LaundryScanDetailPage({
           </Link>
         }
       />
+
+      {showMismatchWarning && (
+        <Card>
+          <CardContent className="flex gap-3 p-4">
+            <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0 text-amber-300" />
+            <div className="space-y-1 text-xs">
+              <p className="font-mono uppercase tracking-widest text-amber-200">
+                Scan summary reports listings but result rows are missing
+              </p>
+              <p className="text-muted-foreground">
+                Job counters show {job?.listings_done ?? 0}/{job?.listings_total ?? 0} processed, but{" "}
+                {properties.length} property row(s) and {listings.length} listing result row(s) were returned.
+                Check worker logs and Supabase persistence.
+              </p>
+            </div>
+          </CardContent>
+        </Card>
+      )}
 
       {(isNoResults || isFailed) && job?.error_message && (
         <Card>
@@ -108,6 +134,38 @@ export default function LaundryScanDetailPage({
         </Card>
       )}
 
+      <Card>
+        <CardHeader>
+          <CardTitle>
+            Results · {properties.length} listing{properties.length === 1 ? "" : "s"}
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          {q.isLoading ? (
+            <div className="space-y-3">
+              {[0, 1].map((i) => (
+                <div key={i} className="h-40 animate-pulse rounded-md border border-border/60 bg-card/40" />
+              ))}
+            </div>
+          ) : properties.length === 0 ? (
+            <EmptyState
+              title="No listing results"
+              description={
+                listings.length > 0
+                  ? "Listing telemetry exists but no property rows were persisted for this scan."
+                  : "This scan has not produced any scored properties yet."
+              }
+            />
+          ) : (
+            <div className="grid gap-4 lg:grid-cols-2">
+              {properties.map((property, index) => (
+                <LaundryScanListingCard key={property.id} property={property} index={index} />
+              ))}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
       <div className="grid gap-4 lg:grid-cols-3">
         <Card>
           <CardHeader>
@@ -120,16 +178,17 @@ export default function LaundryScanDetailPage({
             <Row k="Acquisition" v={job?.acquisition_type ?? "—"} />
             <Row k="Search URL" v={job?.search_url ?? "—"} mono />
             <Row k="Limit" v={job?.listing_limit?.toString() ?? "—"} />
-            <Row k="Approved" v={String(job?.approved_count ?? 0)} />
-            <Row k="Review" v={String(job?.manual_review_count ?? 0)} />
-            <Row k="Rejected" v={String(job?.rejected_count ?? 0)} />
-            <Row k="Failed" v={String(job?.listings_failed ?? 0)} />
+            <Row k="Approved" v={String(summary?.approved_count ?? job?.approved_count ?? 0)} />
+            <Row k="Review" v={String(summary?.manual_review_count ?? job?.manual_review_count ?? 0)} />
+            <Row k="Rejected" v={String(summary?.rejected_count ?? job?.rejected_count ?? 0)} />
+            <Row k="Failed" v={String(summary?.listings_failed ?? job?.listings_failed ?? 0)} />
+            <Row k="Persisted" v={String(summary?.persisted_count ?? properties.length)} />
           </CardContent>
         </Card>
 
         <Card className="lg:col-span-2">
           <CardHeader>
-            <CardTitle>Pipeline</CardTitle>
+            <CardTitle>Worker pipeline</CardTitle>
           </CardHeader>
           <CardContent>
             <div className="max-h-[640px] overflow-y-auto">
@@ -143,30 +202,29 @@ export default function LaundryScanDetailPage({
                   </tr>
                 </thead>
                 <tbody>
-                  {jobSteps.map((s) => {
-                    const c = STATUS_COLOR[s.status] ?? "#94A3B8";
-                    return (
-                      <tr key={s.id} className="border-b border-border/40">
-                        <td className="py-2 pr-2 font-mono text-[10px]">{s.step_order}</td>
-                        <td className="py-2 pr-2">{s.step_key.replace(/^laundry_/, "")}</td>
-                        <td className="py-2 pr-2">
-                          <StatusBadge status={s.status} />
-                        </td>
-                        <td className="py-2 pr-2 truncate max-w-[420px] font-mono text-[10px] text-muted-foreground">
-                          {s.error_message ?? s.listing_url ?? "—"}
-                        </td>
-                      </tr>
-                    );
-                  })}
+                  {jobSteps.map((s) => (
+                    <tr key={s.id} className="border-b border-border/40">
+                      <td className="py-2 pr-2 font-mono text-[10px]">{s.step_order}</td>
+                      <td className="py-2 pr-2">{s.step_key.replace(/^laundry_/, "")}</td>
+                      <td className="py-2 pr-2">
+                        <StatusBadge status={s.status} />
+                      </td>
+                      <td className="max-w-[420px] truncate py-2 pr-2 font-mono text-[10px] text-muted-foreground">
+                        {s.error_message ?? s.listing_url ?? "—"}
+                      </td>
+                    </tr>
+                  ))}
                   {listingSteps.length > 0 && (
                     <tr>
-                      <td colSpan={4} className="pt-3 pb-1 font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+                      <td
+                        colSpan={4}
+                        className="pb-1 pt-3 font-mono text-[10px] uppercase tracking-widest text-muted-foreground"
+                      >
                         Per-listing
                       </td>
                     </tr>
                   )}
                   {listingSteps.map((s) => {
-                    const c = STATUS_COLOR[s.status] ?? "#94A3B8";
                     const label = s.step_key === LISTING_STEP_KEY ? "process listing" : s.step_key;
                     return (
                       <tr key={s.id} className="border-b border-border/40">
@@ -175,7 +233,7 @@ export default function LaundryScanDetailPage({
                         <td className="py-2 pr-2">
                           <StatusBadge status={s.status} />
                         </td>
-                        <td className="py-2 pr-2 truncate max-w-[420px] font-mono text-[10px] text-muted-foreground">
+                        <td className="max-w-[420px] truncate py-2 pr-2 font-mono text-[10px] text-muted-foreground">
                           {s.error_message ?? s.listing_url ?? "—"}
                         </td>
                       </tr>
@@ -211,11 +269,13 @@ function StatusBadge({ status }: { status: string }) {
 function Row({ k, v, mono }: { k: string; v: string; mono?: boolean }) {
   return (
     <div className="flex items-center justify-between gap-3">
-      <span className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-        {k}
-      </span>
+      <span className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">{k}</span>
       <span
-        className={mono ? "max-w-[260px] truncate font-mono text-[11px] text-foreground" : "text-foreground"}
+        className={
+          mono
+            ? "max-w-[260px] truncate font-mono text-[11px] text-foreground"
+            : "text-foreground"
+        }
         title={mono ? v : undefined}
       >
         {v}
@@ -224,11 +284,7 @@ function Row({ k, v, mono }: { k: string; v: string; mono?: boolean }) {
   );
 }
 
-function SearchDiagnosticsDetail({
-  diagnostics,
-}: {
-  diagnostics: LaundrySearchDiagnostics;
-}) {
+function SearchDiagnosticsDetail({ diagnostics }: { diagnostics: LaundrySearchDiagnostics }) {
   const applied = Object.entries(diagnostics.applied_filters ?? {});
   const removed = diagnostics.removed_filters ?? [];
 
@@ -257,9 +313,9 @@ function SearchDiagnosticsDetail({
             Applied filters
           </p>
           <ul className="mt-1 list-disc pl-4 text-muted-foreground">
-            {applied.map(([k, v]) => (
-              <li key={k}>
-                {k}: {v != null && v !== "" ? String(v) : "—"}
+            {applied.map(([key, val]) => (
+              <li key={key}>
+                {key}: {val != null && val !== "" ? String(val) : "—"}
               </li>
             ))}
           </ul>

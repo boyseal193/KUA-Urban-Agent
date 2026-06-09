@@ -16,15 +16,19 @@ export default function LaundryPipelinePage() {
   const review = useLaundryManualReview(50);
   const rejected = useLaundryRejected(50);
 
+  const failed = (rejected.data ?? []).filter(
+    (d) => d.deal_status === "rejected" && (d.score ?? 0) < 40,
+  );
+
   return (
     <div className="space-y-6">
       <PageHeader
         eyebrow="LAUNDRY · PIPELINE"
         title="Acquisition Pipeline"
-        subtitle="Three-column view of every laundromat opportunity moving through underwriting."
+        subtitle="Laundry-specific deal pipeline — approved, manual review, rejected and low-score failures."
       />
 
-      <div className="grid gap-4 lg:grid-cols-3">
+      <div className="grid gap-4 lg:grid-cols-2 xl:grid-cols-4">
         <Card>
           <CardHeader>
             <CardTitle>
@@ -69,6 +73,22 @@ export default function LaundryPipelinePage() {
               deals={(rejected.data ?? []).slice(0, 25)}
               loading={rejected.isLoading}
               emptyTitle="Nothing rejected yet"
+            />
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>
+              <Columns3 className="mr-2 inline h-3.5 w-3.5 text-amber-300" />
+              Failed / Low score
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <LaundryDealList
+              deals={failed.slice(0, 25)}
+              loading={rejected.isLoading}
+              emptyTitle="No failed deals"
             />
           </CardContent>
         </Card>

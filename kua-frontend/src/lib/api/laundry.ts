@@ -63,6 +63,15 @@ export interface LaundryProperty {
   created_at?: string | null;
   deleted_at?: string | null;
   ceiling_height?: number | null;
+  job_id?: string | null;
+  ebitda_eur?: number | null;
+  payback_years?: number | null;
+  in_preferred_market?: boolean | null;
+  matched_neighbourhood?: string | null;
+  analysis_id?: string | null;
+  has_memo?: boolean;
+  memo_preview?: string | null;
+  risk_flags?: string[];
 }
 
 export interface LaundryEconomics {
@@ -198,6 +207,49 @@ export interface LaundryKpis {
   avg_score: number | null;
 }
 
+export interface LaundryScanListingResult {
+  id?: string;
+  job_id: string;
+  listing_index: number;
+  listing_url?: string | null;
+  status: string;
+  property_id?: string | null;
+  deal_status?: LaundryDealStatus | null;
+  score?: number | null;
+  error_message?: string | null;
+  result?: Record<string, unknown> | null;
+  created_at?: string | null;
+}
+
+export interface LaundryScanSummary {
+  scanned_count?: number;
+  listings_total?: number;
+  listings_done?: number;
+  listings_failed?: number;
+  approved_count?: number;
+  manual_review_count?: number;
+  rejected_count?: number;
+  skipped_count?: number;
+  persisted_count?: number;
+  property_count?: number;
+  listing_result_count?: number;
+  results_missing?: boolean;
+  summary_property_mismatch?: boolean;
+  approved_candidates?: LaundryProperty[];
+  manual_review_deals?: LaundryProperty[];
+  rejected_deals?: LaundryProperty[];
+}
+
+export interface LaundryScanMemoRef {
+  property_id: string;
+  analysis_id?: string | null;
+  address?: string | null;
+  listing_url?: string | null;
+  deal_status?: LaundryDealStatus | null;
+  score?: number | null;
+  memo_preview?: string | null;
+}
+
 export interface LaundryScanJob {
   id: string;
   status: string;
@@ -239,6 +291,10 @@ export interface LaundryScanResponse {
   success: boolean;
   job: LaundryScanJob;
   steps: LaundryScanStep[];
+  listings: LaundryScanListingResult[];
+  properties: LaundryProperty[];
+  memos: LaundryScanMemoRef[];
+  summary: LaundryScanSummary;
   search_diagnostics?: LaundrySearchDiagnostics | null;
 }
 
@@ -388,19 +444,25 @@ export const laundryApi = {
   kpis: () => api<{ success: boolean; kpis: LaundryKpis }>(`/laundry/kpis`),
 
   top: (limit = 25) =>
-    api<{ top_deals: LaundryProperty[] }>(`/laundry/deals/top`, { query: { limit } }),
+    api<{ success?: boolean; top_deals?: LaundryProperty[]; deals?: LaundryProperty[] }>(
+      `/laundry/deals/top`,
+      { query: { limit } },
+    ),
   approved: (limit = 50) =>
-    api<{ approved_candidates: LaundryProperty[] }>(`/laundry/deals/approved`, {
-      query: { limit },
-    }),
+    api<{ success?: boolean; approved_candidates?: LaundryProperty[]; deals?: LaundryProperty[] }>(
+      `/laundry/deals/approved`,
+      { query: { limit } },
+    ),
   manualReview: (limit = 50) =>
-    api<{ manual_review_deals: LaundryProperty[] }>(`/laundry/deals/manual-review`, {
-      query: { limit },
-    }),
+    api<{ success?: boolean; manual_review_deals?: LaundryProperty[]; deals?: LaundryProperty[] }>(
+      `/laundry/deals/manual-review`,
+      { query: { limit } },
+    ),
   rejected: (limit = 50) =>
-    api<{ rejected_deals: LaundryProperty[] }>(`/laundry/deals/rejected`, {
-      query: { limit },
-    }),
+    api<{ success?: boolean; rejected_deals?: LaundryProperty[]; deals?: LaundryProperty[] }>(
+      `/laundry/deals/rejected`,
+      { query: { limit } },
+    ),
   all: (limit = 100, offset = 0) =>
     api<{ deals: LaundryProperty[] }>(`/laundry/deals/all`, {
       query: { limit, offset },
@@ -489,13 +551,7 @@ export const laundryApi = {
 
   listScans: (limit = 50) =>
     api<{ scans: LaundryScanJob[] }>(`/laundry/scans`, { query: { limit } }),
-  getScan: (id: string) =>
-    api<{
-      success: boolean;
-      job: LaundryScanJob;
-      steps: LaundryScanStep[];
-      search_diagnostics?: LaundrySearchDiagnostics | null;
-    }>(`/laundry/scans/${id}`),
+  getScan: (id: string) => api<LaundryScanResponse>(`/laundry/scans/${id}`),
   resumeScan: (id: string) =>
     api<{ success: boolean; job_id: string; status: string }>(
       `/laundry/scans/${id}/resume`,

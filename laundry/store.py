@@ -181,30 +181,109 @@ def insert_analysis(*, property_id: str, extracted, economics, scoring,
 # ---------------------------------------------------------------------------
 def list_properties(*, deal_status: Optional[str] = None, limit: int = 100,
                      include_deleted: bool = False) -> List[Dict[str, Any]]:
-    if supabase is None: return []
+    if supabase is None:
+        return []
     try:
         q = supabase.table("laundry_properties").select("*").order("score", desc=True).limit(limit)
-        if deal_status: q = q.eq("deal_status", deal_status)
-        if not include_deleted: q = q.is_("deleted_at", "null")
+        if deal_status:
+            q = q.eq("deal_status", deal_status)
+        if not include_deleted:
+            q = q.is_("deleted_at", "null")
         res = q.execute()
-        return res.data or []
+        return [normalize_property_row(r) for r in (res.data or []) if r]
     except Exception as exc:
         log.warning("list_properties failed: %s", exc)
         return []
 
 
+def normalize_property_row(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Map DB columns to the frontend LaundryProperty contract."""
+    if not row:
+        return None
+    out = dict(row)
+    if out.get("lat") is not None:
+        out["latitude"] = out["lat"]
+    if out.get("lng") is not None:
+        out["longitude"] = out["lng"]
+    out.setdefault("status", out.get("deal_status") or "unknown")
+    scoring = out.pop("scoring", None) if isinstance(out.get("scoring"), dict) else None
+    if scoring and not out.get("confidence_band"):
+        conf = scoring.get("confidence") or {}
+        out["confidence_band"] = conf.get("band")
+    return out
+
+
+def normalize_analysis_row(ana: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Map laundry_analyses row to the frontend LaundryAnalysis contract."""
+    if not ana:
+        return None
+    scoring = ana.get("scoring") or {}
+    return {
+        "id": ana.get("id"),
+        "property_id": ana.get("property_id"),
+        "input": ana.get("extracted") or {},
+        "location": ana.get("location") or {},
+        "economics": ana.get("economics") or {},
+        "score": scoring,
+        "due_diligence": ana.get("due_diligence") or {},
+        "assumptions_used": {"version": ana.get("assumptions_version")},
+        "verdict": scoring.get("verdict"),
+        "classification": scoring.get("classification"),
+        "ic_memo": ana.get("memo_md"),
+        "created_at": ana.get("created_at"),
+    }
+
+
+def normalize_job_row(job: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Lift scan-form fields from payload JSON onto the job object for the UI."""
+    if not job:
+        return None
+    out = dict(job)
+    payload = out.get("payload") or {}
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    filters = out.get("filters") or payload.get("filters") or {}
+    if isinstance(filters, str):
+        try:
+            filters = json.loads(filters)
+        except Exception:
+            filters = {}
+    out["search_type"] = (
+        out.get("search_type")
+        or payload.get("search_type")
+        or (filters.get("search_type") if isinstance(filters, dict) else None)
+    )
+    out["property_type"] = out.get("property_type") or (
+        filters.get("property_type") if isinstance(filters, dict) else None
+    )
+    out["acquisition_type"] = out.get("acquisition_type") or (
+        filters.get("acquisition_type") if isinstance(filters, dict) else None
+    )
+    if out.get("listing_limit") is None:
+        out["listing_limit"] = payload.get("listing_limit") or out.get("listing_limit")
+    return out
+
+
 def get_property(property_id: str) -> Optional[Dict[str, Any]]:
-    if supabase is None or not property_id: return None
+    if supabase is None or not property_id:
+        return None
     try:
         res = (
             supabase.table("laundry_properties")
             .select("*")
             .eq("id", property_id)
+            .is_("deleted_at", "null")
             .limit(1)
             .execute()
         )
-        if not res.data: return None
-        prop = res.data[0]
+        if not res.data:
+            return None
+        prop = normalize_property_row(res.data[0])
         ana = (
             supabase.table("laundry_analyses")
             .select("*")
@@ -213,7 +292,8 @@ def get_property(property_id: str) -> Optional[Dict[str, Any]]:
             .limit(1)
             .execute()
         )
-        prop["latest_analysis"] = (ana.data or [None])[0]
+        if prop is not None:
+            prop["latest_analysis"] = normalize_analysis_row((ana.data or [None])[0])
         return prop
     except Exception as exc:
         log.warning("get_property failed: %s", exc)
@@ -296,31 +376,188 @@ def create_scan_job(*, search_url: str, payload: Dict[str, Any],
 
 
 def get_scan_job(job_id: str) -> Optional[Dict[str, Any]]:
-    if supabase is None or not job_id: return None
+    if supabase is None or not job_id:
+        return None
     try:
         res = supabase.table("scan_jobs").select("*").eq("id", job_id).limit(1).execute()
-        if not res.data: return None
-        job = res.data[0]
-        try:
-            props = (
-                supabase.table("laundry_properties")
-                .select("id, address, city, neighbourhood, score, verdict, classification, "
-                         "deal_status, floor_area_m2, ebitda_eur, payback_years, listing_url, "
-                         "in_preferred_market, matched_neighbourhood, created_at")
-                .eq("job_id", job_id)
-                .is_("deleted_at", "null")
-                .order("score", desc=True)
-                .limit(200)
-                .execute()
-            )
-            job["properties"] = props.data or []
-        except Exception as exc:
-            log.warning("get_scan_job: properties lookup failed: %s", exc)
-            job["properties"] = []
+        if not res.data:
+            return None
+        job = normalize_job_row(res.data[0])
+        job["properties"] = list_job_properties(job_id)
         return job
     except Exception as exc:
         log.warning("get_scan_job failed: %s", exc)
         return None
+
+
+def get_listing_results(job_id: str) -> List[Dict[str, Any]]:
+    """Return scan_listing_results rows for a laundry job."""
+    if supabase is None or not job_id:
+        return []
+    try:
+        res = (
+            supabase.table("scan_listing_results")
+            .select("*")
+            .eq("job_id", job_id)
+            .is_("deleted_at", "null")
+            .order("listing_index")
+            .execute()
+        )
+        return res.data or []
+    except Exception as exc:
+        log.warning("get_listing_results failed: %s", exc)
+        return []
+
+
+def list_job_properties(job_id: str) -> List[Dict[str, Any]]:
+    """Full property rows for a scan job, enriched with latest analysis snippets."""
+    if supabase is None or not job_id:
+        return []
+    try:
+        res = (
+            supabase.table("laundry_properties")
+            .select("*")
+            .eq("job_id", job_id)
+            .is_("deleted_at", "null")
+            .order("score", desc=True)
+            .limit(200)
+            .execute()
+        )
+        rows = res.data or []
+        if not rows:
+            return []
+        prop_ids = [r["id"] for r in rows if r.get("id")]
+        analyses_by_prop: Dict[str, Dict[str, Any]] = {}
+        if prop_ids:
+            ana_res = (
+                supabase.table("laundry_analyses")
+                .select("id, property_id, memo_md, scoring, due_diligence, economics, created_at")
+                .in_("property_id", prop_ids)
+                .order("created_at", desc=True)
+                .execute()
+            )
+            for ana in ana_res.data or []:
+                pid = ana.get("property_id")
+                if pid and pid not in analyses_by_prop:
+                    analyses_by_prop[pid] = ana
+        enriched: List[Dict[str, Any]] = []
+        for row in rows:
+            prop = normalize_property_row(row)
+            if not prop:
+                continue
+            ana = analyses_by_prop.get(prop["id"])
+            if ana:
+                scoring = ana.get("scoring") or {}
+                dd = ana.get("due_diligence") or {}
+                prop["analysis_id"] = ana.get("id")
+                prop["memo_preview"] = (ana.get("memo_md") or "")[:280]
+                prop["has_memo"] = bool(ana.get("memo_md"))
+                prop["risk_flags"] = dd.get("red_flags") or dd.get("risks") or []
+                prop["ebitda_eur"] = prop.get("ebitda_eur") or (ana.get("economics") or {}).get("ebitda_eur")
+            enriched.append(prop)
+        return enriched
+    except Exception as exc:
+        log.warning("list_job_properties failed: %s", exc)
+        return []
+
+
+def get_job_memos(job_id: str) -> List[Dict[str, Any]]:
+    """Memo references for every property produced by a scan job."""
+    props = list_job_properties(job_id)
+    memos: List[Dict[str, Any]] = []
+    for prop in props:
+        if not prop.get("has_memo"):
+            continue
+        memos.append({
+            "property_id": prop.get("id"),
+            "analysis_id": prop.get("analysis_id"),
+            "address": prop.get("address"),
+            "listing_url": prop.get("listing_url"),
+            "deal_status": prop.get("deal_status"),
+            "score": prop.get("score"),
+            "memo_preview": prop.get("memo_preview"),
+        })
+    return memos
+
+
+def build_scan_summary(
+    job: Dict[str, Any],
+    listings: List[Dict[str, Any]],
+    properties: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Aggregate scan counters + deal buckets for the frontend."""
+    successful = [r for r in listings if r.get("status") == "success" and r.get("property_id")]
+    failed_rows = [r for r in listings if r.get("status") == "failed"]
+    skipped_rows = [r for r in listings if r.get("status") == "skipped"]
+    approved = [p for p in properties if p.get("deal_status") == "approved_candidate"]
+    manual = [p for p in properties if p.get("deal_status") == "manual_review"]
+    rejected = [p for p in properties if p.get("deal_status") == "rejected"]
+    return {
+        "scanned_count": job.get("listings_done") or len(listings),
+        "listings_total": job.get("listings_total") or len(listings),
+        "listings_done": job.get("listings_done") or 0,
+        "listings_failed": job.get("listings_failed") or len(failed_rows),
+        "approved_count": job.get("approved_count") or len(approved),
+        "manual_review_count": job.get("manual_review_count") or len(manual),
+        "rejected_count": job.get("rejected_count") or len(rejected),
+        "skipped_count": len(skipped_rows),
+        "persisted_count": len(successful),
+        "property_count": len(properties),
+        "listing_result_count": len(listings),
+        "approved_candidates": approved,
+        "manual_review_deals": manual,
+        "rejected_deals": rejected,
+        "results_missing": (
+            (job.get("listings_done") or 0) > 0
+            and len(listings) == 0
+            and len(properties) == 0
+        ),
+        "summary_property_mismatch": (
+            (job.get("listings_done") or 0) > 0
+            and len(properties) == 0
+        ),
+    }
+
+
+def build_scan_response(job_id: str) -> Optional[Dict[str, Any]]:
+    """Full scan detail payload for GET /laundry/scans/{id}."""
+    job = get_scan_job(job_id)
+    if not job:
+        return None
+    steps = list_pipeline_steps(job_id)
+    listings = get_listing_results(job_id)
+    properties = job.get("properties") or list_job_properties(job_id)
+    memos = get_job_memos(job_id)
+    summary = build_scan_summary(job, listings, properties)
+
+    payload = job.get("payload") or {}
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            payload = {}
+    search_diagnostics = payload.get("search_diagnostics") if isinstance(payload, dict) else None
+    discover_step = next((s for s in steps if s.get("step_key") == JOB_STEP_DISCOVER), None)
+    if discover_step:
+        out = (
+            discover_step.get("output_data")
+            or discover_step.get("result")
+            or discover_step.get("output")
+            or {}
+        )
+        if isinstance(out, dict) and out.get("search_diagnostics"):
+            search_diagnostics = out["search_diagnostics"]
+
+    return {
+        "success": True,
+        "job": job,
+        "steps": steps,
+        "listings": listings,
+        "properties": properties,
+        "memos": memos,
+        "summary": summary,
+        "search_diagnostics": search_diagnostics,
+    }
 
 
 def list_pipeline_steps(job_id: str) -> List[Dict[str, Any]]:
@@ -347,7 +584,8 @@ def list_pipeline_steps(job_id: str) -> List[Dict[str, Any]]:
 
 
 def list_laundry_jobs(*, limit: int = 50, status: Optional[str] = None) -> List[Dict[str, Any]]:
-    if supabase is None: return []
+    if supabase is None:
+        return []
     try:
         q = (
             supabase.table("scan_jobs")
@@ -356,9 +594,10 @@ def list_laundry_jobs(*, limit: int = 50, status: Optional[str] = None) -> List[
             .order("created_at", desc=True)
             .limit(limit)
         )
-        if status: q = q.eq("status", status)
+        if status:
+            q = q.eq("status", status)
         res = q.execute()
-        return res.data or []
+        return [normalize_job_row(j) for j in (res.data or []) if j]
     except Exception as exc:
         log.warning("list_laundry_jobs failed: %s", exc)
         return []
@@ -505,8 +744,10 @@ def record_listing_result(job_id: str, listing_index: int, *,
                            property_id: Optional[str] = None,
                            deal_status: Optional[str] = None,
                            score: Optional[int] = None,
-                           error_message: Optional[str] = None) -> None:
-    if supabase is None: return
+                           error_message: Optional[str] = None) -> bool:
+    if supabase is None:
+        log.warning("record_listing_result skipped — supabase unavailable job_id=%s", job_id)
+        return False
     payload = {
         "job_id": job_id,
         "listing_index": listing_index,
@@ -538,8 +779,17 @@ def record_listing_result(job_id: str, listing_index: int, *,
         else:
             payload["created_at"] = _now()
             supabase.table("scan_listing_results").insert(payload).execute()
+        log.info(
+            "record_listing_result OK job_id=%s idx=%s property_id=%s url=%s status=%s",
+            job_id, listing_index, property_id, listing_url, status,
+        )
+        return True
     except Exception as exc:
-        log.warning("record_listing_result failed: %s", exc)
+        log.warning(
+            "record_listing_result failed job_id=%s idx=%s property_id=%s: %s",
+            job_id, listing_index, property_id, exc,
+        )
+        return False
 
 
 def set_job_counters(job_id: str, *, listings_total: Optional[int] = None,

@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { Activity, RotateCcw } from "lucide-react";
 
 import { PageHeader } from "@/components/common/page-header";
@@ -34,6 +35,7 @@ function statusLabel(status: string): string {
 }
 
 export default function LaundryScansPage() {
+  const router = useRouter();
   const scans = useLaundryScans(50);
 
   return (
@@ -87,13 +89,15 @@ export default function LaundryScansPage() {
                   {(scans.data ?? []).map((s) => {
                     const color = STATUS_COLOR[s.status] ?? "#94A3B8";
                     return (
-                      <tr key={s.id} className="border-b border-border/40 hover:bg-white/[0.02]">
-                        <td className="py-2 pr-2 font-mono text-[10px] text-muted-foreground">
-                          <Link className="text-violet-300 hover:underline" href={`/laundry/scans/${s.id}`}>
-                            {s.id.slice(0, 8)}
-                          </Link>
+                      <tr
+                        key={s.id}
+                        className="cursor-pointer border-b border-border/40 hover:bg-violet-400/[0.04]"
+                        onClick={() => router.push(`/laundry/scans/${s.id}`)}
+                      >
+                        <td className="py-2 pr-2 font-mono text-[10px] text-violet-300">
+                          {s.id.slice(0, 8)}
                         </td>
-                        <td className="py-2 pr-2 uppercase tracking-widest text-[10px] text-muted-foreground">
+                        <td className="py-2 pr-2 text-[10px] uppercase tracking-widest text-muted-foreground">
                           {(s.search_type ?? "").replace(/_/g, " ")}
                         </td>
                         <td className="py-2 pr-2">
@@ -119,7 +123,7 @@ export default function LaundryScansPage() {
                           {Math.round(s.progress_pct)}%
                         </td>
                         <td className="py-2 pr-2 text-muted-foreground">{timeAgo(s.created_at)}</td>
-                        <td className="py-2 pr-2">
+                        <td className="py-2 pr-2" onClick={(e) => e.stopPropagation()}>
                           {RESUMABLE.has(s.status) && (
                             <button
                               className="inline-flex items-center gap-1 rounded border border-border/60 px-2 py-0.5 font-mono text-[10px] uppercase tracking-widest hover:border-violet-400/50 hover:text-violet-300"
