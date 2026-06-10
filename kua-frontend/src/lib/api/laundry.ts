@@ -349,6 +349,28 @@ export interface LaundryLaunchScanPayload {
   scoring_overrides?: Record<string, unknown>;
   filters?: Record<string, unknown>;
   overrides?: Record<string, unknown>;
+  /** When true (default), the autonomous sequencer runs the full workflow without babysitting. */
+  autonomous_mode?: boolean;
+  /** conservative | balanced | aggressive */
+  operation_mode?: LaundryOperationMode;
+  max_attempts?: number;
+  concurrency?: number;
+  /** short | normal | long */
+  timeout_level?: LaundryTimeoutLevel;
+  /** Auto-generate pipeline Excel when the scan completes. */
+  auto_export?: boolean;
+}
+
+export type LaundryOperationMode = "conservative" | "balanced" | "aggressive";
+export type LaundryTimeoutLevel = "short" | "normal" | "long";
+
+export interface LaundryAutonomousSettings {
+  autonomous_mode: boolean;
+  operation_mode: LaundryOperationMode;
+  max_attempts: number;
+  concurrency: number;
+  timeout_level: LaundryTimeoutLevel;
+  auto_export: boolean;
 }
 
 export type LaundrySearchProvider =
@@ -597,6 +619,20 @@ export const laundryApi = {
   listSearchProviders: () =>
     api<{ success: boolean; providers: LaundrySearchProviderInfo[] }>(
       `/laundry/search-providers`,
+    ),
+
+  getAutonomousSettings: () =>
+    api<{
+      success: boolean;
+      settings: LaundryAutonomousSettings;
+      operation_modes: LaundryOperationMode[];
+      timeout_levels: LaundryTimeoutLevel[];
+    }>(`/laundry/settings/autonomous`),
+
+  saveAutonomousSettings: (settings: LaundryAutonomousSettings) =>
+    api<{ success: boolean; settings: LaundryAutonomousSettings }>(
+      `/laundry/settings/autonomous`,
+      { method: "PUT", body: settings },
     ),
 
   listScans: (limit = 50) =>

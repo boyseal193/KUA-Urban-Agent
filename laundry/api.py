@@ -22,6 +22,8 @@ Endpoints (prefix ``/laundry``):
 * ``GET    /laundry/deals/approved``
 * ``GET    /laundry/deals/rejected``
 * ``GET    /laundry/settings/assumptions``
+* ``GET    /laundry/settings/autonomous``     — autonomous sequencer defaults
+* ``PUT    /laundry/settings/autonomous``     — persist autonomous defaults
 * ``POST   /laundry/properties/{id}/exports`` — single-deal Excel workbook
 * ``POST   /laundry/exports/pipeline``        — pipeline Excel export by scope
 * ``POST   /laundry/exports/bulk``            — bulk / selected pipeline export
@@ -84,6 +86,13 @@ class ScanPayload(BaseModel):
     filters: Dict[str, Any] = Field(default_factory=dict)
     overrides: Dict[str, Any] = Field(default_factory=dict)
 
+    autonomous_mode: bool = True
+    operation_mode: str = Field(default="balanced", description="conservative | balanced | aggressive")
+    max_attempts: int = Field(default=3, ge=1, le=10)
+    concurrency: int = Field(default=2, ge=1, le=8)
+    timeout_level: str = Field(default="normal", description="short | normal | long")
+    auto_export: bool = True
+
     class Config:
         extra = "ignore"
 
@@ -131,6 +140,16 @@ class ScanPayload(BaseModel):
             "ground_floor_only": bool(self.ground_floor_only),
             "listing_limit": int(self.listing_limit or 20),
             "extra_filters": dict(self.search_provider_extras or {}),
+        }
+
+    def autonomous_payload(self) -> Dict[str, Any]:
+        return {
+            "enabled": bool(self.autonomous_mode),
+            "operation_mode": (self.operation_mode or "balanced").lower(),
+            "max_attempts": int(self.max_attempts),
+            "concurrency": int(self.concurrency),
+            "timeout_level": (self.timeout_level or "normal").lower(),
+            "auto_export": bool(self.auto_export),
         }
 
 
@@ -305,6 +324,13 @@ def launch_scan(payload: ScanPayload, request: Request) -> JSONResponse:
         "search_provider": payload.search_provider or "idealista",
         "auto_generated_url": auto_generated,
         "search_diagnostics": search_diagnostics,
+        "autonomous_mode": payload.autonomous_mode,
+        "operation_mode": payload.operation_mode,
+        "max_attempts": payload.max_attempts,
+        "concurrency": payload.concurrency,
+        "timeout_level": payload.timeout_level,
+        "auto_export": payload.auto_export,
+        "autonomous": payload.autonomous_payload(),
     }
 
     ok, job, err = store.create_scan_job(
@@ -361,13 +387,20 @@ def resume_scan(job_id: str) -> Dict[str, Any]:
         from jobs.constants import JOB_QUEUED
     except Exception:
         JOB_QUEUED = "queued"
+    existing_listings = store.get_listing_results(job_id)
+    resume_from = len([r for r in existing_listings if r.get("property_id") or r.get("status")])
     store.update_job(
         job_id, status=JOB_QUEUED, error_message=None,
-        started_at=None, finished_at=None, progress_pct=0,
-        listings_done=0, listings_failed=0,
-        approved_count=0, manual_review_count=0, rejected_count=0,
+        started_at=None, finished_at=None,
+        progress_pct=min(int((resume_from / max(job.get("listing_limit") or 1, 1)) * 100), 90),
     )
-    return {"success": True, "job_id": job_id, "status": JOB_QUEUED}
+    return {
+        "success": True,
+        "job_id": job_id,
+        "status": JOB_QUEUED,
+        "resume_from_listing": resume_from,
+        "message": "Job re-queued; sequencer skips already-processed listings.",
+    }
 
 
 @router.get("/jobs")
@@ -488,6 +521,40 @@ def deals_rejected(limit: int = 50) -> Dict[str, Any]:
 def get_assumptions() -> Dict[str, Any]:
     from laundry.assumptions import default_assumptions
     return {"success": True, "assumptions": default_assumptions().to_dict()}
+
+
+class AutonomousSettingsPayload(BaseModel):
+    autonomous_mode: bool = True
+    operation_mode: str = "balanced"
+    max_attempts: int = Field(default=3, ge=1, le=10)
+    concurrency: int = Field(default=2, ge=1, le=8)
+    timeout_level: str = "normal"
+    auto_export: bool = True
+
+    class Config:
+        extra = "ignore"
+
+
+@router.get("/settings/autonomous")
+def get_autonomous_settings_endpoint() -> Dict[str, Any]:
+    from laundry.sequencer import MODE_PRESETS, OPERATION_MODES, TIMEOUT_LEVELS
+
+    settings = store.get_autonomous_settings()
+    return {
+        "success": True,
+        "settings": settings,
+        "operation_modes": list(OPERATION_MODES),
+        "timeout_levels": list(TIMEOUT_LEVELS),
+        "mode_presets": MODE_PRESETS,
+    }
+
+
+@router.put("/settings/autonomous")
+def save_autonomous_settings_endpoint(payload: AutonomousSettingsPayload) -> Dict[str, Any]:
+    ok, saved, err = store.save_autonomous_settings(payload.model_dump())
+    if not ok:
+        raise HTTPException(status_code=500, detail=f"settings_save_failed: {err or 'unknown'}")
+    return {"success": True, "settings": saved}
 
 
 # ---------------------------------------------------------------------------

@@ -25,11 +25,13 @@ import {
   LAUNDRY_SEARCH_PROVIDERS,
   laundryApi,
   type LaundryAcquisitionType,
+  type LaundryOperationMode,
   type LaundryPropertyType,
   type LaundrySearchProvider,
   type LaundrySearchType,
   type LaundrySearchUrlResult,
   type LaundrySearchDiagnostics,
+  type LaundryTimeoutLevel,
 } from "@/lib/api";
 
 const PROPERTY_TYPES: { value: LaundryPropertyType; label: string }[] = [
@@ -63,6 +65,34 @@ const SEARCH_TYPES: { value: LaundrySearchType; label: string; help: string }[] 
   },
 ];
 
+const OPERATION_MODES: {
+  value: LaundryOperationMode;
+  label: string;
+  help: string;
+}[] = [
+  {
+    value: "conservative",
+    label: "Conservative",
+    help: "Fewer retries, stricter scoring, minimal search broadening.",
+  },
+  {
+    value: "balanced",
+    label: "Balanced",
+    help: "Normal retries, scoring, and moderate broadening.",
+  },
+  {
+    value: "aggressive",
+    label: "Aggressive",
+    help: "Broader searches, more retries, prefers manual review over reject.",
+  },
+];
+
+const TIMEOUT_LEVELS: { value: LaundryTimeoutLevel; label: string }[] = [
+  { value: "short", label: "Short (45s)" },
+  { value: "normal", label: "Normal (90s)" },
+  { value: "long", label: "Long (3m)" },
+];
+
 export default function LaundryScanPage() {
   const router = useRouter();
   const launch = useLaunchLaundryScan();
@@ -84,6 +114,13 @@ export default function LaundryScanPage() {
   const [provider, setProvider] = React.useState<LaundrySearchProvider>("idealista");
   const [city] = React.useState("Barcelona");
   const [groundFloorOnly, setGroundFloorOnly] = React.useState(true);
+
+  const [autonomousMode, setAutonomousMode] = React.useState(true);
+  const [operationMode, setOperationMode] = React.useState<LaundryOperationMode>("balanced");
+  const [maxAttempts, setMaxAttempts] = React.useState(3);
+  const [concurrency, setConcurrency] = React.useState(2);
+  const [timeoutLevel, setTimeoutLevel] = React.useState<LaundryTimeoutLevel>("normal");
+  const [autoExport, setAutoExport] = React.useState(true);
 
   const [generatingUrl, setGeneratingUrl] = React.useState(false);
   const [generatedUrl, setGeneratedUrl] = React.useState<LaundrySearchUrlResult | null>(null);
@@ -170,6 +207,12 @@ export default function LaundryScanPage() {
         ground_floor_only: groundFloorOnly,
         auto_generate_url: autoGenerateUrl,
         search_provider: provider,
+        autonomous_mode: autonomousMode,
+        operation_mode: operationMode,
+        max_attempts: maxAttempts,
+        concurrency,
+        timeout_level: timeoutLevel,
+        auto_export: autoExport,
       });
       toast.success(`Scan ${res.status} — job ${res.job_id.slice(0, 8)}`);
       router.push(`/laundry/scans/${res.job_id}`);
@@ -183,6 +226,28 @@ export default function LaundryScanPage() {
   React.useEffect(() => {
     setGeneratedUrl(null);
   }, [propertyType, acquisitionType, provider, maxSizeSqm, groundFloorOnly, city]);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    laundryApi
+      .getAutonomousSettings()
+      .then((res) => {
+        if (cancelled || !res.settings) return;
+        const s = res.settings;
+        setAutonomousMode(s.autonomous_mode);
+        setOperationMode(s.operation_mode);
+        setMaxAttempts(s.max_attempts);
+        setConcurrency(s.concurrency);
+        setTimeoutLevel(s.timeout_level);
+        setAutoExport(s.auto_export);
+      })
+      .catch(() => {
+        /* keep form defaults */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   return (
     <div className="space-y-6">
@@ -484,6 +549,104 @@ export default function LaundryScanPage() {
                 id="polish-llm"
               />
               <Label htmlFor="polish-llm" className="text-xs">LLM memo polish</Label>
+            </div>
+
+            <div className="rounded-md border border-violet-400/25 bg-violet-400/[0.05] p-4 space-y-4">
+              <div className="flex items-start justify-between gap-4">
+                <div className="space-y-1">
+                  <div className="flex items-center gap-2">
+                    <Sparkles className="h-4 w-4 text-violet-300" />
+                    <Label htmlFor="autonomous-mode" className="text-xs uppercase tracking-widest text-violet-200">
+                      Autonomous mode
+                    </Label>
+                  </div>
+                  <p className="text-[11px] leading-relaxed text-muted-foreground">
+                    Launch once — the AI sequencer runs URL generation, discovery broadening, scraping,
+                    dedupe, extraction retries, scoring, memo, Excel export, and live pipeline updates
+                    without manual babysitting.
+                  </p>
+                </div>
+                <Switch
+                  checked={autonomousMode}
+                  onCheckedChange={setAutonomousMode}
+                  id="autonomous-mode"
+                />
+              </div>
+
+              {autonomousMode ? (
+                <>
+                  <div>
+                    <Label className="tactical-mono mb-2 inline-block">Operation mode</Label>
+                    <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+                      {OPERATION_MODES.map((m) => (
+                        <button
+                          key={m.value}
+                          type="button"
+                          aria-pressed={operationMode === m.value}
+                          onClick={() => setOperationMode(m.value)}
+                          className={
+                            "rounded-md border px-3 py-2 text-left text-xs transition " +
+                            (operationMode === m.value
+                              ? "border-violet-400/50 bg-violet-400/10 text-violet-200"
+                              : "border-border/60 bg-card/40 text-muted-foreground hover:text-foreground")
+                          }
+                        >
+                          <span className="font-medium">{m.label}</span>
+                          <span className="mt-1 block text-[10px] leading-snug opacity-80">{m.help}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+                    <div className="space-y-2">
+                      <Label className="tactical-mono">Max attempts</Label>
+                      <Input
+                        type="number"
+                        min={1}
+                        max={10}
+                        value={maxAttempts}
+                        onChange={(e) => setMaxAttempts(Number(e.target.value) || 3)}
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label className="tactical-mono">Concurrency</Label>
+                      <Input
+                        type="number"
+                        min={1}
+                        max={8}
+                        value={concurrency}
+                        onChange={(e) => setConcurrency(Number(e.target.value) || 2)}
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label className="tactical-mono">Timeout</Label>
+                      <Select
+                        value={timeoutLevel}
+                        onValueChange={(v) => setTimeoutLevel(v as LaundryTimeoutLevel)}
+                      >
+                        <SelectTrigger>
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {TIMEOUT_LEVELS.map((t) => (
+                            <SelectItem key={t.value} value={t.value}>
+                              {t.label}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-3">
+                    <Switch checked={autoExport} onCheckedChange={setAutoExport} id="auto-export" />
+                    <Label htmlFor="auto-export" className="text-xs">
+                      Auto-generate Excel export when scan completes
+                    </Label>
+                  </div>
+                </>
+              ) : null}
             </div>
 
             <div className="flex items-center gap-3 border-t border-border/60 pt-4">

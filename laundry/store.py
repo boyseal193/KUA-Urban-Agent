@@ -49,6 +49,7 @@ LAUNDRY_JOB_TYPE = "laundry_scan"
 JOB_STEP_INGEST = "laundry_ingest_inputs"
 JOB_STEP_DISCOVER = "laundry_discover_urls"
 JOB_STEP_UNDERWRITE = "laundry_underwrite_listings"
+JOB_STEP_EXPORT = "laundry_generate_exports"
 JOB_STEP_SUMMARY = "laundry_summarize"
 LISTING_STEP_PROCESS = "laundry_process_listing"
 
@@ -56,6 +57,7 @@ PIPELINE_STEPS: Tuple[str, ...] = (
     JOB_STEP_INGEST,
     JOB_STEP_DISCOVER,
     JOB_STEP_UNDERWRITE,
+    JOB_STEP_EXPORT,
     JOB_STEP_SUMMARY,
 )
 
@@ -650,6 +652,19 @@ def normalize_job_row(job: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]
     )
     if out.get("listing_limit") is None:
         out["listing_limit"] = payload.get("listing_limit") or out.get("listing_limit")
+    autonomous = payload.get("autonomous") or {}
+    if isinstance(autonomous, dict):
+        out["autonomous_mode"] = payload.get("autonomous_mode", autonomous.get("enabled"))
+        out["operation_mode"] = payload.get("operation_mode") or autonomous.get("operation_mode")
+        out["max_attempts"] = payload.get("max_attempts") or autonomous.get("max_attempts")
+        out["concurrency"] = payload.get("concurrency") or autonomous.get("concurrency")
+        out["timeout_level"] = payload.get("timeout_level") or autonomous.get("timeout_level")
+    else:
+        out["autonomous_mode"] = payload.get("autonomous_mode")
+        out["operation_mode"] = payload.get("operation_mode")
+        out["max_attempts"] = payload.get("max_attempts")
+        out["concurrency"] = payload.get("concurrency")
+        out["timeout_level"] = payload.get("timeout_level")
     return out
 
 
@@ -1508,3 +1523,104 @@ def resolve_pipeline_scope(scope: str) -> Tuple[Optional[str], str]:
         label = key.replace("_", " ").title()
         return PIPELINE_EXPORT_SCOPES[key], label
     return None, key.replace("_", " ").title()
+
+
+def clean_stale_running_jobs(*, max_age_minutes: int = 120) -> int:
+    """Mark laundry jobs stuck in running without recent heartbeat as failed."""
+    if supabase is None or max_age_minutes <= 0:
+        return 0
+    try:
+        from datetime import timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=max_age_minutes)).isoformat()
+        res = (
+            supabase.table("scan_jobs")
+            .select("id, status, last_heartbeat_at, started_at")
+            .eq("job_type", LAUNDRY_JOB_TYPE)
+            .eq("status", "running")
+            .execute()
+        )
+        stale_ids: List[str] = []
+        for row in res.data or []:
+            heartbeat = row.get("last_heartbeat_at") or row.get("started_at")
+            if heartbeat and str(heartbeat) >= cutoff:
+                continue
+            stale_ids.append(row["id"])
+        for job_id in stale_ids:
+            update_job(
+                job_id,
+                status="failed",
+                finished_at=_now(),
+                error_message=f"Stale job cleaned after {max_age_minutes}m without heartbeat",
+            )
+            log.warning("clean_stale_running_jobs marked failed job_id=%s", job_id)
+        return len(stale_ids)
+    except Exception as exc:
+        log.warning("clean_stale_running_jobs failed: %s", exc)
+        return 0
+
+
+def get_autonomous_settings(operator_id: str = "default") -> Dict[str, Any]:
+    """Load persisted autonomous defaults from laundry_settings.overrides."""
+    from laundry.sequencer import DEFAULT_AUTONOMOUS_DEFAULTS, parse_autonomous_defaults
+
+    if supabase is None:
+        return dict(DEFAULT_AUTONOMOUS_DEFAULTS)
+    try:
+        res = (
+            supabase.table("laundry_settings")
+            .select("overrides")
+            .eq("operator_id", operator_id)
+            .limit(1)
+            .execute()
+        )
+        row = (res.data or [None])[0]
+        overrides = (row or {}).get("overrides") or {}
+        if isinstance(overrides, str):
+            overrides = json.loads(overrides)
+        return parse_autonomous_defaults(overrides if isinstance(overrides, dict) else {})
+    except Exception as exc:
+        log.warning("get_autonomous_settings failed: %s", exc)
+        return dict(DEFAULT_AUTONOMOUS_DEFAULTS)
+
+
+def save_autonomous_settings(
+    settings: Dict[str, Any],
+    *,
+    operator_id: str = "default",
+) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
+    """Persist autonomous defaults under laundry_settings.overrides.autonomous."""
+    from laundry.sequencer import parse_autonomous_defaults
+
+    if supabase is None:
+        return False, None, "supabase_client_not_initialised"
+    normalized = parse_autonomous_defaults(settings)
+    try:
+        res = (
+            supabase.table("laundry_settings")
+            .select("id, overrides")
+            .eq("operator_id", operator_id)
+            .limit(1)
+            .execute()
+        )
+        row = (res.data or [None])[0]
+        overrides = (row or {}).get("overrides") or {}
+        if isinstance(overrides, str):
+            try:
+                overrides = json.loads(overrides)
+            except Exception:
+                overrides = {}
+        if not isinstance(overrides, dict):
+            overrides = {}
+        overrides["autonomous"] = normalized
+        payload = {"overrides": _json_safe(overrides), "updated_at": _now()}
+        if row and row.get("id"):
+            supabase.table("laundry_settings").update(payload).eq("id", row["id"]).execute()
+        else:
+            supabase.table("laundry_settings").insert({
+                "operator_id": operator_id,
+                "overrides": _json_safe(overrides),
+            }).execute()
+        return True, normalized, None
+    except Exception as exc:
+        log.warning("save_autonomous_settings failed: %s", exc)
+        return False, None, str(exc)
