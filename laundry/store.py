@@ -1229,3 +1229,186 @@ def set_job_counters(job_id: str, *, listings_total: Optional[int] = None,
     if progress_pct is not None: fields["progress_pct"] = progress_pct
     if fields:
         update_job(job_id, **fields)
+
+
+# ---------------------------------------------------------------------------
+# Exports (laundry_exports ledger + property queries for workbooks)
+# ---------------------------------------------------------------------------
+PIPELINE_EXPORT_SCOPES = {
+    "approved": "approved_candidate",
+    "manual_review": "manual_review",
+    "rejected": "rejected",
+    "failed": "extraction_failed",
+}
+
+
+def normalize_export_row(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not row:
+        return None
+    export_id = row.get("id")
+    return {
+        "id": export_id,
+        "format": row.get("format") or "excel",
+        "export_type": row.get("export_type") or row.get("format") or "excel",
+        "label": row.get("label"),
+        "file_path": row.get("file_path") or "",
+        "size_bytes": int(row.get("size_bytes") or 0),
+        "created_at": row.get("created_at"),
+        "property_id": row.get("property_id"),
+        "job_id": row.get("job_id"),
+        "created_by": row.get("created_by"),
+        "download_url": f"/laundry/exports/{export_id}/download" if export_id else None,
+    }
+
+
+def create_export_record(
+    *,
+    file_path: str,
+    size_bytes: int,
+    fmt: str = "excel",
+    export_type: Optional[str] = None,
+    label: Optional[str] = None,
+    property_id: Optional[str] = None,
+    job_id: Optional[str] = None,
+    created_by: Optional[str] = None,
+) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
+    if supabase is None:
+        return False, None, "supabase_client_not_initialised"
+    if not file_path:
+        return False, None, "file_path_required"
+    try:
+        payload: Dict[str, Any] = {
+            "id": str(uuid.uuid4()),
+            "format": fmt or "excel",
+            "export_type": export_type or fmt or "excel",
+            "label": label,
+            "file_path": file_path,
+            "size_bytes": int(size_bytes or 0),
+            "created_at": _now(),
+        }
+        if property_id:
+            payload["property_id"] = property_id
+        if job_id:
+            payload["job_id"] = job_id
+        if created_by:
+            payload["created_by"] = created_by
+        res = supabase.table("laundry_exports").insert(payload).execute()
+        row = (res.data or [None])[0]
+        if not row:
+            return False, None, "insert_failed"
+        return True, normalize_export_row(row), None
+    except Exception as exc:
+        log.warning("create_export_record failed: %s", exc)
+        return False, None, str(exc)
+
+
+def get_export(export_id: str) -> Optional[Dict[str, Any]]:
+    if supabase is None or not export_id:
+        return None
+    try:
+        res = (
+            supabase.table("laundry_exports")
+            .select("*")
+            .eq("id", export_id)
+            .is_("deleted_at", "null")
+            .limit(1)
+            .execute()
+        )
+        if not res.data:
+            return None
+        return normalize_export_row(res.data[0])
+    except Exception as exc:
+        log.warning("get_export failed: %s", exc)
+        return None
+
+
+def list_exports(
+    *,
+    limit: int = 100,
+    property_id: Optional[str] = None,
+    job_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    if supabase is None:
+        return []
+    try:
+        q = (
+            supabase.table("laundry_exports")
+            .select("*")
+            .is_("deleted_at", "null")
+            .order("created_at", desc=True)
+            .limit(limit)
+        )
+        if property_id:
+            q = q.eq("property_id", property_id)
+        if job_id:
+            q = q.eq("job_id", job_id)
+        res = q.execute()
+        return [normalize_export_row(r) for r in (res.data or []) if normalize_export_row(r)]
+    except Exception as exc:
+        log.warning("list_exports failed: %s", exc)
+        return []
+
+
+def _latest_analyses_for_properties(property_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    analyses_by_prop: Dict[str, Dict[str, Any]] = {}
+    if supabase is None or not property_ids:
+        return analyses_by_prop
+    try:
+        ana_res = (
+            supabase.table("laundry_analyses")
+            .select("*")
+            .in_("property_id", property_ids)
+            .order("created_at", desc=True)
+            .execute()
+        )
+        for ana in ana_res.data or []:
+            pid = ana.get("property_id")
+            if pid and pid not in analyses_by_prop:
+                analyses_by_prop[pid] = normalize_analysis_row(ana) or {}
+    except Exception as exc:
+        log.warning("_latest_analyses_for_properties failed: %s", exc)
+    return analyses_by_prop
+
+
+def list_properties_for_export(
+    *,
+    deal_status: Optional[str] = None,
+    job_id: Optional[str] = None,
+    property_ids: Optional[List[str]] = None,
+    limit: int = 500,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    """Return property rows plus latest analysis map for export builders."""
+    if supabase is None:
+        return [], {}
+    try:
+        q = (
+            supabase.table("laundry_properties")
+            .select("*")
+            .is_("deleted_at", "null")
+            .order("score", desc=True)
+            .limit(limit)
+        )
+        if deal_status:
+            q = q.eq("deal_status", deal_status)
+        if job_id:
+            q = q.eq("job_id", job_id)
+        if property_ids:
+            q = q.in_("id", property_ids)
+        res = q.execute()
+        props = [normalize_property_row(r) for r in (res.data or []) if normalize_property_row(r)]
+        analyses = _latest_analyses_for_properties([p["id"] for p in props if p.get("id")])
+        return props, analyses
+    except Exception as exc:
+        log.warning("list_properties_for_export failed: %s", exc)
+        return [], {}
+
+
+def resolve_pipeline_scope(scope: str) -> Tuple[Optional[str], str]:
+    """Map UI scope key to deal_status filter and human label."""
+    key = (scope or "entire").strip().lower()
+    if key in ("entire", "all", "pipeline", "entire_pipeline"):
+        return None, "Entire Pipeline"
+    if key in PIPELINE_EXPORT_SCOPES:
+        label = key.replace("_", " ").title()
+        return PIPELINE_EXPORT_SCOPES[key], label
+    return None, key.replace("_", " ").title()

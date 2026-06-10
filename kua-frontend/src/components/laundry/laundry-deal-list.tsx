@@ -12,6 +12,9 @@ interface Props {
   loading?: boolean;
   emptyTitle?: string;
   emptyDescription?: string;
+  selectable?: boolean;
+  selectedIds?: string[];
+  onToggleSelect?: (id: string) => void;
 }
 
 export function LaundryDealList({
@@ -19,6 +22,9 @@ export function LaundryDealList({
   loading,
   emptyTitle = "No deals",
   emptyDescription = "Run a scan to discover laundromat opportunities.",
+  selectable = false,
+  selectedIds = [],
+  onToggleSelect,
 }: Props) {
   if (loading) {
     return (
@@ -40,7 +46,14 @@ export function LaundryDealList({
   return (
     <div className="grid gap-3 lg:grid-cols-2">
       {deals.map((d, i) => (
-        <LaundryDealCard key={d.id} deal={d} index={i} />
+        <LaundryDealCard
+          key={d.id}
+          deal={d}
+          index={i}
+          selectable={selectable}
+          selected={selectedIds.includes(d.id)}
+          onSelectToggle={onToggleSelect}
+        />
       ))}
     </div>
   );

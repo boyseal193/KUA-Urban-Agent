@@ -36,6 +36,8 @@ export type {
   LaundryScanResponse,
   LaundryLaunchScanPayload,
   LaundryExportRecord,
+  LaundryExportResponse,
+  LaundryPipelineExportScope,
   LaundrySettingsPayload,
   LaundryMapMarker,
   LaundryPropertyType,

@@ -23,6 +23,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 import { LaundryScoreBadge } from "@/components/laundry/laundry-score-badge";
 import { LaundryStatusBadge } from "@/components/laundry/laundry-status";
+import { LaundryExportExcelButton } from "@/components/laundry/laundry-export-actions";
 import {
   useCreateLaundryExport,
   useDeleteLaundryProperty,
@@ -85,12 +86,15 @@ export default function LaundryPropertyPage({
         title={p.address || "Untitled laundromat"}
         subtitle={`${p.neighbourhood || "—"} · ${p.city || "—"} · ${(p.property_type || "").replace(/_/g, " ")}`}
         rightSlot={
-          <Link
-            href="/laundry/pipeline"
-            className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
-          >
-            <ArrowLeft className="h-3.5 w-3.5" /> Pipeline
-          </Link>
+          <div className="flex flex-wrap items-center gap-3">
+            <LaundryExportExcelButton propertyId={id} />
+            <Link
+              href="/laundry/pipeline"
+              className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+            >
+              <ArrowLeft className="h-3.5 w-3.5" /> Pipeline
+            </Link>
+          </div>
         }
       />
 
@@ -259,9 +263,10 @@ export default function LaundryPropertyPage({
                 )}
               </TabsContent>
 
-              <TabsContent value="exports" className="mt-4">
+              <TabsContent value="exports" className="mt-4 space-y-4">
+                <LaundryExportExcelButton propertyId={id} />
                 <div className="grid gap-2 sm:grid-cols-2">
-                  {EXPORT_FORMATS.map((f) => (
+                  {EXPORT_FORMATS.filter((f) => f.id !== "excel").map((f) => (
                     <Button
                       key={f.id}
                       variant="ghost"

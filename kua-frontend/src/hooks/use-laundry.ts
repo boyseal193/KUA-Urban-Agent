@@ -9,6 +9,7 @@ import {
 import {
   laundryApi,
   type LaundryLaunchScanPayload,
+  type LaundryPipelineExportScope,
   type LaundryProperty,
   type LaundryPropertyDetailResponse,
   type LaundryScanResponse,
@@ -211,8 +212,37 @@ export function useRestoreLaundryProperty() {
 }
 
 export function useCreateLaundryExport(propertyId: string) {
+  const qc = useQueryClient();
   return useMutation({
     mutationFn: (format: string) => laundryApi.createExport(propertyId, format),
+    onSuccess: () => qc.invalidateQueries({ queryKey: LAUNDRY_KEYS.exports(100) }),
+  });
+}
+
+export function useCreateLaundryPipelineExport() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (scope: LaundryPipelineExportScope) => laundryApi.exportPipeline(scope),
+    onSuccess: () => qc.invalidateQueries({ queryKey: LAUNDRY_KEYS.exports(100) }),
+  });
+}
+
+export function useCreateLaundryScanExport(scanId: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (scope: LaundryPipelineExportScope) => laundryApi.exportScan(scanId, scope),
+    onSuccess: () => qc.invalidateQueries({ queryKey: LAUNDRY_KEYS.exports(100) }),
+  });
+}
+
+export function useCreateLaundryBulkExport() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (payload: {
+      property_ids?: string[];
+      scope?: LaundryPipelineExportScope;
+    }) => laundryApi.exportBulk(payload),
+    onSuccess: () => qc.invalidateQueries({ queryKey: LAUNDRY_KEYS.exports(100) }),
   });
 }
 

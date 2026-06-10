@@ -262,6 +262,8 @@ ALTER TABLE public.laundry_exports ADD COLUMN IF NOT EXISTS format      TEXT NOT
 ALTER TABLE public.laundry_exports ADD COLUMN IF NOT EXISTS file_path   TEXT;
 ALTER TABLE public.laundry_exports ADD COLUMN IF NOT EXISTS size_bytes  INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE public.laundry_exports ADD COLUMN IF NOT EXISTS created_by  TEXT;
+ALTER TABLE public.laundry_exports ADD COLUMN IF NOT EXISTS export_type TEXT;
+ALTER TABLE public.laundry_exports ADD COLUMN IF NOT EXISTS label       TEXT;
 ALTER TABLE public.laundry_exports ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 ALTER TABLE public.laundry_exports ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;
 ALTER TABLE public.laundry_exports ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
@@ -616,20 +618,34 @@ END$$;
 -- (scan_jobs / scan_steps / scan_listing_results live in jobs/schema.sql)
 -- =============================================================================
 
-ALTER TABLE public.scan_jobs ADD COLUMN IF NOT EXISTS summary JSONB;
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.tables
+         WHERE table_schema = 'public' AND table_name = 'scan_jobs'
+    ) THEN
+        ALTER TABLE public.scan_jobs ADD COLUMN IF NOT EXISTS summary JSONB;
+        CREATE INDEX IF NOT EXISTS idx_scan_jobs_job_type
+            ON public.scan_jobs (job_type, created_at DESC);
+    END IF;
+END$$;
 
-ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS address       TEXT;
-ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS city          TEXT;
-ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS neighbourhood TEXT;
-ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS title         TEXT;
-ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS description   TEXT;
-
-CREATE INDEX IF NOT EXISTS idx_scan_jobs_job_type
-    ON public.scan_jobs (job_type, created_at DESC);
-
-CREATE INDEX IF NOT EXISTS idx_scan_listing_results_property_id
-    ON public.scan_listing_results (property_id)
-    WHERE property_id IS NOT NULL;
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.tables
+         WHERE table_schema = 'public' AND table_name = 'scan_listing_results'
+    ) THEN
+        ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS address       TEXT;
+        ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS city          TEXT;
+        ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS neighbourhood TEXT;
+        ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS title         TEXT;
+        ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS description   TEXT;
+        CREATE INDEX IF NOT EXISTS idx_scan_listing_results_property_id
+            ON public.scan_listing_results (property_id)
+            WHERE property_id IS NOT NULL;
+    END IF;
+END$$;
 
 
 -- =============================================================================
@@ -665,39 +681,50 @@ ALTER TABLE public.laundry_settings          DISABLE ROW LEVEL SECURITY;
 -- =============================================================================
 
 -- 1) Backfill denormalized listing fields from the result JSON blob.
-UPDATE public.scan_listing_results AS slr
-SET
-    address       = COALESCE(slr.address,       slr.result->>'address'),
-    city          = COALESCE(slr.city,          slr.result->>'city', 'Barcelona'),
-    neighbourhood = COALESCE(slr.neighbourhood, slr.result->>'neighbourhood'),
-    title         = COALESCE(slr.title,         slr.result->>'title'),
-    description   = COALESCE(slr.description,   slr.result->>'description'),
-    updated_at    = NOW()
-WHERE slr.deleted_at IS NULL
-  AND slr.result IS NOT NULL
-  AND (
-        slr.address IS NULL
-     OR slr.city IS NULL
-     OR slr.neighbourhood IS NULL
-     OR slr.title IS NULL
-  );
+--    (Skipped automatically if scan_listing_results does not exist yet.)
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.tables
+         WHERE table_schema = 'public' AND table_name = 'scan_listing_results'
+    ) THEN
+        RAISE NOTICE 'Skipping scan_listing_results backfill — table not found';
+        RETURN;
+    END IF;
 
--- 2) Link scan_listing_results.property_id where a matching laundry_properties row exists.
-UPDATE public.scan_listing_results AS slr
-SET
-    property_id = lp.id::text,
-    deal_status = COALESCE(slr.deal_status, lp.deal_status),
-    updated_at  = NOW()
-FROM public.laundry_properties AS lp
-WHERE slr.deleted_at IS NULL
-  AND lp.deleted_at IS NULL
-  AND slr.job_id = lp.job_id
-  AND slr.listing_url IS NOT NULL
-  AND lp.listing_url IS NOT NULL
-  AND slr.listing_url = lp.listing_url
-  AND (slr.property_id IS NULL OR slr.property_id = '');
+    UPDATE public.scan_listing_results AS slr
+    SET
+        address       = COALESCE(slr.address,       slr.result->>'address'),
+        city          = COALESCE(slr.city,          slr.result->>'city', 'Barcelona'),
+        neighbourhood = COALESCE(slr.neighbourhood, slr.result->>'neighbourhood'),
+        title         = COALESCE(slr.title,         slr.result->>'title'),
+        description   = COALESCE(slr.description,   slr.result->>'description'),
+        updated_at    = NOW()
+    WHERE slr.deleted_at IS NULL
+      AND slr.result IS NOT NULL
+      AND (
+            slr.address IS NULL
+         OR slr.city IS NULL
+         OR slr.neighbourhood IS NULL
+         OR slr.title IS NULL
+      );
 
--- 3) Mirror existing analysis memos into laundry_generated_memos (idempotent).
+    UPDATE public.scan_listing_results AS slr
+    SET
+        property_id = lp.id::text,
+        deal_status = COALESCE(slr.deal_status, lp.deal_status),
+        updated_at  = NOW()
+    FROM public.laundry_properties AS lp
+    WHERE slr.deleted_at IS NULL
+      AND lp.deleted_at IS NULL
+      AND slr.job_id = lp.job_id
+      AND slr.listing_url IS NOT NULL
+      AND lp.listing_url IS NOT NULL
+      AND slr.listing_url = lp.listing_url
+      AND (slr.property_id IS NULL OR slr.property_id = '');
+END$$;
+
+-- 2) Mirror existing analysis memos into laundry_generated_memos (idempotent).
 INSERT INTO public.laundry_generated_memos (property_id, analysis_id, kind, markdown, created_at)
 SELECT
     la.property_id,
@@ -715,7 +742,7 @@ WHERE la.deleted_at IS NULL
           AND lgm.deleted_at IS NULL
   );
 
--- 4) Record duplicate-key collisions already present in laundry_properties.
+-- 3) Record duplicate-key collisions already present in laundry_properties.
 INSERT INTO public.laundry_duplicates (dedupe_key, property_id, listing_url, primary_property_id)
 SELECT
     lp.dedupe_key,
@@ -732,30 +759,41 @@ WHERE lp.deleted_at IS NULL
           AND ld.property_id = lp.id
   );
 
--- 5) Flag laundry scan jobs that have listing telemetry but zero persisted properties.
+-- 4) Flag laundry scan jobs that have listing telemetry but zero persisted properties.
 --    Re-run them via POST /laundry/scans/{job_id}/resume after deploying the worker fix.
-UPDATE public.scan_jobs AS sj
-SET
-    error_message = COALESCE(
-        sj.error_message,
-        'Pre-migration scan: listing rows exist but no laundry_properties were persisted. Re-queue this job.'
-    ),
-    updated_at = NOW()
-WHERE sj.job_type = 'laundry_scan'
-  AND sj.deleted_at IS NULL
-  AND COALESCE(sj.listings_done, 0) > 0
-  AND NOT EXISTS (
-        SELECT 1
-        FROM public.laundry_properties AS lp
-        WHERE lp.job_id = sj.id
-          AND lp.deleted_at IS NULL
-  )
-  AND EXISTS (
-        SELECT 1
-        FROM public.scan_listing_results AS slr
-        WHERE slr.job_id = sj.id
-          AND slr.deleted_at IS NULL
-  );
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.tables
+         WHERE table_schema = 'public' AND table_name = 'scan_jobs'
+    ) THEN
+        RAISE NOTICE 'Skipping scan_jobs flag update — table not found';
+        RETURN;
+    END IF;
+
+    UPDATE public.scan_jobs AS sj
+    SET
+        error_message = COALESCE(
+            sj.error_message,
+            'Pre-migration scan: listing rows exist but no laundry_properties were persisted. Re-queue this job.'
+        ),
+        updated_at = NOW()
+    WHERE sj.job_type = 'laundry_scan'
+      AND sj.deleted_at IS NULL
+      AND COALESCE(sj.listings_done, 0) > 0
+      AND NOT EXISTS (
+            SELECT 1
+            FROM public.laundry_properties AS lp
+            WHERE lp.job_id = sj.id
+              AND lp.deleted_at IS NULL
+      )
+      AND EXISTS (
+            SELECT 1
+            FROM public.scan_listing_results AS slr
+            WHERE slr.job_id = sj.id
+              AND slr.deleted_at IS NULL
+      );
+END$$;
 
 
 -- Force PostgREST schema cache reload (fixes "Could not find table public.laundry_properties").

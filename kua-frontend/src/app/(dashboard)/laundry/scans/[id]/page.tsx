@@ -5,6 +5,7 @@ import Link from "next/link";
 import { ArrowLeft, AlertCircle, AlertTriangle } from "lucide-react";
 
 import { PageHeader } from "@/components/common/page-header";
+import { LaundryPipelineExportMenu } from "@/components/laundry/laundry-export-actions";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { EmptyState } from "@/components/common/empty-state";
 import { LaundryScanListingCard } from "@/components/laundry/laundry-scan-listing-card";
@@ -73,12 +74,15 @@ export default function LaundryScanDetailPage({
             : "Loading…"
         }
         rightSlot={
-          <Link
-            href="/laundry/scans"
-            className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
-          >
-            <ArrowLeft className="h-3.5 w-3.5" /> History
-          </Link>
+          <div className="flex flex-wrap items-center gap-3">
+            <LaundryPipelineExportMenu scanId={id} />
+            <Link
+              href="/laundry/scans"
+              className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+            >
+              <ArrowLeft className="h-3.5 w-3.5" /> History
+            </Link>
+          </div>
         }
       />
 

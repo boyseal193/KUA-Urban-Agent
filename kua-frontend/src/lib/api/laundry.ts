@@ -413,11 +413,33 @@ export const LAUNDRY_SEARCH_PROVIDERS: { value: LaundrySearchProvider; label: st
 export interface LaundryExportRecord {
   id: string;
   format: string;
+  export_type?: string | null;
+  label?: string | null;
   file_path: string;
   size_bytes: number;
   created_at?: string | null;
   property_id?: string | null;
   job_id?: string | null;
+  download_url: string;
+}
+
+export type LaundryPipelineExportScope =
+  | "approved"
+  | "manual_review"
+  | "rejected"
+  | "failed"
+  | "entire";
+
+export interface LaundryExportResponse {
+  success: boolean;
+  export_id: string;
+  format: string;
+  export_type?: string | null;
+  label?: string | null;
+  file_path: string;
+  filename: string;
+  size_bytes: number;
+  row_count?: number;
   download_url: string;
 }
 
@@ -562,17 +584,31 @@ export const laundryApi = {
     ),
 
   createExport: (id: string, format: string) =>
-    api<{
-      success: boolean;
-      export_id: string;
-      format: string;
-      file_path: string;
-      filename: string;
-      size_bytes: number;
-      download_url: string;
-    }>(`/laundry/properties/${id}/exports`, {
+    api<LaundryExportResponse>(`/laundry/properties/${id}/exports`, {
       method: "POST",
       body: { format },
+      timeoutMs: 120_000,
+    }),
+  exportPipeline: (scope: LaundryPipelineExportScope) =>
+    api<LaundryExportResponse>(`/laundry/exports/pipeline`, {
+      method: "POST",
+      body: { scope, format: "excel" },
+      timeoutMs: 120_000,
+    }),
+  exportScan: (scanId: string, scope: LaundryPipelineExportScope = "entire") =>
+    api<LaundryExportResponse>(`/laundry/scans/${scanId}/exports`, {
+      method: "POST",
+      body: { scope, format: "excel" },
+      timeoutMs: 120_000,
+    }),
+  exportBulk: (payload: {
+    property_ids?: string[];
+    scope?: LaundryPipelineExportScope;
+    format?: string;
+  }) =>
+    api<LaundryExportResponse>(`/laundry/exports/bulk`, {
+      method: "POST",
+      body: { format: "excel", ...payload },
       timeoutMs: 120_000,
     }),
   listExports: (limit = 100) =>

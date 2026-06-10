@@ -22,17 +22,25 @@ Endpoints (prefix ``/laundry``):
 * ``GET    /laundry/deals/approved``
 * ``GET    /laundry/deals/rejected``
 * ``GET    /laundry/settings/assumptions``
+* ``POST   /laundry/properties/{id}/exports`` — single-deal Excel workbook
+* ``POST   /laundry/exports/pipeline``        — pipeline Excel export by scope
+* ``POST   /laundry/exports/bulk``            — bulk / selected pipeline export
+* ``POST   /laundry/scans/{id}/exports``      — scan-scoped pipeline export
+* ``GET    /laundry/exports``                 — export history
+* ``GET    /laundry/exports/formats``
+* ``GET    /laundry/exports/{id}/download``   — re-download persisted artefact
 """
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from laundry import pipeline, store, url_builder
+from laundry import exports, pipeline, store, url_builder
 
 log = logging.getLogger("kua.laundry.api")
 
@@ -480,3 +488,214 @@ def deals_rejected(limit: int = 50) -> Dict[str, Any]:
 def get_assumptions() -> Dict[str, Any]:
     from laundry.assumptions import default_assumptions
     return {"success": True, "assumptions": default_assumptions().to_dict()}
+
+
+# ---------------------------------------------------------------------------
+# Exports
+# ---------------------------------------------------------------------------
+class ExportRequest(BaseModel):
+    format: str = Field(default="excel", description="excel")
+
+    class Config:
+        extra = "ignore"
+
+
+class PipelineExportRequest(BaseModel):
+    scope: str = Field(
+        default="entire",
+        description="approved | manual_review | rejected | failed | entire",
+    )
+    format: str = Field(default="excel")
+
+    class Config:
+        extra = "ignore"
+
+
+class BulkExportRequest(BaseModel):
+    property_ids: Optional[List[str]] = None
+    scope: Optional[str] = Field(
+        default=None,
+        description="approved | manual_review | entire when property_ids omitted",
+    )
+    format: str = Field(default="excel")
+
+    class Config:
+        extra = "ignore"
+
+
+def _require_excel(fmt: str) -> None:
+    if (fmt or "excel").lower() not in exports.EXPORT_FORMATS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported export format: {fmt!r}. Supported: {list(exports.EXPORT_FORMATS)}",
+        )
+
+
+def _export_json(record: Dict[str, Any], meta: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "success": True,
+        "export_id": record["id"],
+        "format": record.get("format") or meta.get("format") or "excel",
+        "export_type": record.get("export_type"),
+        "label": record.get("label"),
+        "file_path": record.get("file_path") or meta.get("file_path"),
+        "filename": meta.get("filename") or os.path.basename(record.get("file_path") or ""),
+        "size_bytes": record.get("size_bytes") or meta.get("size_bytes") or 0,
+        "row_count": meta.get("row_count"),
+        "download_url": record.get("download_url") or f"/laundry/exports/{record['id']}/download",
+    }
+
+
+def _persist_pipeline_export(
+    *,
+    properties: List[Dict[str, Any]],
+    analyses: Dict[str, Dict[str, Any]],
+    label: str,
+    export_type: str,
+    job: Optional[Dict[str, Any]] = None,
+    job_id: Optional[str] = None,
+    created_by: Optional[str] = None,
+) -> Dict[str, Any]:
+    if not properties:
+        raise HTTPException(status_code=404, detail="no_properties_for_export")
+    meta = exports.generate_pipeline_export(
+        properties, analyses, label=label, job=job,
+    )
+    ok, record, err = store.create_export_record(
+        file_path=meta["file_path"],
+        size_bytes=meta["size_bytes"],
+        fmt=meta.get("format") or "excel",
+        export_type=export_type,
+        label=label,
+        job_id=job_id,
+        created_by=created_by,
+    )
+    if not ok or not record:
+        raise HTTPException(status_code=500, detail=f"export_persist_failed: {err or 'unknown'}")
+    return _export_json(record, meta)
+
+
+@router.post("/properties/{property_id}/exports")
+def create_property_export(
+    property_id: str,
+    payload: ExportRequest,
+    request: Request,
+) -> Dict[str, Any]:
+    _require_excel(payload.format)
+    prop = store.get_property(property_id)
+    if not prop:
+        raise HTTPException(status_code=404, detail="property_not_found")
+    analysis = prop.pop("latest_analysis", None)
+    job = store.get_scan_job(prop.get("job_id")) if prop.get("job_id") else None
+    meta = exports.generate_single_deal_export(prop, analysis, job=job)
+    ok, record, err = store.create_export_record(
+        file_path=meta["file_path"],
+        size_bytes=meta["size_bytes"],
+        fmt=meta.get("format") or "excel",
+        export_type="single_deal",
+        label=prop.get("address") or property_id[:8],
+        property_id=property_id,
+        job_id=prop.get("job_id"),
+        created_by=request.headers.get("x-user-id"),
+    )
+    if not ok or not record:
+        raise HTTPException(status_code=500, detail=f"export_persist_failed: {err or 'unknown'}")
+    return _export_json(record, meta)
+
+
+@router.post("/exports/pipeline")
+def export_pipeline(payload: PipelineExportRequest, request: Request) -> Dict[str, Any]:
+    _require_excel(payload.format)
+    deal_status, label = store.resolve_pipeline_scope(payload.scope)
+    export_type = f"pipeline_{(payload.scope or 'entire').strip().lower()}"
+    properties, analyses = store.list_properties_for_export(deal_status=deal_status, limit=500)
+    return _persist_pipeline_export(
+        properties=properties,
+        analyses=analyses,
+        label=label,
+        export_type=export_type,
+        created_by=request.headers.get("x-user-id"),
+    )
+
+
+@router.post("/exports/bulk")
+def export_bulk(payload: BulkExportRequest, request: Request) -> Dict[str, Any]:
+    _require_excel(payload.format)
+    created_by = request.headers.get("x-user-id")
+    if payload.property_ids:
+        properties, analyses = store.list_properties_for_export(
+            property_ids=list(payload.property_ids),
+            limit=max(len(payload.property_ids), 1),
+        )
+        return _persist_pipeline_export(
+            properties=properties,
+            analyses=analyses,
+            label=f"Selected ({len(properties)})",
+            export_type="bulk_selected",
+            created_by=created_by,
+        )
+    scope = payload.scope or "entire"
+    deal_status, label = store.resolve_pipeline_scope(scope)
+    export_type = f"bulk_{scope.strip().lower()}"
+    properties, analyses = store.list_properties_for_export(deal_status=deal_status, limit=500)
+    return _persist_pipeline_export(
+        properties=properties,
+        analyses=analyses,
+        label=label,
+        export_type=export_type,
+        created_by=created_by,
+    )
+
+
+@router.post("/scans/{job_id}/exports")
+def export_scan(job_id: str, payload: PipelineExportRequest, request: Request) -> Dict[str, Any]:
+    _require_excel(payload.format)
+    job = store.get_scan_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job_not_found")
+    deal_status, label = store.resolve_pipeline_scope(payload.scope)
+    scan_label = f"Scan {job_id[:8]} · {label}"
+    export_type = f"scan_{(payload.scope or 'entire').strip().lower()}"
+    properties, analyses = store.list_properties_for_export(
+        deal_status=deal_status, job_id=job_id, limit=500,
+    )
+    return _persist_pipeline_export(
+        properties=properties,
+        analyses=analyses,
+        label=scan_label,
+        export_type=export_type,
+        job=job,
+        job_id=job_id,
+        created_by=request.headers.get("x-user-id"),
+    )
+
+
+@router.get("/exports")
+def list_exports_endpoint(
+    limit: int = 100,
+    property_id: Optional[str] = None,
+    job_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    rows = store.list_exports(limit=limit, property_id=property_id, job_id=job_id)
+    return {"success": True, "exports": rows}
+
+
+@router.get("/exports/formats")
+def list_export_formats() -> Dict[str, Any]:
+    return {"formats": list(exports.EXPORT_FORMATS)}
+
+
+@router.get("/exports/{export_id}/download")
+def download_export(export_id: str) -> FileResponse:
+    record = store.get_export(export_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="export_not_found")
+    path = record.get("file_path") or ""
+    if not path or not os.path.isfile(path):
+        raise HTTPException(status_code=410, detail="export_file_unavailable")
+    filename = os.path.basename(path)
+    return FileResponse(
+        path=path,
+        filename=filename,
+        media_type=exports.MIME_XLSX,
+    )

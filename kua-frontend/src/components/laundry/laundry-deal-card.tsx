@@ -16,9 +16,20 @@ interface Props {
   index?: number;
   compact?: boolean;
   className?: string;
+  selectable?: boolean;
+  selected?: boolean;
+  onSelectToggle?: (id: string) => void;
 }
 
-export function LaundryDealCard({ deal, index = 0, compact = false, className }: Props) {
+export function LaundryDealCard({
+  deal,
+  index = 0,
+  compact = false,
+  className,
+  selectable = false,
+  selected = false,
+  onSelectToggle,
+}: Props) {
   if (!deal?.id) return null;
 
   const acq = deal.acquisition_type === "rent" ? "RENT" : "BUY";
@@ -39,10 +50,31 @@ export function LaundryDealCard({ deal, index = 0, compact = false, className }:
       whileHover={{ y: -2 }}
       className={cn(
         "group relative panel overflow-hidden transition-all hover:border-violet-400/40 hover:shadow-glow",
+        selected && "border-emerald-400/50 ring-1 ring-emerald-400/30",
         className,
       )}
     >
-      <Link href={`/laundry/property/${deal.id}`} className="block p-4">
+      {selectable && (
+        <button
+          type="button"
+          aria-pressed={selected}
+          aria-label={selected ? "Deselect deal" : "Select deal"}
+          className="absolute left-3 top-3 z-10 rounded border border-border/60 bg-card/90 p-1"
+          onClick={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            onSelectToggle?.(deal.id);
+          }}
+        >
+          <span
+            className={cn(
+              "block h-3.5 w-3.5 rounded-sm border",
+              selected ? "border-emerald-300 bg-emerald-400" : "border-muted-foreground/40",
+            )}
+          />
+        </button>
+      )}
+      <Link href={`/laundry/property/${deal.id}`} className={cn("block p-4", selectable && "pl-10")}>
         <div className="flex items-start justify-between gap-3">
           <div className="flex items-center gap-3">
             <LaundryScoreBadge score={deal.score ?? null} size={compact ? "sm" : "md"} />

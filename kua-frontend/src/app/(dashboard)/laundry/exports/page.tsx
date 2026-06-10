@@ -17,7 +17,7 @@ export default function LaundryExportsPage() {
       <PageHeader
         eyebrow="LAUNDRY · EXPORTS"
         title="Generated Artefacts"
-        subtitle="Every export created from the laundry vertical — Excel, CSV, JSON, ZIP, memo & full investment package."
+        subtitle="Professional Excel workbooks generated from the laundry acquisition pipeline."
       />
 
       <Card>
@@ -42,6 +42,8 @@ export default function LaundryExportsPage() {
               <table className="min-w-full text-xs">
                 <thead className="border-b border-border/60 text-left font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
                   <tr>
+                    <th className="py-2 pr-2">Type</th>
+                    <th className="py-2 pr-2">Label</th>
                     <th className="py-2 pr-2">Format</th>
                     <th className="py-2 pr-2">File</th>
                     <th className="py-2 pr-2">Size</th>
@@ -52,6 +54,10 @@ export default function LaundryExportsPage() {
                 <tbody>
                   {(q.data ?? []).map((r) => (
                     <tr key={r.id} className="border-b border-border/40">
+                      <td className="py-2 pr-2 font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+                        {r.export_type ?? r.format}
+                      </td>
+                      <td className="py-2 pr-2 text-muted-foreground">{r.label ?? "—"}</td>
                       <td className="py-2 pr-2 uppercase tracking-widest font-mono text-[10px]">
                         {r.format}
                       </td>
