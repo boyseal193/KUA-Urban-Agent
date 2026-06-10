@@ -66,7 +66,21 @@ export interface LaundryProperty {
   ceiling_height?: number | null;
   job_id?: string | null;
   ebitda_eur?: number | null;
+  expected_revenue_eur?: number | null;
+  operating_margin?: number | null;
   payback_years?: number | null;
+  total_investment_eur?: number | null;
+  yield_pct?: number | null;
+  locker_revenue_eur?: number | null;
+  vending_revenue_eur?: number | null;
+  upside_potential_eur?: number | null;
+  demand_score?: number | null;
+  competition_score?: number | null;
+  risk_count?: number | null;
+  warning_count?: number | null;
+  dd_items_count?: number | null;
+  critical_issues?: string[];
+  ai_summary?: string | null;
   in_preferred_market?: boolean | null;
   matched_neighbourhood?: string | null;
   analysis_id?: string | null;
@@ -497,6 +511,14 @@ export const laundryApi = {
 
   detail: (id: string) =>
     api<LaundryPropertyDetailResponse>(`/laundry/properties/${id}`),
+
+  properties: (params?: { deal_status?: string; limit?: number }) =>
+    api<{ success: boolean; properties: LaundryProperty[] }>(`/laundry/properties`, {
+      query: {
+        deal_status: params?.deal_status,
+        limit: params?.limit ?? 500,
+      },
+    }),
 
   regenerateMemo: (id: string) =>
     api<{ success: boolean; property_id: string; ic_memo: string }>(

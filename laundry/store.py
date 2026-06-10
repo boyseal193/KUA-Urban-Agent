@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 import traceback
 import uuid
 from datetime import datetime, timezone
@@ -454,7 +455,7 @@ def create_partial_property(
 # Queries
 # ---------------------------------------------------------------------------
 def list_properties(*, deal_status: Optional[str] = None, limit: int = 100,
-                     include_deleted: bool = False) -> List[Dict[str, Any]]:
+                     include_deleted: bool = False, enrich: bool = True) -> List[Dict[str, Any]]:
     if supabase is None:
         return []
     try:
@@ -464,10 +465,100 @@ def list_properties(*, deal_status: Optional[str] = None, limit: int = 100,
         if not include_deleted:
             q = q.is_("deleted_at", "null")
         res = q.execute()
-        return [normalize_property_row(r) for r in (res.data or []) if r]
+        props = [normalize_property_row(r) for r in (res.data or []) if normalize_property_row(r)]
+        if enrich and props:
+            analyses = _latest_analyses_for_properties([p["id"] for p in props if p.get("id")])
+            props = [_attach_pipeline_snapshot(p, analyses.get(p["id"])) for p in props]
+        return props
     except Exception as exc:
         log.warning("list_properties failed: %s", exc)
         return []
+
+
+def _attach_pipeline_snapshot(
+    prop: Dict[str, Any],
+    ana: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Merge latest analysis economics / scoring onto a property card for pipeline UI."""
+    if not ana:
+        dd_empty = prop.get("risk_flags") or []
+        prop["risk_count"] = len(dd_empty) if isinstance(dd_empty, list) else 0
+        prop["warning_count"] = 0
+        prop["dd_items_count"] = 0
+        return prop
+
+    scoring = ana.get("scoring") or ana.get("score") or {}
+    dd = ana.get("due_diligence") or {}
+    economics = ana.get("economics") or {}
+    location = ana.get("location") or {}
+    auto = scoring.get("auto_scores") or {}
+    sub = auto.get("sub_components") or {}
+
+    risks = dd.get("red_flags") or dd.get("risks") or []
+    weaknesses = dd.get("weaknesses") or []
+    checklist = dd.get("due_diligence_checklist") or dd.get("checklist") or []
+    if not isinstance(risks, list):
+        risks = [str(risks)] if risks else []
+    if not isinstance(weaknesses, list):
+        weaknesses = [str(weaknesses)] if weaknesses else []
+    if not isinstance(checklist, list):
+        checklist = [str(checklist)] if checklist else []
+
+    locker_rev = sum(
+        float(economics.get(k) or 0)
+        for k in ("amazon_locker_eur_year", "inpost_locker_eur_year", "locker_revenue_eur")
+    )
+    vending_rev = sum(
+        float(economics.get(k) or 0)
+        for k in (
+            "detergent_vending_eur_year",
+            "snack_vending_eur_year",
+            "drink_vending_eur_year",
+            "vending_revenue_eur",
+        )
+    )
+    upside = economics.get("secondary_revenue_eur") or economics.get("ancillary_revenue_eur")
+    if upside is None and (locker_rev or vending_rev):
+        upside = locker_rev + vending_rev
+
+    memo_md = ana.get("memo_md") or ana.get("ic_memo") or ""
+    ai_summary = _memo_summary(memo_md) or prop.get("verdict")
+
+    prop["analysis_id"] = ana.get("id")
+    prop["memo_preview"] = memo_md[:480] if memo_md else prop.get("memo_preview")
+    prop["has_memo"] = bool(memo_md)
+    prop["risk_flags"] = risks
+    prop["expected_revenue_eur"] = prop.get("expected_revenue_eur") or economics.get("expected_revenue_eur")
+    prop["ebitda_eur"] = prop.get("ebitda_eur") or economics.get("ebitda_eur")
+    prop["operating_margin"] = prop.get("operating_margin") or economics.get("operating_margin")
+    prop["payback_years"] = prop.get("payback_years") or economics.get("payback_years")
+    prop["total_investment_eur"] = economics.get("total_investment_eur")
+    prop["yield_pct"] = economics.get("yield_pct") or economics.get("irr_estimate_pct")
+    prop["locker_revenue_eur"] = locker_rev or None
+    prop["vending_revenue_eur"] = vending_rev or None
+    prop["upside_potential_eur"] = upside
+    prop["demand_score"] = sub.get("demand_signal") or location.get("destination_intensity")
+    prop["competition_score"] = auto.get("competition_score") or sub.get("competition")
+    prop["risk_count"] = len(risks)
+    prop["warning_count"] = len(weaknesses)
+    prop["dd_items_count"] = len(checklist)
+    prop["critical_issues"] = risks[:3]
+    prop["ai_summary"] = ai_summary
+    if not prop.get("confidence_band"):
+        conf = scoring.get("confidence") or {}
+        prop["confidence_band"] = conf.get("band")
+    return prop
+
+
+def _memo_summary(memo_md: str, *, max_sentences: int = 3) -> str:
+    if not memo_md:
+        return ""
+    text = memo_md.replace("#", " ").replace("*", " ").replace("`", " ")
+    text = " ".join(text.split())
+    parts = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    if not parts:
+        return text[:280]
+    return " ".join(parts[:max_sentences])[:320]
 
 
 def normalize_property_row(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -736,7 +827,7 @@ def list_job_properties(job_id: str) -> List[Dict[str, Any]]:
         if prop_ids:
             ana_res = (
                 supabase.table("laundry_analyses")
-                .select("id, property_id, memo_md, scoring, due_diligence, economics, created_at")
+                .select("id, property_id, memo_md, scoring, due_diligence, economics, location, created_at")
                 .in_("property_id", prop_ids)
                 .order("created_at", desc=True)
                 .execute()
@@ -752,13 +843,7 @@ def list_job_properties(job_id: str) -> List[Dict[str, Any]]:
                 continue
             ana = analyses_by_prop.get(prop["id"])
             if ana:
-                scoring = ana.get("scoring") or {}
-                dd = ana.get("due_diligence") or {}
-                prop["analysis_id"] = ana.get("id")
-                prop["memo_preview"] = (ana.get("memo_md") or "")[:280]
-                prop["has_memo"] = bool(ana.get("memo_md"))
-                prop["risk_flags"] = dd.get("red_flags") or dd.get("risks") or []
-                prop["ebitda_eur"] = prop.get("ebitda_eur") or (ana.get("economics") or {}).get("ebitda_eur")
+                prop = _attach_pipeline_snapshot(prop, ana)
             enriched.append(prop)
         return enriched
     except Exception as exc:

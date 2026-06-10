@@ -49,7 +49,7 @@ export function LaundryDealCard({
       }}
       whileHover={{ y: -2 }}
       className={cn(
-        "group relative panel overflow-hidden transition-all hover:border-violet-400/40 hover:shadow-glow",
+        "group relative w-full panel overflow-hidden transition-all hover:border-violet-400/40 hover:shadow-glow",
         selected && "border-emerald-400/50 ring-1 ring-emerald-400/30",
         className,
       )}
@@ -76,36 +76,33 @@ export function LaundryDealCard({
       )}
       <Link href={`/laundry/property/${deal.id}`} className={cn("block p-4", selectable && "pl-10")}>
         <div className="flex items-start justify-between gap-3">
-          <div className="flex items-center gap-3">
+          <div className="flex min-w-0 flex-1 items-start gap-3">
             <LaundryScoreBadge score={deal.score ?? null} size={compact ? "sm" : "md"} />
-            <div className="min-w-0">
-              <div className="flex items-center gap-2">
+            <div className="min-w-0 flex-1">
+              <div className="flex flex-wrap items-center gap-2">
                 <LaundryStatusBadge status={deal.deal_status} />
                 <span className="rounded border border-border/60 bg-card/60 px-1.5 py-px font-mono text-[9px] uppercase tracking-widest text-muted-foreground">
                   {acq}
                 </span>
-                <span className="rounded border border-border/60 bg-card/60 px-1.5 py-px font-mono text-[9px] uppercase tracking-widest text-muted-foreground">
-                  {(deal.property_type || "—").replace(/_/g, " ")}
-                </span>
               </div>
-              <div className="mt-1 truncate font-display text-sm font-semibold text-foreground">
+              <div className="mt-1 break-words font-display text-sm font-semibold leading-snug text-foreground">
                 {deal.address || deal.neighbourhood || "Untitled property"}
               </div>
-              <div className="mt-0.5 flex items-center gap-1.5 text-[11px] text-muted-foreground">
-                <MapPin className="h-3 w-3" />
-                <span className="truncate">
+              <div className="mt-1 flex items-start gap-1.5 text-[11px] text-muted-foreground">
+                <MapPin className="mt-0.5 h-3 w-3 shrink-0" />
+                <span className="break-words">
                   {deal.neighbourhood || "—"} · {deal.city || "—"}
                 </span>
               </div>
             </div>
           </div>
-          <ArrowUpRight className="h-4 w-4 text-muted-foreground opacity-0 transition group-hover:opacity-100 group-hover:text-violet-300" />
+          <ArrowUpRight className="h-4 w-4 shrink-0 text-muted-foreground opacity-0 transition group-hover:opacity-100 group-hover:text-violet-300" />
         </div>
 
         <div
           className={cn(
             "mt-4 grid gap-3 border-t border-border/60 pt-4",
-            compact ? "grid-cols-2" : "grid-cols-2 sm:grid-cols-4",
+            compact ? "grid-cols-2" : "grid-cols-2 xl:grid-cols-4",
           )}
         >
           <Stat icon={Ruler} label="Area" value={metersLabel(deal.floor_area_m2 ?? null)} />
@@ -114,10 +111,10 @@ export function LaundryDealCard({
           <Stat icon={Ruler} label={acq === "RENT" ? "Rent" : "Asking"} value={price} />
         </div>
 
-        <div className="mt-4 flex items-center justify-between border-t border-border/60 pt-3 font-mono text-[10px] uppercase tracking-[0.15em] text-muted-foreground">
+        <div className="mt-4 flex flex-wrap items-center justify-between gap-2 border-t border-border/60 pt-3 font-mono text-[10px] uppercase tracking-[0.15em] text-muted-foreground">
           <span>ID · {deal.id.slice(0, 8)}</span>
-          <span>{deal.verdict || "—"}</span>
-          <span className="text-violet-300 group-hover:underline">OPEN MEMO</span>
+          <span className="break-words text-right">{deal.verdict || "—"}</span>
+          <span className="text-violet-300 group-hover:underline">Open memo</span>
         </div>
       </Link>
     </motion.div>
@@ -134,11 +131,11 @@ function Stat({
   value: React.ReactNode;
 }) {
   return (
-    <div className="space-y-1">
+    <div className="min-w-0 space-y-1">
       <div className="flex items-center gap-1.5 tactical-mono">
-        <Icon className="h-3 w-3" /> {label}
+        <Icon className="h-3 w-3 shrink-0" /> {label}
       </div>
-      <div className="font-mono text-sm font-medium tabular-nums text-foreground">{value}</div>
+      <div className="break-words font-mono text-sm font-medium tabular-nums text-foreground">{value}</div>
     </div>
   );
 }

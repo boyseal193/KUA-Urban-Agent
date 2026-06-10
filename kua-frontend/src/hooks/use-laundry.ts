@@ -94,6 +94,14 @@ export function useLaundryAllDeals(limit = 100, offset = 0) {
   });
 }
 
+export function useLaundryPipelineProperties(limit = 500) {
+  return useQuery({
+    queryKey: ["laundry", "pipeline", limit] as const,
+    queryFn: () => laundryApi.properties({ limit }).then((r) => r.properties ?? []),
+    staleTime: 15_000,
+  });
+}
+
 export function useLaundryDetail(id: string | undefined) {
   return useQuery<LaundryPropertyDetailResponse>({
     queryKey: LAUNDRY_KEYS.detail(id ?? ""),

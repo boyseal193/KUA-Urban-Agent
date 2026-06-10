@@ -32,7 +32,7 @@ export function LaundryDealList({
         {[0, 1, 2].map((i) => (
           <div
             key={i}
-            className="h-28 animate-pulse rounded-xl border border-border/60 bg-card/40"
+            className="h-40 animate-pulse rounded-xl border border-border/60 bg-card/40"
           />
         ))}
       </div>
@@ -44,7 +44,7 @@ export function LaundryDealList({
   }
 
   return (
-    <div className="grid gap-3 lg:grid-cols-2">
+    <div className="flex w-full flex-col gap-3">
       {deals.map((d, i) => (
         <LaundryDealCard
           key={d.id}

@@ -5,12 +5,6 @@ import { Download, FileSpreadsheet, Loader2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
 import { laundryApi, type LaundryPipelineExportScope } from "@/lib/api";
 import {
@@ -19,14 +13,6 @@ import {
   useCreateLaundryScanExport,
   useCreateLaundryExport,
 } from "@/hooks/use-laundry";
-
-const PIPELINE_SCOPE_LABELS: Record<LaundryPipelineExportScope, string> = {
-  approved: "Approved",
-  manual_review: "Manual Review",
-  rejected: "Rejected",
-  failed: "Failed",
-  entire: "Entire Pipeline",
-};
 
 interface ExportResult {
   export_id: string;
@@ -47,7 +33,6 @@ interface LaundryExportExcelButtonProps {
   size?: "sm" | "default";
 }
 
-/** Single-deal underwriting workbook export with re-download support. */
 export function LaundryExportExcelButton({
   propertyId,
   className,
@@ -98,26 +83,20 @@ export function LaundryExportExcelButton({
   );
 }
 
-interface LaundryPipelineExportMenuProps {
-  scanId?: string;
+interface LaundryPipelineExportToolbarProps {
   className?: string;
 }
 
-/** Pipeline or scan-scoped Excel export menu. */
-export function LaundryPipelineExportMenu({ scanId, className }: LaundryPipelineExportMenuProps) {
+export function LaundryPipelineExportToolbar({ className }: LaundryPipelineExportToolbarProps) {
   const pipelineExport = useCreateLaundryPipelineExport();
-  const scanExport = useCreateLaundryScanExport(scanId ?? "");
-  const mutation = scanId ? scanExport : pipelineExport;
   const [lastExport, setLastExport] = React.useState<ExportResult | null>(null);
 
-  async function runScope(scope: LaundryPipelineExportScope) {
-    const toastId = toast.loading(`Exporting ${PIPELINE_SCOPE_LABELS[scope]}…`);
+  async function runScope(scope: LaundryPipelineExportScope, label: string) {
+    const toastId = toast.loading(`Exporting ${label}…`);
     try {
-      const res = scanId
-        ? await scanExport.mutateAsync(scope)
-        : await pipelineExport.mutateAsync(scope);
+      const res = await pipelineExport.mutateAsync(scope);
       setLastExport(res);
-      toast.success("Pipeline export ready", {
+      toast.success(`${label} export ready`, {
         id: toastId,
         description: res.filename ?? `${res.row_count ?? 0} properties`,
       });
@@ -126,34 +105,94 @@ export function LaundryPipelineExportMenu({ scanId, className }: LaundryPipeline
     }
   }
 
+  const buttons: Array<{ scope: LaundryPipelineExportScope; label: string }> = [
+    { scope: "entire", label: "Export pipeline" },
+    { scope: "approved", label: "Export approved" },
+    { scope: "manual_review", label: "Export review" },
+    { scope: "rejected", label: "Export rejected" },
+    { scope: "failed", label: "Export failed" },
+  ];
+
   return (
     <div className={cn("flex flex-wrap items-center gap-2", className)}>
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <Button
-            variant="tactical"
-            size="sm"
-            className="bg-emerald-500/10 text-emerald-200 hover:bg-emerald-500/20"
-            disabled={mutation.isPending}
-          >
-            {mutation.isPending ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            ) : (
-              <FileSpreadsheet className="h-3.5 w-3.5" />
-            )}
-            Export Excel
-          </Button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="w-52">
-          {(Object.keys(PIPELINE_SCOPE_LABELS) as LaundryPipelineExportScope[]).map((scope) => (
-            <DropdownMenuItem key={scope} onClick={() => runScope(scope)}>
-              {PIPELINE_SCOPE_LABELS[scope]}
-            </DropdownMenuItem>
-          ))}
-        </DropdownMenuContent>
-      </DropdownMenu>
+      {buttons.map(({ scope, label }) => (
+        <Button
+          key={scope}
+          type="button"
+          variant="ghost"
+          size="sm"
+          className="h-9 border border-border/60 bg-background/30 font-mono text-[10px] uppercase tracking-widest"
+          disabled={pipelineExport.isPending}
+          onClick={() => runScope(scope, label)}
+        >
+          {pipelineExport.isPending ? (
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          ) : (
+            <FileSpreadsheet className="h-3.5 w-3.5" />
+          )}
+          {label}
+        </Button>
+      ))}
       {lastExport && (
         <Button
+          type="button"
+          variant="tactical"
+          size="sm"
+          className="h-9 bg-violet-500/10 text-violet-200 hover:bg-violet-500/20"
+          onClick={() => openDownload(lastExport)}
+        >
+          <Download className="h-3.5 w-3.5" />
+          Download Excel
+        </Button>
+      )}
+    </div>
+  );
+}
+
+interface LaundryPipelineExportMenuProps {
+  scanId?: string;
+  className?: string;
+}
+
+export function LaundryPipelineExportMenu({ scanId, className }: LaundryPipelineExportMenuProps) {
+  if (!scanId) {
+    return <LaundryPipelineExportToolbar className={className} />;
+  }
+
+  const scanExport = useCreateLaundryScanExport(scanId);
+  const [lastExport, setLastExport] = React.useState<ExportResult | null>(null);
+
+  async function runScanExport() {
+    const toastId = toast.loading("Exporting scan…");
+    try {
+      const res = await scanExport.mutateAsync("entire");
+      setLastExport(res);
+      toast.success("Scan export ready", { id: toastId });
+    } catch (err) {
+      toast.error((err as Error).message, { id: toastId });
+    }
+  }
+
+  return (
+    <div className={cn("flex flex-wrap items-center gap-2", className)}>
+      <Button
+        type="button"
+        variant="tactical"
+        size="sm"
+        className="bg-emerald-500/10 text-emerald-200 hover:bg-emerald-500/20"
+        disabled={scanExport.isPending}
+        onClick={runScanExport}
+      >
+        {scanExport.isPending ? (
+          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+        ) : (
+          <FileSpreadsheet className="h-3.5 w-3.5" />
+        )}
+        Export Excel
+      </Button>
+      {lastExport && (
+        <Button
+          type="button"
           variant="ghost"
           size="sm"
           className="border border-border/60"
@@ -172,7 +211,6 @@ interface LaundryBulkExportToolbarProps {
   className?: string;
 }
 
-/** Bulk export actions for pipeline operators. */
 export function LaundryBulkExportToolbar({
   selectedIds = [],
   className,
@@ -197,46 +235,51 @@ export function LaundryBulkExportToolbar({
   return (
     <div className={cn("flex flex-wrap items-center gap-2", className)}>
       <Button
+        type="button"
         variant="ghost"
         size="sm"
-        className="border border-border/60"
+        className="h-9 border border-border/60 font-mono text-[10px] uppercase tracking-widest"
         disabled={bulkExport.isPending || selectedIds.length === 0}
         onClick={() => runBulk({ property_ids: selectedIds })}
       >
-        Export Selected
+        Export selected
       </Button>
       <Button
+        type="button"
         variant="ghost"
         size="sm"
-        className="border border-border/60"
+        className="h-9 border border-border/60 font-mono text-[10px] uppercase tracking-widest"
         disabled={bulkExport.isPending}
         onClick={() => runBulk({ scope: "approved" })}
       >
-        Export All Approved
+        Export all approved
       </Button>
       <Button
+        type="button"
         variant="ghost"
         size="sm"
-        className="border border-border/60"
+        className="h-9 border border-border/60 font-mono text-[10px] uppercase tracking-widest"
         disabled={bulkExport.isPending}
         onClick={() => runBulk({ scope: "manual_review" })}
       >
-        Export All Manual Review
+        Export all manual review
       </Button>
       <Button
+        type="button"
         variant="ghost"
         size="sm"
-        className="border border-border/60"
+        className="h-9 border border-border/60 font-mono text-[10px] uppercase tracking-widest"
         disabled={bulkExport.isPending}
         onClick={() => runBulk({ scope: "entire" })}
       >
-        Export Entire Pipeline
+        Export entire pipeline
       </Button>
       {lastExport && (
         <Button
+          type="button"
           variant="tactical"
           size="sm"
-          className="bg-violet-500/10 text-violet-200 hover:bg-violet-500/20"
+          className="h-9 bg-violet-500/10 text-violet-200 hover:bg-violet-500/20"
           onClick={() => openDownload(lastExport)}
         >
           <Download className="h-3.5 w-3.5" />
