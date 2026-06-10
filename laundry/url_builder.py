@@ -315,7 +315,7 @@ def _build_idealista_from_spec(req: UrlBuildRequest, spec: _CandidateSpec) -> Ur
             filter_parts.append(f"precio-hasta_{int(round(req.max_rent_month_eur))}")
             applied["max_rent_month_eur"] = str(int(round(req.max_rent_month_eur)))
 
-    # Ground floor is NEVER a hard URL filter — pipeline preference only.
+    # Ground-floor filter in Idealista URL when requested (planta-baja).
     if spec.include_ground_floor and vertical == "locales":
         filter_parts.append("planta-baja")
         applied["ground_floor"] = "url_filter"
@@ -359,7 +359,7 @@ def _build_idealista_from_spec(req: UrlBuildRequest, spec: _CandidateSpec) -> Ur
 
     if req.ground_floor_only and not spec.include_ground_floor:
         warnings.append(
-            "Ground floor is a pipeline preference — not enforced in the search URL."
+            "Ground-floor URL filter removed — retrying with broader floor coverage."
         )
     if req.neighbourhoods and not spec.neighbourhood_slug:
         warnings.append(
@@ -463,11 +463,24 @@ def _idealista_widening_only_ladder(req: UrlBuildRequest) -> List[_CandidateSpec
 
 
 def _idealista_primary_spec(req: UrlBuildRequest) -> _CandidateSpec:
-    """Stage 1 — broad Barcelona commercial rentals (never stack all filters)."""
+    """Stage 1 — broad Barcelona commercial rentals; ground floor in URL when enabled."""
+    include_gf = bool(req.ground_floor_only)
+    return _CandidateSpec(
+        fallback_level="barcelona",
+        stage=4 if include_gf else 1,
+        include_ground_floor=include_gf,
+        label="Barcelona commercial rentals (ground floor)" if include_gf else "Barcelona commercial rentals (broad)",
+    )
+
+
+def _idealista_without_ground_floor_spec(req: UrlBuildRequest) -> _CandidateSpec:
+    """Retry step when ground-floor URL returns zero listings."""
     return _CandidateSpec(
         fallback_level="barcelona",
         stage=1,
-        label="Barcelona commercial rentals (broad)",
+        include_ground_floor=False,
+        removed=["ground_floor"],
+        label="Barcelona commercial rentals (all floors)",
     )
 
 
@@ -663,8 +676,12 @@ def resolve_search_url(
     if not validate:
         return primary
 
-    # Pre-launch: start broad (stage 1), widen only if count == 0.
-    candidates = [primary_spec] + _idealista_widening_only_ladder(req)
+    # Start with ground-floor URL when enabled, then drop floor filter before widening geography.
+    candidates: List[_CandidateSpec] = [primary_spec]
+    if req.ground_floor_only:
+        candidates.append(_idealista_without_ground_floor_spec(req))
+    candidates.extend(_idealista_widening_only_ladder(req))
+    candidates.extend(_idealista_escalation_ladder(req))
     original_url = primary.url
     chosen: Optional[UrlBuildResult] = None
     chosen_count = 0
@@ -698,7 +715,12 @@ def resolve_search_url(
         chosen_count = attempts[-1]["count"] if attempts else 0
 
     broadened = chosen.url != original_url
-    reason = "No listings found under original constraints" if broadened else None
+    if broadened and req.ground_floor_only and "ground_floor" in (chosen.diagnostics.removed_filters if chosen.diagnostics else []):
+        reason = "No ground-floor listings found — search retried without floor filter"
+    elif broadened:
+        reason = "No listings found under original constraints"
+    else:
+        reason = None
 
     if chosen.diagnostics:
         chosen.diagnostics.listing_count = chosen_count
@@ -744,11 +766,11 @@ def discover_with_fallback(
     attempts: List[Dict[str, Any]] = []
     seen_urls: set[str] = {search_url}
 
-    candidate_specs: List[_CandidateSpec] = (
-        [_idealista_primary_spec(req)]
-        + _idealista_widening_only_ladder(req)
-        + _idealista_escalation_ladder(req)
-    )
+    candidate_specs: List[_CandidateSpec] = [_idealista_primary_spec(req)]
+    if req.ground_floor_only:
+        candidate_specs.append(_idealista_without_ground_floor_spec(req))
+    candidate_specs.extend(_idealista_widening_only_ladder(req))
+    candidate_specs.extend(_idealista_escalation_ladder(req))
 
     for spec in candidate_specs:
         built = _build_idealista_from_spec(req, spec)

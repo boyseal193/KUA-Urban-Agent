@@ -10,6 +10,7 @@ import math
 from typing import Any, Dict, List, Optional
 
 from laundry.assumptions import LaundryAssumptions, default_assumptions, merge_overrides
+from laundry.normalization import ground_floor_value
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +138,7 @@ def estimate_secondary_revenue(
     items: Dict[str, float] = {}
     potential: List[str] = []
 
-    has_frontage = bool(extracted.get("ground_floor", True)) and bool(
+    has_frontage = ground_floor_value(extracted) is not False and bool(
         extracted.get("street_visibility_0_100") or location.get("street_visibility_0_100", 65)
     )
     has_loading = bool(extracted.get("loading_access"))

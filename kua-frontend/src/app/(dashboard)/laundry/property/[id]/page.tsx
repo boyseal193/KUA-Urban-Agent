@@ -23,6 +23,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 import { LaundryScoreBadge } from "@/components/laundry/laundry-score-badge";
 import { LaundryStatusBadge } from "@/components/laundry/laundry-status";
+import { LaundryFloorBadge } from "@/components/laundry/laundry-floor-badge";
 import { LaundryExportExcelButton } from "@/components/laundry/laundry-export-actions";
 import {
   useCreateLaundryExport,
@@ -116,6 +117,10 @@ export default function LaundryPropertyPage({
             </div>
 
             <Row k="Classification" v={p.classification ?? "—"} />
+            <Row k="Floor level" v={p.ground_floor_status ?? "Unknown — verify on site"} />
+            <div>
+              <LaundryFloorBadge deal={p} />
+            </div>
             <Row k="Acquisition" v={(p.acquisition_type ?? "—").toUpperCase()} />
             <Row k="Floor area" v={`${p.floor_area_m2 ?? "—"} m²`} />
             <Row

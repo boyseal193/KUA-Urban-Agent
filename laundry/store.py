@@ -579,6 +579,17 @@ def normalize_property_row(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, 
             out["address"] = raw.get("address")
         if not out.get("title") and raw.get("title"):
             out["title"] = raw.get("title")
+        if out.get("ground_floor") is None and "ground_floor" in raw:
+            out["ground_floor"] = raw.get("ground_floor")
+        if raw.get("floor_level") and not out.get("floor_level"):
+            out["floor_level"] = raw.get("floor_level")
+    if out.get("ground_floor") is not None:
+        out["ground_floor"] = bool(out["ground_floor"])
+    gf = normalization.ground_floor_status(
+        {"ground_floor": out.get("ground_floor"), **(raw if isinstance(raw, dict) else {})}
+    )
+    out["ground_floor_status"] = gf.get("label")
+    out["ground_floor_verification"] = gf.get("verification")
     scoring = out.pop("scoring", None) if isinstance(out.get("scoring"), dict) else None
     if scoring and not out.get("confidence_band"):
         conf = scoring.get("confidence") or {}

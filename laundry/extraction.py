@@ -167,7 +167,8 @@ def _heuristic_extract(text: str) -> Dict[str, Any]:
         "ceiling_height": None,
         "washer_count": None,
         "dryer_count": None,
-        "ground_floor": True,
+        "ground_floor": None,
+        "floor_level": None,
         "corner_unit": False,
         "loading_access": False,
         "water_available": True,
@@ -215,6 +216,42 @@ def _heuristic_extract(text: str) -> Dict[str, Any]:
         out["noise_restriction"] = True
     if "cambio de uso" in lower or "change of use" in lower:
         out["requires_change_of_use"] = True
+
+    if any(
+        k in lower
+        for k in (
+            "planta baja",
+            "ground floor",
+            "bajo comercial",
+            "local en planta baja",
+            "planta 0",
+            "piso 0",
+        )
+    ):
+        out["ground_floor"] = True
+        out["floor_level"] = "ground"
+    elif re.search(r"\b(?:planta|piso|floor)\s*(?:[2-9]|[1-9]\d)", lower):
+        out["ground_floor"] = False
+        out["floor_level"] = "upper"
+    elif any(
+        k in lower
+        for k in (
+            "primera planta",
+            "1ª planta",
+            "1a planta",
+            "second floor",
+            "upper floor",
+            "planta 1",
+            "piso 1",
+            "not ground floor",
+            "sin planta baja",
+        )
+    ):
+        out["ground_floor"] = False
+        out["floor_level"] = "upper"
+    elif re.search(r"\b(?:planta|piso)\s*baja\b", lower):
+        out["ground_floor"] = True
+        out["floor_level"] = "ground"
 
     addr_match = re.search(
         r"(?:dirección|address|calle|c/|carrer|ubicación)\s*[:\-]?\s*([^\n,]{6,120})",

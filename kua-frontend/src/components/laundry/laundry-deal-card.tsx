@@ -9,6 +9,7 @@ import { cn } from "@/lib/utils";
 import { moneyCompact, metersLabel } from "@/lib/format";
 import { LaundryScoreBadge } from "./laundry-score-badge";
 import { LaundryStatusBadge } from "./laundry-status";
+import { LaundryFloorBadge } from "./laundry-floor-badge";
 import type { LaundryProperty } from "@/lib/api";
 
 interface Props {
@@ -81,6 +82,7 @@ export function LaundryDealCard({
             <div className="min-w-0 flex-1">
               <div className="flex flex-wrap items-center gap-2">
                 <LaundryStatusBadge status={deal.deal_status} />
+                <LaundryFloorBadge deal={deal} compact />
                 <span className="rounded border border-border/60 bg-card/60 px-1.5 py-px font-mono text-[9px] uppercase tracking-widest text-muted-foreground">
                   {acq}
                 </span>

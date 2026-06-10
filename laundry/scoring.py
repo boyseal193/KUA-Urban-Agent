@@ -18,6 +18,7 @@ from laundry.assumptions import (
     default_assumptions,
     merge_overrides,
 )
+from laundry.normalization import ground_floor_value, laundromat_access_impossible
 
 
 CRITICAL_LOCATION_FIELDS = [
@@ -137,7 +138,7 @@ def _score_economics(economics: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _score_physical_fit(*, floor_area_m2, ceiling_height, has_water, has_gas,
-                        has_drainage, has_3phase_power, ground_floor, loading_access,
+                        has_drainage, has_3phase_power, ground_floor: Optional[bool], loading_access,
                         biz: BusinessProfile) -> Dict[str, Any]:
     score = 50.0
     drivers: List[str] = []
@@ -166,9 +167,18 @@ def _score_physical_fit(*, floor_area_m2, ceiling_height, has_water, has_gas,
     else: score -= 7; drivers.append("no_drainage")
     if has_3phase_power: score += 6
     else: drivers.append("requires_3phase_upgrade")
-    if ground_floor: score += 8
-    else: score -= 10; drivers.append("upper_floor_access_risk")
-    if loading_access: score += 2
+    if ground_floor is True:
+        score += 18
+        drivers.append("ground_floor_strong_positive")
+    elif ground_floor is False:
+        score -= 6
+        drivers.append("not_ground_floor_major_warning")
+    else:
+        score -= 4
+        drivers.append("floor_level_unknown_verify_on_site")
+    if loading_access: score += 4
+    elif ground_floor is False:
+        drivers.append("upper_floor_without_loading_access")
 
     return {"score": _clamp(score), "drivers": drivers or ["fit_standard"]}
 
@@ -310,6 +320,7 @@ def score_property(payload: Dict[str, Any], *, overrides: Optional[Dict[str, Any
     competition_component = _score_competition(nearby, competitors)
     economics_block = _score_economics(economics)
     floor_area_for_fit = _safe_float(economics.get("floor_area_m2") or extracted.get("floor_area_m2"))
+    ground_floor = ground_floor_value(extracted)
     physical_block = _score_physical_fit(
         floor_area_m2=floor_area_for_fit,
         ceiling_height=_safe_float(extracted.get("ceiling_height")),
@@ -317,7 +328,7 @@ def score_property(payload: Dict[str, Any], *, overrides: Optional[Dict[str, Any
         has_gas=bool(extracted.get("gas_available", True)),
         has_drainage=bool(extracted.get("drainage_available", True)),
         has_3phase_power=bool(extracted.get("three_phase_power", False)),
-        ground_floor=bool(extracted.get("ground_floor", True)),
+        ground_floor=ground_floor,
         loading_access=bool(extracted.get("loading_access", False)),
         biz=biz,
     )
@@ -346,6 +357,12 @@ def score_property(payload: Dict[str, Any], *, overrides: Optional[Dict[str, Any
     if extracted.get("structural_issue_flag"): risk_component -= 20; risk_drivers.append("possible_structural_issue")
     if extracted.get("flood_risk_flag"): risk_component -= 12; risk_drivers.append("flood_risk")
     if night_safety and night_safety < 45: risk_component -= 10; risk_drivers.append("low_night_safety")
+    if ground_floor is False:
+        risk_component -= 12
+        risk_drivers.append("not_ground_floor_major_access_warning")
+    elif ground_floor is None:
+        risk_component -= 6
+        risk_drivers.append("floor_level_unknown_manual_verification")
     risk_component = _clamp(risk_component)
 
     secondary_weight = getattr(weights, "secondary_revenue", 0.0) or 0.0
@@ -379,6 +396,21 @@ def score_property(payload: Dict[str, Any], *, overrides: Optional[Dict[str, Any
     if confidence["band"] == "low" and deal_status == "rejected":
         deal_status = "manual_review"; verdict = "MANUAL REVIEW"
         notes.append("promoted_to_review_due_to_low_confidence")
+
+    if ground_floor is None:
+        if deal_status == "approved_candidate":
+            deal_status = "manual_review"
+            verdict = "MANUAL REVIEW"
+        notes.append("floor_level_unknown_requires_verification")
+    elif ground_floor is False:
+        if deal_status == "approved_candidate":
+            deal_status = "manual_review"
+            verdict = "MANUAL REVIEW"
+        notes.append("not_ground_floor_requires_manual_review")
+        if laundromat_access_impossible(extracted) and deal_status != "manual_review":
+            deal_status = "manual_review"
+            verdict = "MANUAL REVIEW"
+            notes.append("upper_floor_access_limited_not_auto_rejected")
 
     classification = _classification(final_score, economics, location, physical_block, competition_component)
 

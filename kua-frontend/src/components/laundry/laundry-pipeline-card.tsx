@@ -26,6 +26,7 @@ import {
 } from "@/hooks/use-laundry";
 import { LaundryScoreBadge } from "./laundry-score-badge";
 import { LaundryStatusBadge } from "./laundry-status";
+import { LaundryFloorBadge } from "./laundry-floor-badge";
 
 interface Props {
   deal: LaundryProperty;
@@ -108,6 +109,7 @@ export function LaundryPipelineCard({
                 {deal.verdict || "Pending verdict"}
               </span>
               <LaundryStatusBadge status={deal.deal_status} />
+              <LaundryFloorBadge deal={deal} />
               {deal.classification && (
                 <span className="rounded-md border border-border/60 bg-background/40 px-2 py-0.5 font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
                   {deal.classification}

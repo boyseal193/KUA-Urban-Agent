@@ -276,7 +276,7 @@ export default function LaundryScanPage() {
                   </SelectContent>
                 </Select>
                 <p className="mt-2 text-[11px] text-muted-foreground">
-                  Broad city-wide search first — neighbourhood, size and ground floor run in the pipeline.
+                  Broad city-wide search first — neighbourhood and size run in the pipeline. Ground floor is applied in the Idealista URL when enabled.
                 </p>
               </div>
             </div>
@@ -423,7 +423,27 @@ export default function LaundryScanPage() {
               </p>
             </div>
 
-            <div className="grid grid-cols-1 gap-4 sm:grid-cols-4">
+            <div className="rounded-md border border-emerald-400/25 bg-emerald-400/[0.05] p-4">
+              <div className="flex items-start justify-between gap-4">
+                <div className="space-y-1">
+                  <Label htmlFor="ground-floor" className="text-xs uppercase tracking-widest text-emerald-200">
+                    Ground floor only
+                  </Label>
+                  <p className="text-[11px] leading-relaxed text-muted-foreground">
+                    Strong preference for laundromat sites. When enabled, Idealista URLs include the
+                    <span className="font-mono text-foreground"> planta-baja </span>
+                    filter. If that returns zero listings, the search automatically retries without the floor filter.
+                  </p>
+                </div>
+                <Switch
+                  checked={groundFloorOnly}
+                  onCheckedChange={setGroundFloorOnly}
+                  id="ground-floor"
+                />
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
               <div className="space-y-2">
                 <Label className="tactical-mono">Listing limit</Label>
                 <Input
@@ -446,14 +466,6 @@ export default function LaundryScanPage() {
                 <p className="text-[10px] text-muted-foreground">
                   Right-sized urban units sit around 60–80 m². Larger hits go to manual review.
                 </p>
-              </div>
-              <div className="flex items-center gap-3 pt-7">
-                <Switch
-                  checked={groundFloorOnly}
-                  onCheckedChange={setGroundFloorOnly}
-                  id="ground-floor"
-                />
-                <Label htmlFor="ground-floor" className="text-xs">Ground floor only</Label>
               </div>
               <div className="flex items-center gap-3 pt-7">
                 <Switch

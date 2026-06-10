@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from laundry.normalization import ground_floor_status
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
@@ -45,6 +46,7 @@ _PIPELINE_COLUMNS: List[Tuple[str, str, Optional[str], float]] = [
     ("Neighbourhood", "neighbourhood", None, 18),
     ("Acquisition Type", "acquisition_type", None, 14),
     ("Property Type", "property_type", None, 16),
+    ("Ground Floor", "ground_floor_status", None, 18),
     ("Area (m²)", "floor_area_m2", "#,##0.0", 12),
     ("Price (€)", "asking_price", "€#,##0", 14),
     ("Rent (€/mo)", "asking_rent_month", "€#,##0", 14),
@@ -143,8 +145,10 @@ def _flatten_property_row(
         prop.get("address")
         or extracted.get("title")
         or prop.get("neighbourhood")
-        or f"Listing {str(prop.get('id', ''))[:8]}"
+        or         f"Listing {str(prop.get('id', ''))[:8]}"
     )
+
+    gf = ground_floor_status({**extracted, **{k: prop.get(k) for k in ("ground_floor",) if prop.get(k) is not None}})
 
     return {
         "property_id": prop.get("id"),
@@ -154,6 +158,8 @@ def _flatten_property_row(
         "neighbourhood": prop.get("neighbourhood") or extracted.get("neighbourhood"),
         "acquisition_type": prop.get("acquisition_type") or extracted.get("acquisition_type"),
         "property_type": prop.get("property_type") or extracted.get("property_type"),
+        "ground_floor_status": gf.get("label"),
+        "ground_floor": gf.get("ground_floor"),
         "floor_area_m2": _money(prop.get("floor_area_m2") or economics.get("floor_area_m2") or extracted.get("floor_area_m2")),
         "asking_price": _money(prop.get("asking_price") or extracted.get("asking_price")),
         "asking_rent_month": _money(prop.get("asking_rent_month") or extracted.get("asking_rent_month")),
@@ -199,7 +205,7 @@ def build_pipeline_workbook(rows: List[Dict[str, Any]], *, title: str = "Pipelin
                 cell.number_format = fmt
             cell.alignment = _ALIGN_LEFT if not fmt else _ALIGN_CENTER
             cell.border = _ROW_BORDER
-        status_cell = ws.cell(row=row_idx, column=15)
+        status_cell = ws.cell(row=row_idx, column=16)
         fill = _VERDICT_FILLS.get(record.get("deal_status") or "")
         if fill:
             status_cell.fill = fill
@@ -264,6 +270,7 @@ def build_single_deal_workbook(
         ("City", row.get("city")),
         ("Acquisition", row.get("acquisition_type")),
         ("Property Type", row.get("property_type")),
+        ("Ground Floor", row.get("ground_floor_status")),
         ("Floor Area (m²)", row.get("floor_area_m2")),
         ("Score", row.get("score")),
         ("Verdict", row.get("verdict")),

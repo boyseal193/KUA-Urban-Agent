@@ -52,7 +52,65 @@ def normalize_extracted(extracted: Dict[str, Any]) -> Dict[str, Any]:
         out["acquisition_type"] = None
     out["property_type"] = (out.get("property_type") or "").lower() or None
     if not out.get("city"): out["city"] = "Barcelona"
+    if "ground_floor" in out and out.get("ground_floor") is not None:
+        out["ground_floor"] = bool(out["ground_floor"])
     return out
+
+
+def ground_floor_value(extracted: Optional[Dict[str, Any]]) -> Optional[bool]:
+    """Tri-state ground floor: True, False, or None (unknown)."""
+    if not isinstance(extracted, dict):
+        return None
+    if "ground_floor" not in extracted:
+        return None
+    val = extracted.get("ground_floor")
+    if val is None:
+        return None
+    return bool(val)
+
+
+def ground_floor_status(extracted: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Human-readable ground-floor status for UI and exports."""
+    val = ground_floor_value(extracted)
+    if val is True:
+        return {
+            "ground_floor": True,
+            "label": "Ground floor",
+            "short_label": "GF",
+            "tone": "positive",
+            "verification": "confirmed",
+        }
+    if val is False:
+        return {
+            "ground_floor": False,
+            "label": "Not ground floor",
+            "short_label": "Upper",
+            "tone": "warning",
+            "verification": "confirmed",
+        }
+    return {
+        "ground_floor": None,
+        "label": "Floor unknown — verify on site",
+        "short_label": "Verify",
+        "tone": "caution",
+        "verification": "required",
+    }
+
+
+def laundromat_access_impossible(extracted: Optional[Dict[str, Any]]) -> bool:
+    """True only when upper-floor access makes a laundromat physically impractical."""
+    if not isinstance(extracted, dict):
+        return False
+    if ground_floor_value(extracted) is not False:
+        return False
+    if extracted.get("loading_access"):
+        return False
+    floor_area = _safe_float(extracted.get("floor_area_m2")) or 0.0
+    if floor_area >= 120:
+        return True
+    if extracted.get("requires_freight_elevator") is False:
+        return True
+    return False
 
 
 def make_dedupe_key(*, listing_url: Optional[str], address: Optional[str],

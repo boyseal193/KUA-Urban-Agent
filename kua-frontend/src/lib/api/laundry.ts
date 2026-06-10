@@ -48,6 +48,9 @@ export interface LaundryProperty {
   washer_count?: number | null;
   dryer_count?: number | null;
   ground_floor?: boolean | null;
+  ground_floor_status?: string | null;
+  ground_floor_verification?: string | null;
+  floor_level?: string | null;
   loading_access?: boolean | null;
   corner_unit?: boolean | null;
   water_available?: boolean | null;

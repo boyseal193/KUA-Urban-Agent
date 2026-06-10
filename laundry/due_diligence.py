@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
+from laundry.normalization import ground_floor_value
+
 
 def _push(arr: List[str], cond: bool, text: str) -> None:
     if cond and text not in arr:
@@ -31,12 +33,15 @@ def build_due_diligence(*, extracted: Dict[str, Any], economics: Dict[str, Any],
           f"Located in operator target market: {scoring.get('preferred_market', {}).get('matched')}")
     _push(strengths, (economics.get("secondary_revenue_eur") or 0) > 6_000,
           "Material secondary revenue (lockers / vending / drop-off)")
-    _push(strengths, bool(extracted.get("ground_floor", True)) and bool(extracted.get("loading_access")),
+    gf = ground_floor_value(extracted)
+    _push(strengths, gf is True and bool(extracted.get("loading_access")),
           "Ground floor with loading access")
+    _push(strengths, gf is True, "Ground floor — strong laundromat fit")
 
     _push(weaknesses, (economics.get("payback_years") or 99) > 8, "Long payback period (>8y)")
     _push(weaknesses, (economics.get("operating_margin") or 0) < 0.20, "Thin operating margin (<20%)")
-    _push(weaknesses, not extracted.get("ground_floor", True), "Not ground floor — access risk")
+    _push(weaknesses, gf is False, "Not ground floor — major access warning (manual review)")
+    _push(weaknesses, gf is None, "Floor level unknown — on-site verification required")
     _push(weaknesses, not extracted.get("loading_access"), "No dedicated loading access")
     _push(weaknesses, confidence.get("band") == "low", "Low data confidence — many key fields unknown")
 
@@ -60,6 +65,8 @@ def build_due_diligence(*, extracted: Dict[str, Any], economics: Dict[str, Any],
         if d.startswith("ebitda_neg"): _push(risks, True, "EBITDA negative or unknown")
 
     checklist += [
+        "Verify floor level on-site (ground floor strongly preferred for laundromats).",
+        "Confirm planta baja / street-level access for machine delivery.",
         "Verify floor area on-site (laser measurement).",
         "Confirm 3-phase power availability and meter capacity.",
         "Check existing water supply diameter and pressure.",
@@ -77,6 +84,8 @@ def build_due_diligence(*, extracted: Dict[str, Any], economics: Dict[str, Any],
     if int(location.get("competitors_within_1km") or 0) >= 12: _push(red_flags, True, "Severely oversaturated market")
     if extracted.get("structural_issue_flag"): _push(red_flags, True, "Possible structural issue declared")
     if extracted.get("flood_risk_flag"): _push(red_flags, True, "Known flood risk")
+    if gf is None: _push(red_flags, True, "Floor level unverified — confirm ground-floor access")
+    if gf is False: _push(red_flags, True, "Not ground floor — laundromat access risk")
 
     return {
         "swot": {

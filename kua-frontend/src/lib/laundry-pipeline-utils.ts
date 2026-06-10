@@ -23,6 +23,33 @@ export function propertyTitle(deal: LaundryProperty): string {
   return deal.address || deal.neighbourhood || "Untitled property";
 }
 
+export function floorStatusMeta(
+  deal: Pick<LaundryProperty, "ground_floor" | "ground_floor_status" | "ground_floor_verification">,
+) {
+  if (deal.ground_floor === true) {
+    return {
+      label: deal.ground_floor_status || "Ground floor",
+      shortLabel: "GF",
+      tone: "positive" as const,
+      color: "#34D399",
+    };
+  }
+  if (deal.ground_floor === false) {
+    return {
+      label: deal.ground_floor_status || "Not ground floor",
+      shortLabel: "Upper",
+      tone: "warning" as const,
+      color: "#FBBF24",
+    };
+  }
+  return {
+    label: deal.ground_floor_status || "Floor unknown — verify on site",
+    shortLabel: "Verify",
+    tone: "caution" as const,
+    color: "#38BDF8",
+  };
+}
+
 export function districtLabel(deal: LaundryProperty): string {
   return deal.matched_neighbourhood || deal.neighbourhood || "—";
 }
