@@ -154,11 +154,13 @@ interface LaundryPipelineExportMenuProps {
   className?: string;
 }
 
-export function LaundryPipelineExportMenu({ scanId, className }: LaundryPipelineExportMenuProps) {
-  if (!scanId) {
-    return <LaundryPipelineExportToolbar className={className} />;
-  }
-
+function LaundryScanExportToolbar({
+  scanId,
+  className,
+}: {
+  scanId: string;
+  className?: string;
+}) {
   const scanExport = useCreateLaundryScanExport(scanId);
   const [lastExport, setLastExport] = React.useState<ExportResult | null>(null);
 
@@ -204,6 +206,14 @@ export function LaundryPipelineExportMenu({ scanId, className }: LaundryPipeline
       )}
     </div>
   );
+}
+
+export function LaundryPipelineExportMenu({ scanId, className }: LaundryPipelineExportMenuProps) {
+  if (!scanId) {
+    return <LaundryPipelineExportToolbar className={className} />;
+  }
+
+  return <LaundryScanExportToolbar scanId={scanId} className={className} />;
 }
 
 interface LaundryBulkExportToolbarProps {

@@ -8,7 +8,6 @@ import {
   Activity,
   BadgeCheck,
   BrainCircuit,
-  CheckCircle2,
   Columns3,
   Download,
   History,
@@ -18,7 +17,6 @@ import {
   Settings,
   ShieldCheck,
   Sliders,
-  WashingMachine,
   Wrench,
   XCircle,
 } from "lucide-react";
