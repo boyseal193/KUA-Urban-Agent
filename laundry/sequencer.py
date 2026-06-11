@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 import traceback as _tb
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -19,6 +20,17 @@ from jobs import store as job_store
 from jobs.constants import JOB_CANCELLED, JOB_FAILED, JOB_RUNNING, JOB_SUCCESS
 
 from laundry import exports, pipeline, store as laundry_store, url_builder
+from laundry.listing_ledger import (
+    ListingDiagnostics,
+    TRACE_CLAIMED,
+    TRACE_FAILED,
+    TRACE_PROCESSED,
+    TRACE_RETRIED,
+    build_listing_queue,
+    persist_skip_rows,
+    reconcile_diagnostics,
+    trace_event,
+)
 from laundry.pipeline import EXTRACTION_FAILED
 
 log = logging.getLogger("kua.laundry.sequencer")
@@ -63,7 +75,7 @@ DEFAULT_AUTONOMOUS_DEFAULTS: Dict[str, Any] = {
     "autonomous_mode": True,
     "operation_mode": "balanced",
     "max_attempts": 3,
-    "concurrency": 2,
+    "concurrency": int(os.getenv("PIPELINE_CONCURRENCY", "5")),
     "timeout_level": "normal",
     "auto_export": True,
 }
@@ -115,6 +127,7 @@ class AutonomousConfig:
         concurrency = int(
             payload.get("concurrency")
             or raw.get("concurrency")
+            or os.getenv("PIPELINE_CONCURRENCY")
             or DEFAULT_AUTONOMOUS_DEFAULTS["concurrency"]
         )
         concurrency = max(1, min(concurrency, 8))
@@ -195,7 +208,7 @@ def parse_autonomous_defaults(stored: Optional[Dict[str, Any]]) -> Dict[str, Any
     if out.get("timeout_level") not in TIMEOUT_LEVELS:
         out["timeout_level"] = "normal"
     out["max_attempts"] = max(1, min(int(out.get("max_attempts") or 3), 10))
-    out["concurrency"] = max(1, min(int(out.get("concurrency") or 2), 8))
+    out["concurrency"] = max(1, min(int(out.get("concurrency") or os.getenv("PIPELINE_CONCURRENCY", 5)), 8))
     out["autonomous_mode"] = bool(out.get("autonomous_mode", True))
     out["auto_export"] = bool(out.get("auto_export", True))
     return out
@@ -224,11 +237,16 @@ class AutonomousSequencer:
         self.overrides = config.merge_overrides(payload.get("overrides") or {})
         self.listing_url = payload.get("url") or job.get("search_url") or None
         self.raw_text = payload.get("raw_text")
-        self.use_llm = bool(payload.get("use_llm_extraction", True))
+        self.use_llm = bool(payload.get("use_llm_extraction", False))
         self.listing_limit = max(int(payload.get("listing_limit") or job.get("listing_limit") or 10), 1)
         self.search_type = (payload.get("search_type") or self.filters.get("search_type") or "manual_url").lower()
         self.search_provider = payload.get("search_provider") or "idealista"
         self.search_diagnostics = payload.get("search_diagnostics") or {}
+
+        self._counter_lock = threading.Lock()
+        self._diagnostics = ListingDiagnostics()
+        self._retried_count = 0
+        self._completed_urls: Set[str] = set()
 
         self.counters: Dict[str, int] = {
             "done": 0,
@@ -287,8 +305,13 @@ class AutonomousSequencer:
             if not self._step_underwrite(listing_targets):
                 return self._final_response(JOB_CANCELLED)
 
-            export_meta = self._step_export()
-            final_status = self._step_summarize(export_meta)
+            final_status = self._step_summarize(None)
+            if self.config.auto_export:
+                threading.Thread(
+                    target=self._run_export_background,
+                    name=f"laundry-export-{self.job_id[:8]}",
+                    daemon=True,
+                ).start()
             return self._final_response(final_status)
 
         except Exception as exc:
@@ -297,16 +320,18 @@ class AutonomousSequencer:
             return self._final_response(JOB_FAILED)
 
     def _load_resume_state(self) -> None:
-        for row in laundry_store.get_listing_results(self.job_id):
+        existing = laundry_store.get_listing_results(self.job_id)
+        self._completed_urls = laundry_store.get_completed_listing_urls(self.job_id)
+        self.counters["done"] = len(existing)
+        for row in existing:
             idx = row.get("listing_index")
             if idx is None:
                 continue
             status = (row.get("status") or "").lower()
-            if row.get("property_id") or status in ("success", "skipped", EXTRACTION_FAILED):
+            if row.get("property_id") or status in ("success", "skipped", EXTRACTION_FAILED, "failed"):
                 self._completed_indices.add(int(idx))
                 bucket = _classify_listing_row(row)
                 self.counters[bucket] = self.counters.get(bucket, 0) + 1
-                self.counters["done"] = self.counters.get("done", 0) + 1
         if self._completed_indices:
             self.counters["resumed"] = len(self._completed_indices)
             log.info(
@@ -410,6 +435,8 @@ class AutonomousSequencer:
                 status=laundry_store.STEP_SKIPPED,
                 output={"reason": "inline_text_only"},
             )
+            self._diagnostics.listings_found = 1
+            self._diagnostics.listings_queued = 1
             return [(None, self.raw_text, 0)]
 
         if mode == "single_listing":
@@ -419,10 +446,12 @@ class AutonomousSequencer:
                 status=laundry_store.STEP_SKIPPED,
                 output={"reason": "single_listing_url"},
             )
+            self._diagnostics.listings_found = 1
+            self._diagnostics.listings_queued = 1
             return [(self.listing_url, None, 0)]
 
         laundry_store.start_step(self.job_id, laundry_store.JOB_STEP_DISCOVER, listing_url=self.listing_url)
-        urls, diagnostics = self._discover_with_retries()
+        raw_urls, diagnostics = self._discover_with_retries()
         if diagnostics:
             self.search_diagnostics = diagnostics
 
@@ -434,17 +463,26 @@ class AutonomousSequencer:
             except Exception:
                 pass
 
-        urls = self._dedupe_urls(urls)
+        queue, self._diagnostics, skip_rows = build_listing_queue(
+            job_id=self.job_id,
+            raw_urls=raw_urls,
+            listing_limit=self.listing_limit,
+            completed_indices=self._completed_indices,
+            completed_urls=self._completed_urls,
+        )
+        persist_skip_rows(self.job_id, skip_rows)
+
         discover_output: Dict[str, Any] = {
-            "discovered_count": len(urls),
+            "discovered_count": self._diagnostics.listings_found,
+            "queued_count": self._diagnostics.listings_queued,
             "search_url": self.listing_url,
-            "urls": urls[:20],
-            "deduped_count": self.counters.get("deduped", 0),
+            "urls": raw_urls[:20],
+            "diagnostics": self._diagnostics.to_dict(),
         }
         if self.search_diagnostics:
             discover_output["search_diagnostics"] = self.search_diagnostics
 
-        if not urls:
+        if self._diagnostics.listings_found == 0:
             laundry_store.finish_step(
                 self.job_id,
                 laundry_store.JOB_STEP_DISCOVER,
@@ -472,8 +510,7 @@ class AutonomousSequencer:
             status=laundry_store.STEP_SUCCESS,
             output=discover_output,
         )
-        limited = urls[: self.listing_limit]
-        return [(u, None, i) for i, u in enumerate(limited)]
+        return [(item.url, None, item.index) for item in queue]
 
     def _discover_with_retries(self) -> Tuple[List[str], Dict[str, Any]]:
         attempts = 0
@@ -514,20 +551,9 @@ class AutonomousSequencer:
 
         return last_urls, diagnostics
 
-    def _dedupe_urls(self, urls: List[str]) -> List[str]:
-        seen: Set[str] = set()
-        unique: List[str] = []
-        for url in urls:
-            key = (url or "").strip().rstrip("/")
-            if not key or key in seen:
-                self.counters["deduped"] = self.counters.get("deduped", 0) + 1
-                continue
-            seen.add(key)
-            unique.append(url)
-        return unique
-
     def _step_underwrite(self, targets: List[Tuple[Optional[str], Optional[str], int]]) -> bool:
-        self.counters["total"] = len(targets)
+        self.counters["total"] = self._diagnostics.listings_found or len(targets)
+        self.counters["deduped"] = self._diagnostics.listings_deduped
         laundry_store.set_job_counters(
             self.job_id,
             listings_total=self.counters["total"],
@@ -541,13 +567,20 @@ class AutonomousSequencer:
             if idx not in self._completed_indices
         ]
         url_by_idx = {idx: url for url, text, idx in targets}
+        workers = max(1, min(self.config.concurrency, len(pending) or 1))
 
-        if self.config.concurrency <= 1 or len(pending) <= 1:
+        if workers <= 1 or len(pending) <= 1:
             for url, text, idx in pending:
                 if not self._process_one_listing(url, text, idx):
                     return False
         else:
-            with ThreadPoolExecutor(max_workers=self.config.concurrency) as pool:
+            log.info(
+                "laundry.sequencer concurrent job_id=%s workers=%s pending=%s",
+                self.job_id,
+                workers,
+                len(pending),
+            )
+            with ThreadPoolExecutor(max_workers=workers) as pool:
                 futures = {
                     pool.submit(self._process_listing_worker, url, text, idx): idx
                     for url, text, idx in pending
@@ -562,6 +595,13 @@ class AutonomousSequencer:
                     except Exception as exc:
                         log.exception("Concurrent listing worker failed idx=%s: %s", idx, exc)
                         res = {"success": False, "error": str(exc)}
+                        if url_by_idx.get(idx):
+                            res = pipeline.persist_extraction_failed(
+                                listing_url=url_by_idx[idx],
+                                job_id=self.job_id,
+                                extracted={},
+                                error=str(exc),
+                            )
                     self._apply_listing_result(idx, url_by_idx.get(idx), res)
 
         laundry_store.finish_step(
@@ -604,6 +644,7 @@ class AutonomousSequencer:
         text: Optional[str],
         idx: int,
     ) -> Tuple[bool, Dict[str, Any]]:
+        trace_event(TRACE_CLAIMED, job_id=self.job_id, url=url, listing_index=idx)
         laundry_store.start_step(
             self.job_id,
             laundry_store.LISTING_STEP_PROCESS,
@@ -611,11 +652,39 @@ class AutonomousSequencer:
             listing_url=url,
         )
         step_started = time.monotonic()
-        res = self._run_listing_with_retries(url, text, idx)
+        res, retries = self._run_listing_with_retries(url, text, idx)
+        if retries:
+            with self._counter_lock:
+                self._retried_count += retries
         res = self._maybe_upgrade_to_manual_review(res)
 
         step_ms = int((time.monotonic() - step_started) * 1000)
         row_status = _listing_row_status(res)
+        if row_status == "failed":
+            trace_event(
+                TRACE_FAILED,
+                job_id=self.job_id,
+                url=url,
+                listing_index=idx,
+                error=res.get("error") or res.get("reason"),
+            )
+        elif row_status == "skipped":
+            trace_event(
+                TRACE_FAILED,
+                job_id=self.job_id,
+                url=url,
+                listing_index=idx,
+                reason=res.get("reason") or "skipped",
+            )
+        else:
+            trace_event(
+                TRACE_PROCESSED,
+                job_id=self.job_id,
+                url=url,
+                listing_index=idx,
+                property_id=res.get("property_id"),
+                deal_status=_deal_status(res),
+            )
         listing_status = (
             laundry_store.STEP_SUCCESS
             if row_status in ("success", EXTRACTION_FAILED)
@@ -643,24 +712,31 @@ class AutonomousSequencer:
 
     def _apply_listing_result(self, idx: int, url: Optional[str], res: Dict[str, Any]) -> None:
         bucket = _classify_result(res)
-        self.counters[bucket] = self.counters.get(bucket, 0) + 1
-        self.counters["done"] = self.counters.get("done", 0) + 1
         _record_listing(self.job_id, idx, url, res)
+        with self._counter_lock:
+            self.counters[bucket] = self.counters.get(bucket, 0) + 1
+            self.counters["done"] = self.counters.get("done", 0) + 1
+            done = self.counters["done"]
+            total = self.counters["total"]
+            failed = self.counters["failed"]
+            approved = self.counters["approved"]
+            manual = self.counters["manual_review"]
+            rejected = self.counters["rejected"]
 
-        progress = 10 + int((self.counters["done"] / max(self.counters["total"], 1)) * 70)
+        progress = 10 + int((done / max(total, 1)) * 70)
         laundry_store.set_job_counters(
             self.job_id,
-            listings_done=self.counters["done"],
-            listings_failed=self.counters["failed"],
-            approved_count=self.counters["approved"],
-            manual_review_count=self.counters["manual_review"],
-            rejected_count=self.counters["rejected"],
+            listings_done=done,
+            listings_failed=failed,
+            approved_count=approved,
+            manual_review_count=manual,
+            rejected_count=rejected,
             progress_pct=min(progress, 90),
         )
         log.info(
             "laundry.sequencer listing %s/%s url=%s bucket=%s property_id=%s",
-            self.counters["done"],
-            self.counters["total"],
+            done,
+            total,
             url,
             bucket,
             res.get("property_id"),
@@ -671,8 +747,9 @@ class AutonomousSequencer:
         url: Optional[str],
         text: Optional[str],
         idx: int,
-    ) -> Dict[str, Any]:
+    ) -> Tuple[Dict[str, Any], int]:
         attempts = 0
+        retries = 0
         max_tries = 1 + self.config.listing_retries
         last: Dict[str, Any] = {"success": False, "error": "not_started"}
 
@@ -695,18 +772,34 @@ class AutonomousSequencer:
                         url=url or "",
                         overrides=self.overrides,
                         filters=self.filters,
-                        use_llm=self.use_llm,
+                        use_llm=False,
                         job_id=self.job_id,
                         persist=True,
                     )
                 if last.get("property_id") or last.get("skipped"):
-                    return last
+                    return last, retries
                 if last.get("extraction_failed") and last.get("property_id"):
-                    return last
+                    return last, retries
                 if attempts >= max_tries:
-                    return last
+                    if url and not last.get("property_id"):
+                        last = pipeline.persist_extraction_failed(
+                            listing_url=url,
+                            job_id=self.job_id,
+                            extracted=last.get("extracted") or {},
+                            error=last.get("error") or "max_retries_exceeded",
+                        )
+                    return last, retries
                 if not self.config.enabled:
-                    return last
+                    return last, retries
+                retries += 1
+                trace_event(
+                    TRACE_RETRIED,
+                    job_id=self.job_id,
+                    url=url,
+                    listing_index=idx,
+                    attempt=attempts,
+                    max_tries=max_tries,
+                )
                 log.info(
                     "laundry.sequencer listing retry job_id=%s idx=%s attempt=%s/%s",
                     self.job_id,
@@ -731,9 +824,10 @@ class AutonomousSequencer:
                         error=str(exc),
                     )
                 if attempts >= max_tries:
-                    return last
+                    return last, retries
+                retries += 1
 
-        return last
+        return last, retries
 
     def _maybe_upgrade_to_manual_review(self, res: Dict[str, Any]) -> Dict[str, Any]:
         if not self.config.prefer_manual_over_reject:
@@ -751,59 +845,25 @@ class AutonomousSequencer:
             res["scoring"] = scoring
         return res
 
-    def _step_export(self) -> Optional[Dict[str, Any]]:
+    def _run_export_background(self) -> None:
         laundry_store.start_step(self.job_id, laundry_store.JOB_STEP_EXPORT)
-        if not self.config.auto_export:
-            laundry_store.finish_step(
-                self.job_id,
-                laundry_store.JOB_STEP_EXPORT,
-                status=laundry_store.STEP_SKIPPED,
-                output={"reason": "auto_export_disabled"},
-            )
-            return None
-
-        properties, analyses = laundry_store.list_properties_for_export(job_id=self.job_id, limit=500)
-        if not properties:
-            laundry_store.finish_step(
-                self.job_id,
-                laundry_store.JOB_STEP_EXPORT,
-                status=laundry_store.STEP_SKIPPED,
-                output={"reason": "no_properties_to_export"},
-            )
-            return None
-
         try:
-            label = f"Scan {self.job_id[:8]} · Autonomous pipeline"
-            meta = exports.generate_pipeline_export(
-                properties,
-                analyses,
-                label=label,
-                job=self.job,
-            )
-            ok, record, err = laundry_store.create_export_record(
-                file_path=meta["file_path"],
-                size_bytes=meta["size_bytes"],
-                fmt=meta.get("format") or "excel",
-                export_type="scan_autonomous",
-                label=label,
-                job_id=self.job_id,
-            )
-            if not ok or not record:
-                raise RuntimeError(err or "export_persist_failed")
-            export_meta = {
-                "export_id": record.get("id"),
-                "file_path": record.get("file_path"),
-                "row_count": meta.get("row_count"),
-                "download_url": record.get("download_url"),
-            }
-            laundry_store.finish_step(
-                self.job_id,
-                laundry_store.JOB_STEP_EXPORT,
-                status=laundry_store.STEP_SUCCESS,
-                output=export_meta,
-            )
-            laundry_store.update_job(self.job_id, generate_excel=True)
-            return export_meta
+            meta = self._generate_export_file()
+            if meta:
+                laundry_store.finish_step(
+                    self.job_id,
+                    laundry_store.JOB_STEP_EXPORT,
+                    status=laundry_store.STEP_SUCCESS,
+                    output=meta,
+                )
+                laundry_store.update_job(self.job_id, generate_excel=True)
+            else:
+                laundry_store.finish_step(
+                    self.job_id,
+                    laundry_store.JOB_STEP_EXPORT,
+                    status=laundry_store.STEP_SKIPPED,
+                    output={"reason": "no_properties_to_export"},
+                )
         except Exception as exc:
             log.warning("laundry.sequencer export failed job_id=%s: %s", self.job_id, exc)
             laundry_store.finish_step(
@@ -812,16 +872,58 @@ class AutonomousSequencer:
                 status=laundry_store.STEP_FAILED,
                 error_message=str(exc)[:500],
             )
+
+    def _generate_export_file(self) -> Optional[Dict[str, Any]]:
+        if not self.config.auto_export:
             return None
+        properties, analyses = laundry_store.list_properties_for_export(job_id=self.job_id, limit=500)
+        if not properties:
+            return None
+        label = f"Scan {self.job_id[:8]} · Autonomous pipeline"
+        meta = exports.generate_pipeline_export(
+            properties,
+            analyses,
+            label=label,
+            job=self.job,
+        )
+        ok, record, err = laundry_store.create_export_record(
+            file_path=meta["file_path"],
+            size_bytes=meta["size_bytes"],
+            fmt=meta.get("format") or "excel",
+            export_type="scan_autonomous",
+            label=label,
+            job_id=self.job_id,
+        )
+        if not ok or not record:
+            raise RuntimeError(err or "export_persist_failed")
+        return {
+            "export_id": record.get("id"),
+            "file_path": record.get("file_path"),
+            "row_count": meta.get("row_count"),
+            "download_url": record.get("download_url"),
+        }
 
     def _step_summarize(self, export_meta: Optional[Dict[str, Any]]) -> str:
         laundry_store.start_step(self.job_id, laundry_store.JOB_STEP_SUMMARY)
         listing_rows = laundry_store.get_listing_results(self.job_id)
+        self._diagnostics = reconcile_diagnostics(self._diagnostics, listing_rows)
+        self._diagnostics.listings_retried = self._retried_count
         persisted_count = len([r for r in listing_rows if r.get("property_id")])
         scored_anything = (
             self.counters["approved"] + self.counters["manual_review"] + self.counters["rejected"]
         ) > 0
         has_cards = persisted_count > 0
+
+        if not self._diagnostics.invariant_ok:
+            log.error(
+                "laundry.sequencer invariant broken job_id=%s found=%s accounted=%s delta=%s",
+                self.job_id,
+                self._diagnostics.listings_found,
+                self._diagnostics.listings_processed
+                + self._diagnostics.listings_failed
+                + self._diagnostics.listings_skipped,
+                self._diagnostics.invariant_delta,
+            )
 
         if self.counters["done"] > 0 and not has_cards and self.counters.get("skipped", 0) < self.counters["done"]:
             final_status = JOB_FAILED
@@ -829,7 +931,7 @@ class AutonomousSequencer:
                 "Scan processed listings but no property rows were persisted. "
                 "Check Supabase connectivity and laundry/schema.sql migrations."
             )
-        elif has_cards or scored_anything:
+        elif has_cards or scored_anything or self._diagnostics.listings_found > 0:
             final_status = JOB_SUCCESS
             finish_error = None
         else:
@@ -842,14 +944,23 @@ class AutonomousSequencer:
             "rejected_count": self.counters["rejected"],
             "failed_count": self.counters["failed"],
             "extraction_failed_count": self.counters["extraction_failed"],
-            "skipped_count": self.counters["skipped"],
-            "deduped_count": self.counters.get("deduped", 0),
+            "skipped_count": self._diagnostics.listings_skipped,
+            "deduped_count": self._diagnostics.listings_deduped,
             "resumed_count": self.counters.get("resumed", 0),
-            "total": self.counters["total"],
+            "total": self._diagnostics.listings_found,
+            "listings_found": self._diagnostics.listings_found,
+            "listings_queued": self._diagnostics.listings_queued,
+            "listings_processed": self._diagnostics.listings_processed,
+            "listings_failed_count": self._diagnostics.listings_failed,
+            "listings_skipped": self._diagnostics.listings_skipped,
+            "listings_retried": self._retried_count,
+            "listings_truncated": self._diagnostics.listings_truncated,
             "persisted_count": persisted_count,
             "listing_result_count": len(listing_rows),
             "elapsed_sec": round(time.monotonic() - self.started, 2),
             "autonomous": self.config.to_dict(),
+            "diagnostics": self._diagnostics.to_dict(),
+            "invariant_ok": self._diagnostics.invariant_ok,
             "export": export_meta,
         }
         laundry_store.finish_step(
@@ -865,6 +976,9 @@ class AutonomousSequencer:
             finished_at=job_store._now(),
             summary=summary,
             error_message=finish_error,
+            listings_done=len(listing_rows),
+            listings_total=self._diagnostics.listings_found,
+            listings_failed=self._diagnostics.listings_failed,
         )
         log.info(
             "laundry.sequencer finished job_id=%s status=%s persisted=%s autonomous=%s",

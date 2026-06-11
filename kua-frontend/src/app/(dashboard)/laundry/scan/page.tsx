@@ -118,7 +118,7 @@ export default function LaundryScanPage() {
   const [autonomousMode, setAutonomousMode] = React.useState(true);
   const [operationMode, setOperationMode] = React.useState<LaundryOperationMode>("balanced");
   const [maxAttempts, setMaxAttempts] = React.useState(3);
-  const [concurrency, setConcurrency] = React.useState(2);
+  const [concurrency, setConcurrency] = React.useState(5);
   const [timeoutLevel, setTimeoutLevel] = React.useState<LaundryTimeoutLevel>("normal");
   const [autoExport, setAutoExport] = React.useState(true);
 

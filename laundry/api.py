@@ -68,7 +68,7 @@ class ScanPayload(BaseModel):
 
     llm_memo_polish: bool = False
     polish_with_llm: Optional[bool] = None
-    use_llm_extraction: bool = True
+    use_llm_extraction: bool = False
 
     neighbourhood_filters: List[str] = Field(default_factory=list)
     max_size_sqm: Optional[float] = Field(default=80.0, ge=10, le=2000)

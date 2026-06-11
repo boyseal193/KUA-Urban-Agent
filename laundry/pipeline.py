@@ -20,6 +20,7 @@ import logging
 from typing import Any, Dict, Optional, Tuple
 
 from laundry import (
+    cache as laundry_cache,
     due_diligence as dd_mod,
     economics as econ_mod,
     extraction,
@@ -284,10 +285,16 @@ def analyse_listing(
         extracted=extracted, economics=economics, scoring=scoring, location=location
     )
 
-    memo_md = memo_mod.generate_ic_memo(
-        extracted=extracted, economics=economics, scoring=scoring,
-        location=location, due_diligence=due_diligence,
-    )
+    memo_key = laundry_cache.memo_cache_key(listing_url=listing_url, extracted=extracted)
+    cached_memo = laundry_cache.get_memo(memo_key)
+    if cached_memo:
+        memo_md = cached_memo
+    else:
+        memo_md = memo_mod.generate_ic_memo(
+            extracted=extracted, economics=economics, scoring=scoring,
+            location=location, due_diligence=due_diligence,
+        )
+        laundry_cache.set_memo(memo_key, memo_md)
 
     result: Dict[str, Any] = {
         "success": True, "skipped": False,
@@ -329,12 +336,34 @@ def process_listing_url(
     url: str,
     overrides: Optional[Dict[str, Any]] = None,
     filters: Optional[Dict[str, Any]] = None,
-    use_llm: bool = True,
+    use_llm: bool = False,
     job_id: Optional[str] = None,
     persist: bool = True,
 ) -> Dict[str, Any]:
     """Scrape listing detail → extract → persist property (or extraction_failed card)."""
     log.info("pipeline.found_listing_url job_id=%s url=%s", job_id, url)
+
+    cached_extracted = laundry_cache.get_extracted(url)
+    if cached_extracted:
+        log.info("pipeline.cache hit extracted job_id=%s url=%s", job_id, url)
+        if not extraction.has_usable_fields(cached_extracted):
+            return _persist_extraction_failed(
+                listing_url=url,
+                job_id=job_id,
+                extracted=cached_extracted,
+                error="insufficient_extracted_fields",
+            )
+        return analyse_listing(
+            raw_text=cached_extracted.get("_raw_text") or "",
+            html=cached_extracted.get("_html") or "",
+            listing_url=url,
+            source="url_scan",
+            overrides=overrides,
+            filters=filters,
+            use_llm=False,
+            job_id=job_id,
+            persist=persist,
+        )
 
     fetched = scanner.fetch_listing_text(url)
     if not fetched.get("success"):
@@ -358,6 +387,10 @@ def process_listing_url(
         extraction.extract_listing(raw_text, html=html, use_llm=use_llm)
     )
     _log_extracted_fields(job_id, url, extracted)
+    cache_payload = dict(extracted)
+    cache_payload["_raw_text"] = raw_text[:8000] if raw_text else ""
+    cache_payload["_html"] = ""
+    laundry_cache.set_extracted(url, cache_payload)
 
     if not extraction.has_usable_fields(extracted):
         log.warning(

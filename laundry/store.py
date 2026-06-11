@@ -24,7 +24,7 @@ import re
 import traceback
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, TypeVar
 
 from database import supabase
 from laundry import normalization
@@ -808,6 +808,46 @@ def get_listing_results(job_id: str) -> List[Dict[str, Any]]:
         return []
 
 
+def get_completed_listing_urls(job_id: str) -> Set[str]:
+    """Normalized listing URLs already terminal in this job (for resume + early dedupe)."""
+    from laundry.listing_ledger import normalize_listing_url
+
+    urls: Set[str] = set()
+    for row in get_listing_results(job_id):
+        url = row.get("listing_url")
+        if not url:
+            continue
+        status = (row.get("status") or "").lower()
+        if row.get("property_id") or status in ("success", "failed", "skipped", "extraction_failed"):
+            urls.add(normalize_listing_url(url))
+    return urls
+
+
+def get_global_known_listing_urls(limit: int = 5000) -> Set[str]:
+    """Listing URLs already persisted in laundry_properties (cross-scan early dedupe)."""
+    from laundry.listing_ledger import normalize_listing_url
+
+    if supabase is None:
+        return set()
+    try:
+        res = (
+            supabase.table("laundry_properties")
+            .select("listing_url")
+            .is_("deleted_at", "null")
+            .not_.is_("listing_url", "null")
+            .limit(limit)
+            .execute()
+        )
+        return {
+            normalize_listing_url(row.get("listing_url"))
+            for row in (res.data or [])
+            if row.get("listing_url")
+        }
+    except Exception as exc:
+        log.warning("get_global_known_listing_urls failed: %s", exc)
+        return set()
+
+
 def list_job_properties(job_id: str) -> List[Dict[str, Any]]:
     """Full property rows for a scan job, enriched with latest analysis snippets."""
     if supabase is None or not job_id:
@@ -970,6 +1010,28 @@ def build_scan_summary(
     rejected = [p for p in properties if p.get("deal_status") == "rejected"]
     extraction_failed_props = [p for p in properties if p.get("deal_status") == "extraction_failed"]
     persisted_count = len(persisted_rows) or len(properties)
+
+    job_summary = job.get("summary") or {}
+    if isinstance(job_summary, str):
+        try:
+            job_summary = json.loads(job_summary)
+        except Exception:
+            job_summary = {}
+    diagnostics = job_summary.get("diagnostics") or {}
+
+    processed_count = len(scored_rows) + len(extraction_failed_rows)
+    failed_count = len(failed_rows)
+    skipped_count = len(skipped_rows)
+    found_count = int(
+        diagnostics.get("listings_found")
+        or job_summary.get("listings_found")
+        or job.get("listings_total")
+        or len(listings)
+        or 0
+    )
+    accounted = processed_count + failed_count + skipped_count
+    invariant_ok = found_count == 0 or found_count == accounted
+
     return {
         "scanned_count": job.get("listings_done") or len(listings),
         "listings_total": job.get("listings_total") or len(listings),
@@ -979,10 +1041,22 @@ def build_scan_summary(
         "approved_count": job.get("approved_count") or len(approved),
         "manual_review_count": job.get("manual_review_count") or len(manual),
         "rejected_count": job.get("rejected_count") or len(rejected),
-        "skipped_count": len(skipped_rows),
+        "skipped_count": skipped_count,
         "persisted_count": persisted_count,
         "property_count": len(properties),
         "listing_result_count": len(listings),
+        "listings_found": found_count,
+        "listings_queued": int(diagnostics.get("listings_queued") or job_summary.get("listings_queued") or job.get("listings_total") or 0),
+        "listings_processed": processed_count,
+        "listings_failed_count": failed_count,
+        "listings_skipped": skipped_count,
+        "listings_retried": int(diagnostics.get("listings_retried") or job_summary.get("listings_retried") or 0),
+        "listings_deduped": int(diagnostics.get("listings_deduped") or job_summary.get("listings_deduped") or 0),
+        "listings_truncated": int(diagnostics.get("listings_truncated") or job_summary.get("listings_truncated") or 0),
+        "listings_resumed": int(diagnostics.get("listings_resumed") or job_summary.get("listings_resumed") or 0),
+        "invariant_ok": bool(diagnostics.get("invariant_ok", invariant_ok)),
+        "invariant_delta": int(diagnostics.get("invariant_delta") or (found_count - accounted)),
+        "skip_reasons": diagnostics.get("skip_reasons") or {},
         "approved_candidates": approved,
         "manual_review_deals": manual,
         "rejected_deals": rejected,
@@ -996,6 +1070,7 @@ def build_scan_summary(
             (job.get("listings_done") or 0) > 0
             and persisted_count == 0
         ),
+        "diagnostics": diagnostics,
     }
 
 

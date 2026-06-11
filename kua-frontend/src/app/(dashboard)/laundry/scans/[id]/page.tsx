@@ -138,6 +138,28 @@ export default function LaundryScanDetailPage({
         </Card>
       )}
 
+      {summary && (
+        <Card>
+          <CardHeader>
+            <CardTitle>Pipeline diagnostics</CardTitle>
+          </CardHeader>
+          <CardContent className="grid gap-3 sm:grid-cols-3 lg:grid-cols-6">
+            <DiagStat label="Found" value={summary.listings_found ?? summary.listings_total ?? 0} />
+            <DiagStat label="Queued" value={summary.listings_queued ?? job?.listings_total ?? 0} />
+            <DiagStat label="Processed" value={summary.listings_processed ?? summary.persisted_count ?? 0} />
+            <DiagStat label="Failed" value={summary.listings_failed_count ?? summary.listings_failed ?? 0} />
+            <DiagStat label="Skipped" value={summary.listings_skipped ?? summary.skipped_count ?? 0} />
+            <DiagStat label="Retried" value={summary.listings_retried ?? 0} />
+          </CardContent>
+          {summary.invariant_ok === false && (
+            <CardContent className="border-t border-border/60 pt-3 text-xs text-amber-200">
+              Listing count mismatch (delta {summary.invariant_delta ?? "?"}). Check worker trace logs
+              for DISCOVERED / QUEUED / CLAIMED / PROCESSED / FAILED events.
+            </CardContent>
+          )}
+        </Card>
+      )}
+
       <Card>
         <CardHeader>
           <CardTitle>
@@ -268,6 +290,15 @@ function StatusBadge({ status }: { status: string }) {
     >
       {statusLabel(status)}
     </span>
+  );
+}
+
+function DiagStat({ label, value }: { label: string; value: number | string }) {
+  return (
+    <div className="rounded-md border border-border/60 bg-card/40 px-3 py-2">
+      <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">{label}</p>
+      <p className="mt-1 text-lg font-semibold tabular-nums text-foreground">{value}</p>
+    </div>
   );
 }
 
