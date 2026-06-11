@@ -235,6 +235,16 @@ export interface LaundryScanListingResult {
   deal_status?: LaundryDealStatus | null;
   score?: number | null;
   error_message?: string | null;
+  reason_code?: string | null;
+  reason_message?: string | null;
+  stage_failed?: string | null;
+  attempt_count?: number | null;
+  duplicate_of_property_id?: string | null;
+  dedupe_key?: string | null;
+  dedupe_method?: string | null;
+  filter_name?: string | null;
+  filter_value?: string | null;
+  actual_value?: string | null;
   result?: Record<string, unknown> | null;
   created_at?: string | null;
 }
@@ -266,6 +276,14 @@ export interface LaundryScanSummary {
   discovered_count?: number;
   source_available_count?: number | null;
   availability_message?: string | null;
+  source_found_count?: number;
+  queued_count?: number;
+  processed_count?: number;
+  success_count?: number;
+  duplicate_count?: number;
+  filtered_out_count?: number;
+  failed_count?: number;
+  exported_count?: number;
   invariant_ok?: boolean;
   invariant_delta?: number;
   skip_reasons?: Record<string, number>;

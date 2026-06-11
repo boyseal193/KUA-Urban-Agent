@@ -28,9 +28,17 @@ from laundry.listing_ledger import (
     TRACE_PROCESSED,
     TRACE_RETRIED,
     build_listing_queue,
+    normalize_worker_result,
     persist_skip_rows,
     reconcile_diagnostics,
     trace_event,
+)
+from laundry.listing_outcomes import (
+    accounting_bucket,
+    display_label,
+    merge_pipeline_result,
+    resolve_legacy_skip,
+    step_status_for_terminal,
 )
 from laundry.pipeline import EXTRACTION_FAILED
 
@@ -76,7 +84,7 @@ DEFAULT_AUTONOMOUS_DEFAULTS: Dict[str, Any] = {
     "autonomous_mode": True,
     "operation_mode": "balanced",
     "max_attempts": 3,
-    "concurrency": int(os.getenv("PIPELINE_CONCURRENCY", "5")),
+    "concurrency": int(os.getenv("PIPELINE_CONCURRENCY", "3")),
     "timeout_level": "normal",
     "auto_export": True,
 }
@@ -131,7 +139,7 @@ class AutonomousConfig:
             or os.getenv("PIPELINE_CONCURRENCY")
             or DEFAULT_AUTONOMOUS_DEFAULTS["concurrency"]
         )
-        concurrency = max(1, min(concurrency, 8))
+        concurrency = max(1, min(concurrency, 5))
 
         timeout_level = (
             payload.get("timeout_level")
@@ -209,7 +217,7 @@ def parse_autonomous_defaults(stored: Optional[Dict[str, Any]]) -> Dict[str, Any
     if out.get("timeout_level") not in TIMEOUT_LEVELS:
         out["timeout_level"] = "normal"
     out["max_attempts"] = max(1, min(int(out.get("max_attempts") or 3), 10))
-    out["concurrency"] = max(1, min(int(out.get("concurrency") or os.getenv("PIPELINE_CONCURRENCY", 5)), 8))
+    out["concurrency"] = max(1, min(int(out.get("concurrency") or os.getenv("PIPELINE_CONCURRENCY", 3)), 5))
     out["autonomous_mode"] = bool(out.get("autonomous_mode", True))
     out["auto_export"] = bool(out.get("auto_export", True))
     return out
@@ -259,7 +267,9 @@ class AutonomousSequencer:
             "manual_review": 0,
             "rejected": 0,
             "failed": 0,
-            "skipped": 0,
+            "success": 0,
+            "duplicate": 0,
+            "filtered_out": 0,
             "extraction_failed": 0,
             "deduped": 0,
             "resumed": 0,
@@ -489,6 +499,23 @@ class AutonomousSequencer:
             source_available_count=source_available_count,
         )
         persist_skip_rows(self.job_id, skip_rows)
+        for item in queue:
+            laundry_store.seed_listing_step(
+                self.job_id,
+                item.index,
+                listing_url=item.url,
+                status=laundry_store.STEP_PENDING,
+            )
+        for idx, url, reason in skip_rows:
+            terminal_status, msg = resolve_legacy_skip(reason)
+            laundry_store.seed_listing_step(
+                self.job_id,
+                idx,
+                listing_url=url,
+                status=step_status_for_terminal(terminal_status),
+                error_message=msg,
+                output={"reason_code": reason, "reason_message": msg, "terminal_status": terminal_status},
+            )
 
         availability_note = availability_message(
             requested_limit=self.requested_limit,
@@ -681,28 +708,23 @@ class AutonomousSequencer:
         )
         step_started = time.monotonic()
         res, retries = self._run_listing_with_retries(url, text, idx)
+        res = merge_pipeline_result(normalize_worker_result(res))
         if retries:
             with self._counter_lock:
                 self._retried_count += retries
         res = self._maybe_upgrade_to_manual_review(res)
 
         step_ms = int((time.monotonic() - step_started) * 1000)
-        row_status = _listing_row_status(res)
-        if row_status == "failed":
+        terminal_status = res.get("status") or res.get("terminal_status") or "failed"
+        bucket = accounting_bucket(terminal_status)
+        if bucket == "failed" or terminal_status == EXTRACTION_FAILED:
             trace_event(
                 TRACE_FAILED,
                 job_id=self.job_id,
                 url=url,
                 listing_index=idx,
-                error=res.get("error") or res.get("reason"),
-            )
-        elif row_status == "skipped":
-            trace_event(
-                TRACE_FAILED,
-                job_id=self.job_id,
-                url=url,
-                listing_index=idx,
-                reason=res.get("reason") or "skipped",
+                error=res.get("reason_message") or res.get("error"),
+                terminal_status=terminal_status,
             )
         else:
             trace_event(
@@ -712,37 +734,49 @@ class AutonomousSequencer:
                 listing_index=idx,
                 property_id=res.get("property_id"),
                 deal_status=_deal_status(res),
+                terminal_status=terminal_status,
             )
-        listing_status = (
-            laundry_store.STEP_SUCCESS
-            if row_status in ("success", EXTRACTION_FAILED)
-            else laundry_store.STEP_SKIPPED
-            if row_status == "skipped"
-            else laundry_store.STEP_FAILED
-        )
+        listing_status = step_status_for_terminal(terminal_status)
         laundry_store.finish_step(
             self.job_id,
             laundry_store.LISTING_STEP_PROCESS,
             listing_index=idx,
             status=listing_status,
-            error_type=(None if listing_status == laundry_store.STEP_SUCCESS else "PersistError"),
-            error_message=res.get("error") or res.get("persist_warning"),
+            error_type=res.get("reason_code") if listing_status != laundry_store.STEP_SUCCESS else None,
+            error_message=res.get("reason_message") or res.get("error") or res.get("persist_warning"),
             duration_ms=step_ms,
             output={
+                "terminal_status": terminal_status,
+                "reason_code": res.get("reason_code"),
+                "reason_message": res.get("reason_message"),
+                "stage_failed": res.get("stage_failed"),
+                "attempt_count": res.get("attempt_count"),
                 "deal_status": _deal_status(res),
                 "score": (res.get("scoring") or {}).get("score"),
                 "property_id": res.get("property_id"),
                 "analysis_id": res.get("analysis_id"),
+                "duplicate_of_property_id": res.get("duplicate_of_property_id"),
                 "extraction_failed": bool(res.get("extraction_failed")),
             },
         )
         return True, res
 
     def _apply_listing_result(self, idx: int, url: Optional[str], res: Dict[str, Any]) -> None:
+        res = merge_pipeline_result(res)
         bucket = _classify_result(res)
         _record_listing(self.job_id, idx, url, res)
         with self._counter_lock:
             self.counters[bucket] = self.counters.get(bucket, 0) + 1
+            terminal = res.get("status") or res.get("terminal_status")
+            acct = accounting_bucket(str(terminal or bucket))
+            if acct == "success":
+                self.counters["success"] = self.counters.get("success", 0) + 1
+            elif acct == "duplicate":
+                self.counters["duplicate"] = self.counters.get("duplicate", 0) + 1
+            elif acct == "filtered_out":
+                self.counters["filtered_out"] = self.counters.get("filtered_out", 0) + 1
+            elif acct == "failed":
+                self.counters["failed"] = self.counters.get("failed", 0) + 1
             self.counters["done"] = self.counters.get("done", 0) + 1
             done = self.counters["done"]
             total = self.counters["total"]
@@ -804,8 +838,10 @@ class AutonomousSequencer:
                         job_id=self.job_id,
                         persist=True,
                     )
-                if last.get("property_id") or last.get("skipped"):
-                    return last, retries
+                if last.get("property_id"):
+                    return merge_pipeline_result(last), retries
+                if last.get("terminal_status") in ("duplicate", "filtered_out"):
+                    return merge_pipeline_result(last), retries
                 if last.get("extraction_failed") and last.get("property_id"):
                     return last, retries
                 if attempts >= max_tries:
@@ -905,13 +941,19 @@ class AutonomousSequencer:
         if not self.config.auto_export:
             return None
         properties, analyses = laundry_store.list_properties_for_export(job_id=self.job_id, limit=500)
-        if not properties:
-            return None
+        listing_rows = laundry_store.get_listing_results(self.job_id)
+        summary = laundry_store.build_scan_summary(self.job, listing_rows, properties)
         label = f"Scan {self.job_id[:8]} · Autonomous pipeline"
         meta = exports.generate_pipeline_export(
             properties,
             analyses,
             label=label,
+            job=self.job,
+        )
+        accounting_meta = exports.generate_listing_accounting_export(
+            listing_rows,
+            label=f"Scan {self.job_id[:8]} · All Listings",
+            summary=summary,
             job=self.job,
         )
         ok, record, err = laundry_store.create_export_record(
@@ -929,6 +971,7 @@ class AutonomousSequencer:
             "file_path": record.get("file_path"),
             "row_count": meta.get("row_count"),
             "download_url": record.get("download_url"),
+            "listing_accounting_export": accounting_meta,
         }
 
     def _step_summarize(self, export_meta: Optional[Dict[str, Any]]) -> str:
@@ -993,6 +1036,13 @@ class AutonomousSequencer:
             "effective_limit": self._diagnostics.effective_limit,
             "discovered_count": self._diagnostics.discovered_count,
             "source_available_count": self._diagnostics.source_available_count,
+            "source_found_count": self._diagnostics.source_available_count,
+            "queued_count": self._diagnostics.listings_queued,
+            "processed_count": self._diagnostics.listings_processed,
+            "success_count": self._diagnostics.success_count,
+            "duplicate_count": self._diagnostics.duplicate_count,
+            "filtered_out_count": self._diagnostics.filtered_out_count,
+            "exported_count": (export_meta or {}).get("row_count") if export_meta else 0,
             "availability_message": availability_note,
             "persisted_count": persisted_count,
             "listing_result_count": len(listing_rows),
@@ -1089,13 +1139,22 @@ class AutonomousSequencer:
 
 
 def _classify_listing_row(row: Dict[str, Any]) -> str:
-    ds = row.get("deal_status")
     status = (row.get("status") or "").lower()
-    if status == EXTRACTION_FAILED or ds == EXTRACTION_FAILED:
+    bucket = accounting_bucket(status)
+    if bucket == "duplicate":
+        return "duplicate"
+    if bucket == "filtered_out":
+        return "filtered_out"
+    if status == EXTRACTION_FAILED or row.get("deal_status") == EXTRACTION_FAILED:
         return "extraction_failed"
+    if bucket == "failed" or status == "failed":
+        return "failed"
     if status == "skipped":
-        return "skipped"
-    if status == "failed" or not row.get("property_id"):
+        code = row.get("reason_code") or (row.get("result") or {}).get("skip_reason") or "skipped"
+        legacy_bucket = accounting_bucket(resolve_legacy_skip(str(code))[0])
+        return legacy_bucket if legacy_bucket in ("duplicate", "filtered_out") else "failed"
+    ds = row.get("deal_status")
+    if not row.get("property_id"):
         return "failed"
     if ds == "approved_candidate":
         return "approved"
@@ -1113,12 +1172,22 @@ def _deal_status(res: Dict[str, Any]) -> Optional[str]:
 def _classify_result(res: Dict[str, Any]) -> str:
     if not isinstance(res, dict):
         return "failed"
+    res = merge_pipeline_result(res)
+    terminal = res.get("status") or res.get("terminal_status")
+    if terminal:
+        bucket = accounting_bucket(str(terminal))
+        if bucket == "duplicate":
+            return "duplicate"
+        if bucket == "filtered_out":
+            return "filtered_out"
+        if bucket == "failed":
+            if terminal == EXTRACTION_FAILED or res.get("extraction_failed"):
+                return "extraction_failed"
+            return "failed"
+    if res.get("duplicate"):
+        return "duplicate"
     if res.get("extraction_failed") and res.get("property_id"):
         return "extraction_failed"
-    if not res.get("success"):
-        return "failed"
-    if res.get("skipped"):
-        return "skipped"
     if not res.get("property_id"):
         return "failed"
     ds = _deal_status(res)
@@ -1126,21 +1195,14 @@ def _classify_result(res: Dict[str, Any]) -> str:
         return "approved"
     if ds == "manual_review":
         return "manual_review"
-    if ds == EXTRACTION_FAILED:
-        return "extraction_failed"
     return "rejected"
 
 
 def _listing_row_status(res: Dict[str, Any]) -> str:
     if not isinstance(res, dict):
         return "failed"
-    if res.get("skipped"):
-        return "skipped"
-    if res.get("property_id"):
-        if res.get("extraction_failed") or _deal_status(res) == EXTRACTION_FAILED:
-            return EXTRACTION_FAILED
-        return "success"
-    return "failed"
+    merged = merge_pipeline_result(res)
+    return merged.get("status") or merged.get("terminal_status") or "failed"
 
 
 def _extracted(res: Dict[str, Any]) -> Dict[str, Any]:
@@ -1153,15 +1215,13 @@ def _record_listing(
     url: Optional[str],
     res: Dict[str, Any],
 ) -> bool:
+    res = merge_pipeline_result(res)
     extracted = _extracted(res)
-    row_status = _listing_row_status(res)
     deal_status = _deal_status(res)
-    row_error = (
-        res.get("error")
-        or res.get("reason")
-        or res.get("persist_warning")
-        or ("persist_failed_no_property_id" if row_status == "failed" else None)
-    )
+    outcome = dict(res)
+    outcome.setdefault("listing_url", url)
+    outcome.setdefault("deal_status", deal_status)
+    outcome.setdefault("score", (res.get("scoring") or {}).get("score"))
     result_payload = {
         "verdict": (res.get("scoring") or {}).get("verdict"),
         "classification": (res.get("scoring") or {}).get("classification"),
@@ -1178,19 +1238,18 @@ def _record_listing(
         "payback_years": (res.get("economics") or {}).get("payback_years"),
         "analysis_id": res.get("analysis_id"),
     }
-    return laundry_store.record_listing_result(
+    outcome.update(result_payload)
+    return laundry_store.record_listing_outcome(
         job_id,
         idx,
         listing_url=url,
-        status=row_status,
+        outcome=outcome,
         property_id=res.get("property_id"),
         deal_status=deal_status,
         score=(res.get("scoring") or {}).get("score"),
-        error_message=row_error,
         address=extracted.get("address"),
         city=extracted.get("city"),
         neighbourhood=extracted.get("neighbourhood"),
         title=extracted.get("title"),
         description=extracted.get("description"),
-        result=result_payload,
     )

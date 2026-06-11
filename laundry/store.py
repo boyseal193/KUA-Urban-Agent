@@ -397,6 +397,8 @@ def create_partial_property(
         "verdict": verdict,
         "classification": "extraction_failed",
         "deal_status": "extraction_failed",
+        "extraction_status": "failed",
+        "error_message": (error or "Listing detail could not be extracted")[:500],
         "raw_extracted": _json_safe({**extracted, "description": extracted.get("description")}),
     }
 
@@ -1019,7 +1021,10 @@ def build_scan_summary(
         if r.get("status") == "extraction_failed" or r.get("deal_status") == "extraction_failed"
     ]
     failed_rows = [r for r in listings if r.get("status") == "failed" and not r.get("property_id")]
-    skipped_rows = [r for r in listings if r.get("status") == "skipped"]
+    skipped_rows = [r for r in listings if (r.get("status") or "").lower() == "skipped"]
+    duplicate_rows = [r for r in listings if (r.get("status") or "").lower() == "duplicate"]
+    filtered_rows = [r for r in listings if (r.get("status") or "").lower() == "filtered_out"]
+    success_rows = [r for r in listings if (r.get("status") or "").lower() == "success"]
     approved = [p for p in properties if p.get("deal_status") == "approved_candidate"]
     manual = [p for p in properties if p.get("deal_status") == "manual_review"]
     rejected = [p for p in properties if p.get("deal_status") == "rejected"]
@@ -1059,8 +1064,32 @@ def build_scan_summary(
     availability_message = job_summary.get("availability_message") or diagnostics.get("availability_message")
 
     processed_count = len(scored_rows) + len(extraction_failed_rows)
-    failed_count = len(failed_rows)
+    failed_count = len(failed_rows) + len([
+        r for r in listings
+        if (r.get("status") or "").lower() in (
+            "failed", "scrape_failed", "persistence_failed", "scoring_failed", "memo_failed", "export_failed",
+        )
+    ])
     skipped_count = len(skipped_rows)
+    success_count = int(diagnostics.get("success_count") or job_summary.get("success_count") or len(success_rows))
+    duplicate_count = int(diagnostics.get("duplicate_count") or job_summary.get("duplicate_count") or len(duplicate_rows))
+    filtered_out_count = int(
+        diagnostics.get("filtered_out_count") or job_summary.get("filtered_out_count") or len(filtered_rows)
+    )
+    failed_accounting = int(diagnostics.get("failed_count") or job_summary.get("failed_count") or failed_count)
+    queued_count = int(
+        diagnostics.get("listings_queued")
+        or job_summary.get("queued_count")
+        or job_summary.get("listings_queued")
+        or 0
+    )
+    exported_count = int(job_summary.get("exported_count") or diagnostics.get("exported_count") or 0)
+    source_found_count = int(
+        job_summary.get("source_available_count")
+        or diagnostics.get("source_available_count")
+        or discovered_count
+        or 0
+    )
     found_count = int(
         diagnostics.get("listings_found")
         or job_summary.get("listings_found")
@@ -1069,8 +1098,8 @@ def build_scan_summary(
         or 0
     )
     listings_total = requested_limit or job.get("listing_limit") or job.get("listings_total") or effective_limit or len(listings)
-    accounted = processed_count + failed_count + skipped_count
-    invariant_ok = found_count == 0 or found_count == accounted
+    accounted = success_count + duplicate_count + filtered_out_count + failed_accounting
+    invariant_ok = discovered_count == 0 or discovered_count == accounted
 
     return {
         "scanned_count": job.get("listings_done") or len(listings),
@@ -1080,6 +1109,14 @@ def build_scan_summary(
         "effective_limit": effective_limit,
         "discovered_count": discovered_count,
         "source_available_count": source_available_count,
+        "source_found_count": source_found_count,
+        "queued_count": queued_count,
+        "processed_count": processed_count,
+        "success_count": success_count,
+        "duplicate_count": duplicate_count,
+        "filtered_out_count": filtered_out_count,
+        "failed_count": failed_accounting,
+        "exported_count": exported_count,
         "availability_message": availability_message,
         "listings_failed": job.get("listings_failed") or len(failed_rows),
         "extraction_failed_count": len(extraction_failed_rows) or len(extraction_failed_props),
@@ -1350,7 +1387,20 @@ def record_listing_result(job_id: str, listing_index: int, *,
                            city: Optional[str] = None,
                            neighbourhood: Optional[str] = None,
                            title: Optional[str] = None,
-                           description: Optional[str] = None) -> bool:
+                           description: Optional[str] = None,
+                           reason_code: Optional[str] = None,
+                           reason_message: Optional[str] = None,
+                           stage_failed: Optional[str] = None,
+                           attempt_count: int = 0,
+                           duplicate_of_property_id: Optional[str] = None,
+                           dedupe_key: Optional[str] = None,
+                           dedupe_method: Optional[str] = None,
+                           filter_name: Optional[str] = None,
+                           filter_value: Optional[str] = None,
+                           actual_value: Optional[str] = None,
+                           traceback: Optional[str] = None,
+                           raw_error: Optional[str] = None,
+                           exception_type: Optional[str] = None) -> bool:
     if supabase is None:
         log.warning("record_listing_result skipped — supabase unavailable job_id=%s", job_id)
         return False
@@ -1365,6 +1415,10 @@ def record_listing_result(job_id: str, listing_index: int, *,
         "neighbourhood": neighbourhood or (result or {}).get("neighbourhood"),
         "title": title or (result or {}).get("title"),
         "description": description or (result or {}).get("description"),
+        "reason_code": reason_code or (result or {}).get("reason_code"),
+        "reason_message": reason_message or (result or {}).get("reason_message"),
+        "stage_failed": stage_failed or (result or {}).get("stage_failed"),
+        "attempt_count": attempt_count or (result or {}).get("attempt_count"),
     }
     payload: Dict[str, Any] = {
         "job_id": job_id,
@@ -1375,8 +1429,21 @@ def record_listing_result(job_id: str, listing_index: int, *,
         "property_id": property_id,
         "deal_status": deal_status,
         "score": score,
-        "error_message": (error_message or "")[:2000] if error_message else None,
+        "error_message": (error_message or reason_message or "")[:2000] if (error_message or reason_message) else None,
         "updated_at": _now(),
+        "reason_code": reason_code,
+        "reason_message": (reason_message or "")[:2000] if reason_message else None,
+        "stage_failed": stage_failed,
+        "attempt_count": attempt_count,
+        "duplicate_of_property_id": duplicate_of_property_id,
+        "dedupe_key": dedupe_key,
+        "dedupe_method": dedupe_method,
+        "filter_name": filter_name,
+        "filter_value": filter_value,
+        "actual_value": actual_value,
+        "traceback": (traceback or "")[:8000] if traceback else None,
+        "raw_error": (raw_error or "")[:2000] if raw_error else None,
+        "exception_type": exception_type,
     }
     if address is not None:
         payload["address"] = address
@@ -1420,8 +1487,21 @@ def record_listing_result(job_id: str, listing_index: int, *,
     except Exception as exc:
         # Optional top-level columns may be missing on older DBs — retry without them.
         msg = str(exc).lower()
-        if any(k in msg for k in ("address", "city", "neighbourhood", "title", "description", "column")):
-            for key in ("address", "city", "neighbourhood", "title", "description"):
+        optional_cols = (
+            "address", "city", "neighbourhood", "title", "description",
+            "reason_code", "reason_message", "stage_failed", "attempt_count",
+            "duplicate_of_property_id", "dedupe_key", "dedupe_method",
+            "filter_name", "filter_value", "actual_value", "traceback",
+            "raw_error", "exception_type", "column",
+        )
+        if any(k in msg for k in optional_cols):
+            for key in (
+                "address", "city", "neighbourhood", "title", "description",
+                "reason_code", "reason_message", "stage_failed", "attempt_count",
+                "duplicate_of_property_id", "dedupe_key", "dedupe_method",
+                "filter_name", "filter_value", "actual_value", "traceback",
+                "raw_error", "exception_type",
+            ):
                 payload.pop(key, None)
             try:
                 _write(payload)
@@ -1441,6 +1521,126 @@ def record_listing_result(job_id: str, listing_index: int, *,
             job_id, listing_index, property_id, exc,
         )
         return False
+
+
+def record_duplicate(
+    *,
+    dedupe_key: str,
+    property_id: str,
+    listing_url: Optional[str],
+    primary_property_id: str,
+    dedupe_method: str = "dedupe_key",
+    duplicate_confidence: float = 1.0,
+    reason_message: Optional[str] = None,
+) -> None:
+    if supabase is None or not dedupe_key:
+        return
+    try:
+        row = {
+            "dedupe_key": dedupe_key,
+            "property_id": property_id,
+            "listing_url": listing_url,
+            "primary_property_id": primary_property_id,
+            "dedupe_method": dedupe_method,
+            "duplicate_confidence": duplicate_confidence,
+            "reason_message": reason_message,
+            "updated_at": _now(),
+        }
+        existing = (
+            supabase.table("laundry_duplicates")
+            .select("id")
+            .eq("dedupe_key", dedupe_key)
+            .eq("property_id", property_id)
+            .limit(1)
+            .execute()
+        )
+        if existing.data:
+            supabase.table("laundry_duplicates").update(row).eq("id", existing.data[0]["id"]).execute()
+        else:
+            row["created_at"] = _now()
+            supabase.table("laundry_duplicates").insert(row).execute()
+    except Exception as exc:
+        log.warning("record_duplicate failed property_id=%s: %s", property_id, exc)
+
+
+def record_listing_outcome(
+    job_id: str,
+    listing_index: int,
+    *,
+    listing_url: Optional[str] = None,
+    outcome: Dict[str, Any],
+    property_id: Optional[str] = None,
+    deal_status: Optional[str] = None,
+    score: Optional[int] = None,
+    address: Optional[str] = None,
+    city: Optional[str] = None,
+    neighbourhood: Optional[str] = None,
+    title: Optional[str] = None,
+    description: Optional[str] = None,
+) -> bool:
+    status = outcome.get("status") or outcome.get("terminal_status") or "failed"
+    result_payload = dict(outcome)
+    return record_listing_result(
+        job_id,
+        listing_index,
+        listing_url=listing_url or outcome.get("listing_url"),
+        status=status,
+        result=result_payload,
+        property_id=property_id or outcome.get("property_id"),
+        deal_status=deal_status or outcome.get("deal_status"),
+        score=score if score is not None else outcome.get("score"),
+        error_message=outcome.get("reason_message") or outcome.get("raw_error"),
+        address=address,
+        city=city,
+        neighbourhood=neighbourhood,
+        title=title,
+        description=description,
+        reason_code=outcome.get("reason_code"),
+        reason_message=outcome.get("reason_message"),
+        stage_failed=outcome.get("stage_failed"),
+        attempt_count=int(outcome.get("attempt_count") or 0),
+        duplicate_of_property_id=outcome.get("duplicate_of_property_id"),
+        dedupe_key=outcome.get("dedupe_key"),
+        dedupe_method=outcome.get("dedupe_method"),
+        filter_name=outcome.get("filter_name"),
+        filter_value=outcome.get("filter_value"),
+        actual_value=outcome.get("actual_value"),
+        traceback=outcome.get("traceback"),
+        raw_error=outcome.get("raw_error"),
+        exception_type=outcome.get("exception_type"),
+    )
+
+
+def seed_listing_step(
+    job_id: str,
+    listing_index: int,
+    *,
+    listing_url: Optional[str] = None,
+    status: str = STEP_PENDING,
+    error_message: Optional[str] = None,
+    output: Optional[Dict[str, Any]] = None,
+) -> None:
+    if supabase is None:
+        return
+    step = _find_or_seed_step(job_id, LISTING_STEP_PROCESS, listing_index, listing_url)
+    if not step:
+        return
+    try:
+        fields: Dict[str, Any] = {
+            "status": status,
+            "listing_url": listing_url or step.get("listing_url"),
+            "error_message": (error_message or "")[:2000] if error_message else None,
+        }
+        if status in (STEP_RUNNING,):
+            fields["started_at"] = _now()
+        if status not in (STEP_PENDING, STEP_RUNNING):
+            fields["finished_at"] = _now()
+        if output:
+            fields["output_data"] = _json_safe(output)
+            fields["result"] = _json_safe(output)
+        supabase.table("scan_steps").update(fields).eq("id", step["id"]).execute()
+    except Exception as exc:
+        log.warning("seed_listing_step failed job_id=%s idx=%s: %s", job_id, listing_index, exc)
 
 
 def set_job_counters(job_id: str, *, listings_total: Optional[int] = None,

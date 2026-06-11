@@ -114,6 +114,11 @@ ALTER TABLE public.laundry_properties ADD COLUMN IF NOT EXISTS deleted_at       
 ALTER TABLE public.laundry_properties ADD COLUMN IF NOT EXISTS deletion_reason          TEXT;
 ALTER TABLE public.laundry_properties ADD COLUMN IF NOT EXISTS created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW();
 ALTER TABLE public.laundry_properties ADD COLUMN IF NOT EXISTS updated_at               TIMESTAMPTZ;
+ALTER TABLE public.laundry_properties ADD COLUMN IF NOT EXISTS title                     TEXT;
+ALTER TABLE public.laundry_properties ADD COLUMN IF NOT EXISTS extraction_status          TEXT;
+ALTER TABLE public.laundry_properties ADD COLUMN IF NOT EXISTS raw_payload                JSONB;
+ALTER TABLE public.laundry_properties ADD COLUMN IF NOT EXISTS error_message              TEXT;
+ALTER TABLE public.laundry_properties ADD COLUMN IF NOT EXISTS ground_floor                BOOLEAN;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_laundry_properties_dedupe
     ON public.laundry_properties (dedupe_key)
@@ -303,6 +308,9 @@ ALTER TABLE public.laundry_duplicates ADD COLUMN IF NOT EXISTS listing_url      
 ALTER TABLE public.laundry_duplicates ADD COLUMN IF NOT EXISTS primary_property_id UUID;
 ALTER TABLE public.laundry_duplicates ADD COLUMN IF NOT EXISTS created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW();
 ALTER TABLE public.laundry_duplicates ADD COLUMN IF NOT EXISTS updated_at         TIMESTAMPTZ;
+ALTER TABLE public.laundry_duplicates ADD COLUMN IF NOT EXISTS dedupe_method      TEXT;
+ALTER TABLE public.laundry_duplicates ADD COLUMN IF NOT EXISTS duplicate_confidence DOUBLE PRECISION;
+ALTER TABLE public.laundry_duplicates ADD COLUMN IF NOT EXISTS reason_message     TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_laundry_duplicates_dedupe_key
     ON public.laundry_duplicates (dedupe_key);
@@ -641,6 +649,19 @@ BEGIN
         ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS neighbourhood TEXT;
         ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS title         TEXT;
         ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS description   TEXT;
+        ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS reason_code   TEXT;
+        ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS reason_message TEXT;
+        ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS stage_failed  TEXT;
+        ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS attempt_count INT NOT NULL DEFAULT 0;
+        ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS duplicate_of_property_id TEXT;
+        ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS dedupe_key      TEXT;
+        ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS dedupe_method   TEXT;
+        ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS filter_name     TEXT;
+        ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS filter_value    TEXT;
+        ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS actual_value    TEXT;
+        ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS traceback       TEXT;
+        ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS raw_error       TEXT;
+        ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS exception_type  TEXT;
         CREATE INDEX IF NOT EXISTS idx_scan_listing_results_property_id
             ON public.scan_listing_results (property_id)
             WHERE property_id IS NOT NULL;

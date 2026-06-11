@@ -430,3 +430,125 @@ def generate_pipeline_export(
     meta["row_count"] = len(rows)
     meta["label"] = label
     return meta
+
+
+_LISTING_ACCOUNTING_COLUMNS: List[Tuple[str, str, Optional[str], float]] = [
+    ("Listing URL", "listing_url", None, 42),
+    ("Index", "listing_index", "0", 8),
+    ("Status", "status", None, 18),
+    ("Reason Code", "reason_code", None, 22),
+    ("Reason Message", "reason_message", None, 36),
+    ("Stage Failed", "stage_failed", None, 16),
+    ("Attempt Count", "attempt_count", "0", 12),
+    ("Property ID", "property_id", None, 38),
+    ("Duplicate Of", "duplicate_of_property_id", None, 38),
+    ("Filter Name", "filter_name", None, 18),
+    ("Filter Value", "filter_value", None, 14),
+    ("Actual Value", "actual_value", None, 14),
+    ("Score", "score", "0", 8),
+    ("Verdict", "verdict", None, 16),
+    ("Deal Status", "deal_status", None, 18),
+    ("Address", "address", None, 28),
+    ("Title", "title", None, 24),
+]
+
+
+def _flatten_listing_result_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    result = row.get("result") or {}
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except Exception:
+            result = {}
+    return {
+        "listing_url": row.get("listing_url") or result.get("listing_url"),
+        "listing_index": row.get("listing_index"),
+        "status": row.get("status") or result.get("status") or result.get("terminal_status"),
+        "reason_code": row.get("reason_code") or result.get("reason_code"),
+        "reason_message": row.get("reason_message") or result.get("reason_message") or row.get("error_message"),
+        "stage_failed": row.get("stage_failed") or result.get("stage_failed"),
+        "attempt_count": row.get("attempt_count") or result.get("attempt_count") or 0,
+        "property_id": row.get("property_id") or result.get("property_id"),
+        "duplicate_of_property_id": row.get("duplicate_of_property_id") or result.get("duplicate_of_property_id"),
+        "filter_name": row.get("filter_name") or result.get("filter_name"),
+        "filter_value": row.get("filter_value") or result.get("filter_value"),
+        "actual_value": row.get("actual_value") or result.get("actual_value"),
+        "score": row.get("score") or result.get("score"),
+        "verdict": result.get("verdict"),
+        "deal_status": row.get("deal_status") or result.get("deal_status"),
+        "address": row.get("address") or result.get("address"),
+        "title": row.get("title") or result.get("title"),
+    }
+
+
+def build_listing_accounting_workbook(
+    listing_rows: List[Dict[str, Any]],
+    *,
+    title: str = "All Listings",
+    summary: Optional[Dict[str, Any]] = None,
+) -> Workbook:
+    wb = Workbook()
+    ws_summary = wb.active
+    ws_summary.title = "Summary"
+    summary_rows = [
+        ["Metric", "Value"],
+        ["Requested limit", (summary or {}).get("requested_limit")],
+        ["Effective limit", (summary or {}).get("effective_limit")],
+        ["Source found", (summary or {}).get("source_found_count") or (summary or {}).get("source_available_count")],
+        ["Discovered", (summary or {}).get("discovered_count")],
+        ["Queued", (summary or {}).get("queued_count")],
+        ["Processed", (summary or {}).get("processed_count")],
+        ["Successful", (summary or {}).get("success_count")],
+        ["Duplicates", (summary or {}).get("duplicate_count")],
+        ["Filtered out", (summary or {}).get("filtered_out_count")],
+        ["Failed", (summary or {}).get("failed_count")],
+        ["Exported properties", (summary or {}).get("exported_count")],
+    ]
+    for r_idx, (label, val) in enumerate(summary_rows, start=1):
+        ws_summary.cell(row=r_idx, column=1, value=label)
+        ws_summary.cell(row=r_idx, column=2, value=val)
+
+    sheets = {
+        "All Listings": listing_rows,
+        "Successful": [r for r in listing_rows if (r.get("status") or "").lower() == "success"],
+        "Manual Review": [r for r in listing_rows if (r.get("deal_status") or "").lower() == "manual_review"],
+        "Approved": [r for r in listing_rows if (r.get("deal_status") or "").lower() == "approved_candidate"],
+        "Rejected": [r for r in listing_rows if (r.get("deal_status") or "").lower() == "rejected"],
+        "Failed": [r for r in listing_rows if (r.get("status") or "").lower() in (
+            "failed", "scrape_failed", "extraction_failed", "persistence_failed", "scoring_failed",
+        )],
+        "Duplicates": [r for r in listing_rows if (r.get("status") or "").lower() == "duplicate"],
+        "Filtered Out": [r for r in listing_rows if (r.get("status") or "").lower() == "filtered_out"],
+    }
+
+    for sheet_name, rows in sheets.items():
+        ws = wb.create_sheet(sheet_name[:31])
+        headers = [c[0] for c in _LISTING_ACCOUNTING_COLUMNS]
+        _write_header(ws, headers)
+        flat_rows = [_flatten_listing_result_row(r) for r in rows]
+        for r_idx, flat in enumerate(flat_rows, start=2):
+            for c_idx, (_, key, fmt, _) in enumerate(_LISTING_ACCOUNTING_COLUMNS, start=1):
+                val = flat.get(key)
+                cell = ws.cell(row=r_idx, column=c_idx, value=val)
+                cell.border = _ROW_BORDER
+                cell.alignment = _ALIGN_LEFT
+                if fmt and val is not None:
+                    cell.number_format = fmt
+        _autosize(ws, [c[3] for c in _LISTING_ACCOUNTING_COLUMNS])
+    return wb
+
+
+def generate_listing_accounting_export(
+    listing_rows: List[Dict[str, Any]],
+    *,
+    label: str = "Scan Listings",
+    summary: Optional[Dict[str, Any]] = None,
+    job: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    flat = [_flatten_listing_result_row(r) for r in listing_rows]
+    wb = build_listing_accounting_workbook(listing_rows, title=label, summary=summary)
+    meta = save_workbook(wb, filename_for_pipeline(label, len(flat)))
+    meta["row_count"] = len(flat)
+    meta["label"] = label
+    meta["job_id"] = (job or {}).get("id")
+    return meta

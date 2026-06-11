@@ -17,6 +17,8 @@ property row (full underwriting or ``extraction_failed`` partial card).
 from __future__ import annotations
 
 import logging
+import time
+import traceback as _tb
 from typing import Any, Dict, Optional, Tuple
 
 from laundry import (
@@ -31,10 +33,17 @@ from laundry import (
     scoring as scoring_mod,
     store,
 )
+from laundry.listing_outcomes import (
+    STATUS_PERSISTENCE_FAILED,
+    STATUS_SCRAPE_FAILED,
+    build_outcome,
+    merge_pipeline_result,
+)
 
 log = logging.getLogger("kua.laundry.pipeline")
 
 EXTRACTION_FAILED = "extraction_failed"
+SCRAPE_MAX_ATTEMPTS = int(__import__("os").getenv("LAUNDRY_SCRAPE_MAX_ATTEMPTS", "3"))
 
 
 def _matches_neighbourhood_filter(extracted: Dict[str, Any], location: Dict[str, Any],
@@ -117,7 +126,22 @@ def _persist_underwriting(
 
     property_id = prop["id"]
     result["property_id"] = property_id
-    result["duplicate"] = prop.get("duplicate", False)
+    result["dedupe_key"] = dedupe
+    if prop.get("duplicate"):
+        result["duplicate"] = True
+        result["duplicate_of_property_id"] = property_id
+        result["dedupe_method"] = "dedupe_key"
+        result["duplicate_confidence"] = 1.0
+        store.record_duplicate(
+            dedupe_key=dedupe,
+            property_id=property_id,
+            listing_url=listing_url,
+            primary_property_id=property_id,
+            dedupe_method="dedupe_key",
+            reason_message="Existing property updated via dedupe key match",
+        )
+    else:
+        result["duplicate"] = False
     log.info(
         "pipeline.property_created job_id=%s property_id=%s url=%s duplicate=%s",
         job_id, property_id, listing_url, prop.get("duplicate"),
@@ -133,13 +157,23 @@ def _persist_underwriting(
         memo_md=memo_md,
         assumptions_version=economics.get("assumptions_version", "2.0.0"),
     )
-    if not ana_ok or not ana_id:
+    if not ok or not ana_id:
         msg = ana_err or "analysis_insert_failed"
         log.error(
             "pipeline.persist analysis FAILED job_id=%s property_id=%s error=%s",
             job_id, property_id, msg,
         )
         result["persist_warning"] = msg
+        result.update(
+            build_outcome(
+                status=STATUS_PERSISTENCE_FAILED,
+                reason_code="analysis_insert_failed",
+                reason_message=msg,
+                stage_failed="persist",
+                listing_url=listing_url,
+                property_id=property_id,
+            )
+        )
         return False, msg
 
     result["analysis_id"] = ana_id
@@ -172,12 +206,21 @@ def _persist_extraction_failed(
             "pipeline.extraction_failed persist FAILED job_id=%s url=%s error=%s",
             job_id, listing_url, err,
         )
+        outcome = build_outcome(
+            status=STATUS_PERSISTENCE_FAILED,
+            reason_code="partial_property_failed",
+            reason_message=err or error or "partial_property_failed",
+            stage_failed="persist",
+            listing_url=listing_url,
+            raw_error=err or error,
+        )
         return {
             "success": False,
             "extraction_failed": True,
             "url": listing_url,
             "error": err or error or "partial_property_failed",
             "extracted": extracted,
+            **outcome,
         }
 
     property_id = prop["id"]
@@ -267,14 +310,12 @@ def analyse_listing(
 
     if not _matches_neighbourhood_filter(extracted, location, filters):
         log.info(
-            "pipeline.analyse_listing skipped neighbourhood_filter job_id=%s url=%s",
-            job_id, listing_url,
+            "pipeline.outside_preferred_neighbourhood job_id=%s url=%s — continuing with manual review flags",
+            job_id,
+            listing_url,
         )
-        return {
-            "success": True, "skipped": True,
-            "reason": "neighbourhood_filter_no_match",
-            "extracted": extracted, "location": location,
-        }
+        location["outside_preferred_neighbourhood"] = True
+        extracted["_outside_preferred_neighbourhood"] = True
 
     enriched_extracted = dict(extracted)
     enriched_extracted["_location"] = location
@@ -288,6 +329,18 @@ def analyse_listing(
     due_diligence = dd_mod.build_due_diligence(
         extracted=extracted, economics=economics, scoring=scoring, location=location
     )
+    if location.get("outside_preferred_neighbourhood"):
+        due_diligence.setdefault("required_verification", [])
+        due_diligence["required_verification"].append(
+            "Confirm neighbourhood matches acquisition target — listing came from broader search results"
+        )
+        if scoring.get("deal_status") == "rejected":
+            scoring = dict(scoring)
+            scoring["deal_status"] = "manual_review"
+            scoring["verdict"] = "MANUAL REVIEW"
+            scoring.setdefault("notes", [])
+            if isinstance(scoring["notes"], list):
+                scoring["notes"].append("outside_preferred_neighbourhood")
 
     memo_key = laundry_cache.memo_cache_key(listing_url=listing_url, extracted=extracted)
     cached_memo = laundry_cache.get_memo(memo_key)
@@ -321,18 +374,42 @@ def analyse_listing(
         )
         if not ok:
             if listing_url:
-                return _persist_extraction_failed(
-                    listing_url=listing_url,
-                    job_id=job_id,
-                    extracted=extracted,
-                    error=err,
-                    source=source,
+                return merge_pipeline_result(
+                    _persist_extraction_failed(
+                        listing_url=listing_url,
+                        job_id=job_id,
+                        extracted=extracted,
+                        error=err,
+                        source=source,
+                    )
                 )
             result["success"] = False
             result["error"] = err
             result["persist_warning"] = err
 
-    return result
+    return merge_pipeline_result(result)
+
+
+def _fetch_listing_with_retry(url: str, *, job_id: Optional[str] = None) -> Dict[str, Any]:
+    last: Dict[str, Any] = {"success": False, "error": "not_started"}
+    for attempt in range(1, SCRAPE_MAX_ATTEMPTS + 1):
+        fetched = scanner.fetch_listing_text(url)
+        if fetched.get("success"):
+            fetched["attempt_count"] = attempt
+            return fetched
+        last = dict(fetched)
+        last["attempt_count"] = attempt
+        log.warning(
+            "pipeline.scrape_retry job_id=%s url=%s attempt=%s/%s error=%s",
+            job_id,
+            url,
+            attempt,
+            SCRAPE_MAX_ATTEMPTS,
+            fetched.get("error"),
+        )
+        if attempt < SCRAPE_MAX_ATTEMPTS:
+            time.sleep(min(2 ** (attempt - 1), 8))
+    return last
 
 
 def process_listing_url(
@@ -351,34 +428,56 @@ def process_listing_url(
     if cached_extracted:
         log.info("pipeline.cache hit extracted job_id=%s url=%s", job_id, url)
         if not extraction.has_usable_fields(cached_extracted):
-            return _persist_extraction_failed(
-                listing_url=url,
-                job_id=job_id,
-                extracted=cached_extracted,
-                error="insufficient_extracted_fields",
+            return merge_pipeline_result(
+                _persist_extraction_failed(
+                    listing_url=url,
+                    job_id=job_id,
+                    extracted=cached_extracted,
+                    error="insufficient_extracted_fields",
+                )
             )
-        return analyse_listing(
-            raw_text=cached_extracted.get("_raw_text") or "",
-            html=cached_extracted.get("_html") or "",
-            listing_url=url,
-            source="url_scan",
-            overrides=overrides,
-            filters=filters,
-            use_llm=False,
-            job_id=job_id,
-            persist=persist,
+        return merge_pipeline_result(
+            analyse_listing(
+                raw_text=cached_extracted.get("_raw_text") or "",
+                html=cached_extracted.get("_html") or "",
+                listing_url=url,
+                source="url_scan",
+                overrides=overrides,
+                filters=filters,
+                use_llm=False,
+                job_id=job_id,
+                persist=persist,
+            )
         )
 
-    fetched = scanner.fetch_listing_text(url)
+    fetched = _fetch_listing_with_retry(url, job_id=job_id)
     if not fetched.get("success"):
         err = fetched.get("error") or "scrape_failed"
-        log.warning("pipeline.scrape_failed job_id=%s url=%s error=%s", job_id, url, err)
-        return _persist_extraction_failed(
+        log.warning(
+            "pipeline.scrape_failed job_id=%s url=%s error=%s attempts=%s",
+            job_id,
+            url,
+            err,
+            fetched.get("attempt_count"),
+        )
+        failed = _persist_extraction_failed(
             listing_url=url,
             job_id=job_id,
             extracted={},
             error=err,
         )
+        failed.update(
+            build_outcome(
+                status=STATUS_SCRAPE_FAILED,
+                reason_code="scrape_failed",
+                reason_message=str(err),
+                stage_failed="scrape",
+                attempt_count=int(fetched.get("attempt_count") or SCRAPE_MAX_ATTEMPTS),
+                listing_url=url,
+                property_id=failed.get("property_id"),
+            )
+        )
+        return merge_pipeline_result(failed)
 
     raw_text = fetched.get("raw_text") or ""
     html = fetched.get("html") or ""
@@ -401,24 +500,29 @@ def process_listing_url(
             "pipeline.insufficient_fields job_id=%s url=%s — creating extraction_failed card",
             job_id, url,
         )
-        return _persist_extraction_failed(
-            listing_url=url,
-            job_id=job_id,
-            extracted=extracted,
-            error="insufficient_extracted_fields",
+        return merge_pipeline_result(
+            _persist_extraction_failed(
+                listing_url=url,
+                job_id=job_id,
+                extracted=extracted,
+                error="insufficient_extracted_fields",
+            )
         )
 
-    return analyse_listing(
+    res = analyse_listing(
         raw_text=raw_text,
         html=html,
         listing_url=url,
         source="url_scan",
         overrides=overrides,
         filters=filters,
-        use_llm=False,  # already extracted above
+        use_llm=False,
         job_id=job_id,
         persist=persist,
     )
+    if isinstance(res, dict):
+        res["attempt_count"] = int(fetched.get("attempt_count") or 1)
+    return merge_pipeline_result(res)
 
 
 def analyse_url(*, url: str, overrides=None, filters=None,

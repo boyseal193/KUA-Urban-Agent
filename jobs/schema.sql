@@ -296,6 +296,19 @@ ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS payload       J
 ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS error_message TEXT;
 ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW();
 ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS reason_code   TEXT;
+ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS reason_message TEXT;
+ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS stage_failed  TEXT;
+ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS attempt_count INT NOT NULL DEFAULT 0;
+ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS duplicate_of_property_id TEXT;
+ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS dedupe_key      TEXT;
+ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS dedupe_method   TEXT;
+ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS filter_name     TEXT;
+ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS filter_value    TEXT;
+ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS actual_value    TEXT;
+ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS traceback       TEXT;
+ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS raw_error       TEXT;
+ALTER TABLE public.scan_listing_results ADD COLUMN IF NOT EXISTS exception_type  TEXT;
 
 DO $$
 BEGIN
