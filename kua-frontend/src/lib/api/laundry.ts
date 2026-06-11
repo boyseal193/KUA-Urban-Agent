@@ -261,6 +261,11 @@ export interface LaundryScanSummary {
   listings_deduped?: number;
   listings_truncated?: number;
   listings_resumed?: number;
+  requested_limit?: number;
+  effective_limit?: number;
+  discovered_count?: number;
+  source_available_count?: number | null;
+  availability_message?: string | null;
   invariant_ok?: boolean;
   invariant_delta?: number;
   skip_reasons?: Record<string, number>;
@@ -453,6 +458,24 @@ export const LAUNDRY_PREFERRED_NEIGHBOURHOODS = [
 ] as const;
 
 export const LAUNDRY_DEFAULT_MAX_SQM = 80;
+export const LAUNDRY_MAX_LISTINGS = 200;
+
+export function formatLaundryListingProgress(
+  job?: Pick<LaundryScanJob, "listings_done" | "listings_total" | "listing_limit"> | null,
+  summary?: Pick<
+    LaundryScanSummary,
+    "listings_done" | "listings_total" | "requested_limit"
+  > | null,
+): string {
+  const done = summary?.listings_done ?? job?.listings_done ?? 0;
+  const total =
+    summary?.requested_limit ??
+    job?.listing_limit ??
+    job?.listings_total ??
+    summary?.listings_total ??
+    0;
+  return `${done}/${total}`;
+}
 
 export const LAUNDRY_SEARCH_PROVIDERS: { value: LaundrySearchProvider; label: string }[] = [
   { value: "idealista", label: "Idealista" },
@@ -506,11 +529,27 @@ export interface LaundryMapMarker {
   id: string;
   lat: number;
   lng: number;
+  latitude?: number;
+  longitude?: number;
+  vertical?: "laundry" | "storage";
   score: number | null;
   deal_status: LaundryDealStatus;
   address?: string | null;
   city?: string | null;
+  neighbourhood?: string | null;
   verdict?: string | null;
+  geocode_source?: string | null;
+}
+
+export interface MapDiagnosticsLike {
+  vertical?: string;
+  total_properties?: number;
+  plotted?: number;
+  missing_coordinates?: number;
+  backfilled?: number;
+  google_api_key_configured?: boolean;
+  provider_chain?: string[];
+  missing_samples?: Array<Record<string, unknown>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -544,8 +583,16 @@ export const laundryApi = {
     api<{ deals: LaundryProperty[] }>(`/laundry/deals/all`, {
       query: { limit, offset },
     }),
-  markers: (limit = 500) =>
-    api<{ markers: LaundryMapMarker[] }>(`/laundry/map/markers`, { query: { limit } }),
+  markers: (limit = 500, backfill = true) =>
+    api<{ success: boolean; markers: LaundryMapMarker[]; diagnostics?: MapDiagnosticsLike }>(
+      `/laundry/map/markers`,
+      { query: { limit, backfill } },
+    ),
+
+  mapDiagnostics: (limit = 500) =>
+    api<{ success: boolean; diagnostics: MapDiagnosticsLike }>(`/laundry/map/diagnostics`, {
+      query: { limit },
+    }),
 
   detail: (id: string) =>
     api<LaundryPropertyDetailResponse>(`/laundry/properties/${id}`),

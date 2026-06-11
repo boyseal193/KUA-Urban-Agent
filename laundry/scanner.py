@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
@@ -15,6 +16,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from laundry import cache as page_cache
+from laundry.limits import clamp_listing_limit, search_max_pages
 
 log = logging.getLogger("kua.laundry.scanner")
 
@@ -23,13 +25,28 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 TIMEOUT_SEC = 18.0
-MAX_SEARCH_PAGES = int(__import__("os").getenv("LAUNDRY_SEARCH_MAX_PAGES", "5"))
 
 _COUNT_PATTERNS = (
     re.compile(r"(\d[\d\s.]*)\s+(?:locales|inmuebles|resultados|anuncios)", re.I),
     re.compile(r"\"(?:total|numFound|listingCount)\"\s*:\s*(\d+)", re.I),
     re.compile(r"data-total-results=\"(\d+)\"", re.I),
 )
+
+
+@dataclass
+class DiscoverResult:
+    urls: List[str]
+    discovered_count: int
+    source_available_count: Optional[int] = None
+    pages_fetched: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "urls": self.urls,
+            "discovered_count": self.discovered_count,
+            "source_available_count": self.source_available_count,
+            "pages_fetched": self.pages_fetched,
+        }
 
 
 def fetch_listing_text(url: str) -> Dict[str, Any]:
@@ -141,44 +158,79 @@ def _merge_unique_urls(existing: List[str], batch: List[str], *, limit: int) -> 
     return out
 
 
-def discover_listing_urls(search_url: str, *, limit: int = 20) -> List[str]:
+def discover_listings(search_url: str, *, limit: int = 20) -> DiscoverResult:
+    """Discover listing detail URLs, paginating until ``limit`` is reached."""
+    limit = clamp_listing_limit(limit)
     if not search_url:
-        return []
+        return DiscoverResult(urls=[], discovered_count=0, source_available_count=0, pages_fetched=0)
 
     urls: List[str] = []
+    source_available_count: Optional[int] = None
+    pages_fetched = 0
+    max_pages = search_max_pages(limit)
+    empty_streak = 0
+
     try:
         try:
             from scraper import scrape_idealista_search_urls  # type: ignore
 
-            # Paginate through Idealista search results when limit exceeds one page.
-            for page in range(1, MAX_SEARCH_PAGES + 1):
+            for page in range(1, max_pages + 1):
                 page_url = _search_page_url(search_url, page)
                 remaining = max(limit - len(urls), 0)
                 if remaining <= 0:
                     break
                 res = scrape_idealista_search_urls(page_url, limit=remaining)
+                pages_fetched += 1
                 if not isinstance(res, dict) or not res.get("success"):
+                    empty_streak += 1
                     if page == 1:
+                        break
+                    if empty_streak >= 2:
                         break
                     continue
                 batch = list(res.get("urls") or [])
+                if page == 1:
+                    parsed = _parse_total_from_html(str(res.get("html") or ""))
+                    if parsed is not None and parsed > 0:
+                        source_available_count = parsed
                 if not batch:
-                    break
+                    empty_streak += 1
+                    if empty_streak >= 2:
+                        break
+                    continue
+                empty_streak = 0
+                before = len(urls)
                 urls = _merge_unique_urls(urls, batch, limit=limit)
+                if len(urls) == before:
+                    empty_streak += 1
+                    if empty_streak >= 2:
+                        break
                 if len(urls) >= limit:
                     break
+
             if urls:
+                discovered = len(urls)
+                if source_available_count is None:
+                    source_available_count = discovered
                 log.info(
-                    "discover_listing_urls paginated search_url=%s found=%s limit=%s",
+                    "discover_listings paginated search_url=%s found=%s limit=%s pages=%s source_total=%s",
                     search_url,
-                    len(urls),
+                    discovered,
                     limit,
+                    pages_fetched,
+                    source_available_count,
                 )
-                return urls[:limit]
+                return DiscoverResult(
+                    urls=urls[:limit],
+                    discovered_count=discovered,
+                    source_available_count=source_available_count,
+                    pages_fetched=pages_fetched,
+                )
         except Exception as exc:
             log.info("Idealista discovery unavailable, falling back: %s", exc)
 
-        for page in range(1, MAX_SEARCH_PAGES + 1):
+        empty_streak = 0
+        for page in range(1, max_pages + 1):
             page_url = _search_page_url(search_url, page)
             remaining = max(limit - len(urls), 0)
             if remaining <= 0:
@@ -189,17 +241,53 @@ def discover_listing_urls(search_url: str, *, limit: int = 20) -> List[str]:
                 timeout=TIMEOUT_SEC,
             )
             r.raise_for_status()
+            pages_fetched += 1
+            if page == 1:
+                parsed = _parse_total_from_html(r.text)
+                if parsed is not None and parsed > 0:
+                    source_available_count = parsed
             soup = BeautifulSoup(r.text, "lxml")
             batch = _extract_urls_from_soup(soup, limit=remaining)
             if not batch:
-                break
+                empty_streak += 1
+                if empty_streak >= 2:
+                    break
+                continue
+            empty_streak = 0
+            before = len(urls)
             urls = _merge_unique_urls(urls, batch, limit=limit)
+            if len(urls) == before:
+                empty_streak += 1
+                if empty_streak >= 2:
+                    break
             if len(urls) >= limit:
                 break
-        return urls[:limit]
+
+        discovered = len(urls)
+        if source_available_count is None:
+            source_available_count = discovered
+        return DiscoverResult(
+            urls=urls[:limit],
+            discovered_count=discovered,
+            source_available_count=source_available_count,
+            pages_fetched=pages_fetched,
+        )
     except Exception as exc:
         log.warning("URL discovery failed for %s: %s", search_url, exc)
-        return urls[:limit]
+        discovered = len(urls)
+        if source_available_count is None:
+            source_available_count = discovered
+        return DiscoverResult(
+            urls=urls[:limit],
+            discovered_count=discovered,
+            source_available_count=source_available_count,
+            pages_fetched=pages_fetched,
+        )
+
+
+def discover_listing_urls(search_url: str, *, limit: int = 20) -> List[str]:
+    """Back-compat wrapper returning URL list only."""
+    return discover_listings(search_url, limit=limit).urls
 
 
 def estimate_listing_count(search_url: str, *, probe_limit: int = 5) -> int:
@@ -212,6 +300,9 @@ def estimate_listing_count(search_url: str, *, probe_limit: int = 5) -> int:
 
             res = scrape_idealista_search_urls(search_url, limit=probe_limit)
             if isinstance(res, dict) and res.get("success"):
+                parsed = _parse_total_from_html(str(res.get("html") or ""))
+                if parsed is not None and parsed > 0:
+                    return parsed
                 urls = list(res.get("urls") or [])
                 if urls:
                     return max(len(urls), int(res.get("count") or len(urls)))

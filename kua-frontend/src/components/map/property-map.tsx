@@ -29,6 +29,8 @@ import type { PropertyRecord } from "@/lib/api/types";
 interface PropertyMapProps {
   deals: PropertyRecord[];
   height?: number | string;
+  missingCount?: number;
+  totalCount?: number;
 }
 
 function dealIcon(deal: PropertyRecord) {
@@ -53,6 +55,8 @@ function dealIcon(deal: PropertyRecord) {
 export default function PropertyMap({
   deals,
   height = "calc(100vh - 220px)",
+  missingCount = 0,
+  totalCount,
 }: PropertyMapProps) {
   const { isStale } = useStaleProperties();
   const valid = React.useMemo(
@@ -164,6 +168,17 @@ export default function PropertyMap({
           </div>
         </div>
         <Legend />
+        {(missingCount > 0 || (totalCount != null && valid.length < totalCount)) && (
+          <div className="rounded-md border border-amber-400/30 bg-amber-400/10 px-3 py-2 backdrop-blur-xl">
+            <div className="font-mono text-[10px] uppercase tracking-widest text-amber-200">
+              Hidden — no coordinates
+            </div>
+            <div className="text-[11px] text-muted-foreground">
+              {missingCount || (totalCount ?? 0) - valid.length} of {totalCount ?? deals.length} not
+              plotted
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

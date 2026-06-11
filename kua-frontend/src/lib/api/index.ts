@@ -11,6 +11,8 @@ export {
 } from "./exports";
 export type { ExportFormat, ExportArtifact } from "./exports";
 export { propertiesApi, adminApi } from "./properties";
+export { mapApi } from "./map";
+export type { TacticalMapMarker, MapDiagnostics, MapVerticalDiagnostics } from "./map";
 export type {
   DeletePropertyResponse,
   RestorePropertyResponse,
@@ -20,7 +22,9 @@ export {
   laundryApi,
   LAUNDRY_PREFERRED_NEIGHBOURHOODS,
   LAUNDRY_DEFAULT_MAX_SQM,
+  LAUNDRY_MAX_LISTINGS,
   LAUNDRY_SEARCH_PROVIDERS,
+  formatLaundryListingProgress,
 } from "./laundry";
 export type {
   LaundryProperty,

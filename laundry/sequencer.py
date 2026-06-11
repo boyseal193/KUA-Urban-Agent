@@ -20,6 +20,7 @@ from jobs import store as job_store
 from jobs.constants import JOB_CANCELLED, JOB_FAILED, JOB_RUNNING, JOB_SUCCESS
 
 from laundry import exports, pipeline, store as laundry_store, url_builder
+from laundry.limits import availability_message, clamp_listing_limit
 from laundry.listing_ledger import (
     ListingDiagnostics,
     TRACE_CLAIMED,
@@ -238,7 +239,10 @@ class AutonomousSequencer:
         self.listing_url = payload.get("url") or job.get("search_url") or None
         self.raw_text = payload.get("raw_text")
         self.use_llm = bool(payload.get("use_llm_extraction", False))
-        self.listing_limit = max(int(payload.get("listing_limit") or job.get("listing_limit") or 10), 1)
+        self.listing_limit = clamp_listing_limit(
+            payload.get("listing_limit") or job.get("listing_limit") or 10
+        )
+        self.requested_limit = self.listing_limit
         self.search_type = (payload.get("search_type") or self.filters.get("search_type") or "manual_url").lower()
         self.search_provider = payload.get("search_provider") or "idealista"
         self.search_diagnostics = payload.get("search_diagnostics") or {}
@@ -437,6 +441,10 @@ class AutonomousSequencer:
             )
             self._diagnostics.listings_found = 1
             self._diagnostics.listings_queued = 1
+            self._diagnostics.requested_limit = self.requested_limit
+            self._diagnostics.effective_limit = 1
+            self._diagnostics.discovered_count = 1
+            self._diagnostics.source_available_count = 1
             return [(None, self.raw_text, 0)]
 
         if mode == "single_listing":
@@ -448,6 +456,10 @@ class AutonomousSequencer:
             )
             self._diagnostics.listings_found = 1
             self._diagnostics.listings_queued = 1
+            self._diagnostics.requested_limit = self.requested_limit
+            self._diagnostics.effective_limit = 1
+            self._diagnostics.discovered_count = 1
+            self._diagnostics.source_available_count = 1
             return [(self.listing_url, None, 0)]
 
         laundry_store.start_step(self.job_id, laundry_store.JOB_STEP_DISCOVER, listing_url=self.listing_url)
@@ -463,18 +475,34 @@ class AutonomousSequencer:
             except Exception:
                 pass
 
+        source_available_count = None
+        if diagnostics:
+            self.search_diagnostics = diagnostics
+            source_available_count = diagnostics.get("source_available_count")
+
         queue, self._diagnostics, skip_rows = build_listing_queue(
             job_id=self.job_id,
             raw_urls=raw_urls,
             listing_limit=self.listing_limit,
             completed_indices=self._completed_indices,
             completed_urls=self._completed_urls,
+            source_available_count=source_available_count,
         )
         persist_skip_rows(self.job_id, skip_rows)
 
+        availability_note = availability_message(
+            requested_limit=self.requested_limit,
+            discovered_count=self._diagnostics.discovered_count,
+            source_available_count=self._diagnostics.source_available_count,
+        )
+
         discover_output: Dict[str, Any] = {
-            "discovered_count": self._diagnostics.listings_found,
+            "discovered_count": self._diagnostics.discovered_count,
             "queued_count": self._diagnostics.listings_queued,
+            "requested_limit": self.requested_limit,
+            "effective_limit": self._diagnostics.effective_limit,
+            "source_available_count": self._diagnostics.source_available_count,
+            "availability_message": availability_note,
             "search_url": self.listing_url,
             "urls": raw_urls[:20],
             "diagnostics": self._diagnostics.to_dict(),
@@ -552,11 +580,11 @@ class AutonomousSequencer:
         return last_urls, diagnostics
 
     def _step_underwrite(self, targets: List[Tuple[Optional[str], Optional[str], int]]) -> bool:
-        self.counters["total"] = self._diagnostics.listings_found or len(targets)
+        self.counters["total"] = self.requested_limit
         self.counters["deduped"] = self._diagnostics.listings_deduped
         laundry_store.set_job_counters(
             self.job_id,
-            listings_total=self.counters["total"],
+            listings_total=self.requested_limit,
             progress_pct=10,
         )
         laundry_store.start_step(self.job_id, laundry_store.JOB_STEP_UNDERWRITE)
@@ -938,6 +966,12 @@ class AutonomousSequencer:
             final_status = JOB_NO_RESULTS
             finish_error = "Worker processed listings but every one was skipped or failed to score."
 
+        availability_note = availability_message(
+            requested_limit=self.requested_limit,
+            discovered_count=self._diagnostics.discovered_count,
+            source_available_count=self._diagnostics.source_available_count,
+        )
+
         summary = {
             "approved_count": self.counters["approved"],
             "manual_review_count": self.counters["manual_review"],
@@ -947,7 +981,7 @@ class AutonomousSequencer:
             "skipped_count": self._diagnostics.listings_skipped,
             "deduped_count": self._diagnostics.listings_deduped,
             "resumed_count": self.counters.get("resumed", 0),
-            "total": self._diagnostics.listings_found,
+            "total": self.requested_limit,
             "listings_found": self._diagnostics.listings_found,
             "listings_queued": self._diagnostics.listings_queued,
             "listings_processed": self._diagnostics.listings_processed,
@@ -955,6 +989,11 @@ class AutonomousSequencer:
             "listings_skipped": self._diagnostics.listings_skipped,
             "listings_retried": self._retried_count,
             "listings_truncated": self._diagnostics.listings_truncated,
+            "requested_limit": self.requested_limit,
+            "effective_limit": self._diagnostics.effective_limit,
+            "discovered_count": self._diagnostics.discovered_count,
+            "source_available_count": self._diagnostics.source_available_count,
+            "availability_message": availability_note,
             "persisted_count": persisted_count,
             "listing_result_count": len(listing_rows),
             "elapsed_sec": round(time.monotonic() - self.started, 2),
@@ -976,8 +1015,8 @@ class AutonomousSequencer:
             finished_at=job_store._now(),
             summary=summary,
             error_message=finish_error,
-            listings_done=len(listing_rows),
-            listings_total=self._diagnostics.listings_found,
+            listings_done=self.counters.get("done", 0),
+            listings_total=self.requested_limit,
             listings_failed=self._diagnostics.listings_failed,
         )
         log.info(

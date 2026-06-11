@@ -76,6 +76,9 @@ class UrlBuildRequest:
 class SearchDiagnostics:
     generated_url: str
     listing_count: Optional[int] = None
+    discovered_count: Optional[int] = None
+    source_available_count: Optional[int] = None
+    requested_limit: Optional[int] = None
     fallback_level: str = "barcelona"
     stage: int = 1
     applied_filters: Dict[str, str] = field(default_factory=dict)
@@ -89,6 +92,9 @@ class SearchDiagnostics:
         return {
             "generated_url": self.generated_url,
             "listing_count": self.listing_count,
+            "discovered_count": self.discovered_count,
+            "source_available_count": self.source_available_count,
+            "requested_limit": self.requested_limit,
             "fallback_level": self.fallback_level,
             "stage": self.stage,
             "applied_filters": self.applied_filters,
@@ -743,24 +749,40 @@ def discover_with_fallback(
 ) -> Tuple[List[str], UrlBuildResult]:
     """Discover listing URLs; if the search URL yields 0, walk toward broader searches."""
     from laundry import scanner
+    from laundry.limits import clamp_listing_limit
 
     req = UrlBuildRequest.from_dict(filters or {})
-    urls = scanner.discover_listing_urls(search_url, limit=limit)
+    listing_limit = clamp_listing_limit(limit)
+
+    def _discover(url: str) -> scanner.DiscoverResult:
+        return scanner.discover_listings(url, limit=listing_limit)
+
+    def _attach_discovery(built: UrlBuildResult, result: scanner.DiscoverResult) -> None:
+        if not built.diagnostics:
+            return
+        built.diagnostics.listing_count = result.discovered_count
+        built.diagnostics.discovered_count = result.discovered_count
+        built.diagnostics.source_available_count = result.source_available_count
+        built.diagnostics.requested_limit = listing_limit
+
+    discovery = _discover(search_url)
+    urls = discovery.urls
 
     if urls:
         built = _build_idealista_from_spec(req, _idealista_primary_spec(req))
         if built.diagnostics:
-            built.diagnostics.listing_count = len(urls)
             built.diagnostics.generated_url = search_url
+        _attach_discovery(built, discovery)
         return urls, built
 
     log.info("Discovery returned 0 for %s — walking fallback ladder", search_url)
 
     if (provider or "idealista").lower() != "idealista":
         resolved = resolve_search_url(filters, provider=provider, validate=True, min_listings=1)
-        urls = scanner.discover_listing_urls(resolved.url, limit=limit)
-        if urls and resolved.diagnostics:
-            resolved.diagnostics.listing_count = len(urls)
+        discovery = _discover(resolved.url)
+        urls = discovery.urls
+        if urls:
+            _attach_discovery(resolved, discovery)
         return urls, resolved
 
     attempts: List[Dict[str, Any]] = []
@@ -786,16 +808,17 @@ def discover_with_fallback(
             "removed_filters": spec.removed,
         })
         if count >= 1:
-            urls = scanner.discover_listing_urls(built.url, limit=limit)
+            discovery = _discover(built.url)
+            urls = discovery.urls
             if urls:
                 if built.diagnostics:
-                    built.diagnostics.listing_count = len(urls)
                     built.diagnostics.search_broadened = built.url != search_url
                     built.diagnostics.broadening_reason = (
                         "No listings found under original constraints"
                         if built.url != search_url else None
                     )
                     built.diagnostics.attempts = attempts
+                _attach_discovery(built, discovery)
                 return urls, built
 
     last = _build_idealista_from_spec(req, candidate_specs[-1])
@@ -805,6 +828,7 @@ def discover_with_fallback(
             "No listings found under original constraints" if last.url != search_url else None
         )
         last.diagnostics.attempts = attempts
+        last.diagnostics.requested_limit = listing_limit
     return [], last
 
 

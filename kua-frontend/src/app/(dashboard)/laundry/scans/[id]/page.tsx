@@ -10,6 +10,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { EmptyState } from "@/components/common/empty-state";
 import { LaundryScanListingCard } from "@/components/laundry/laundry-scan-listing-card";
 import { useLaundryScan } from "@/hooks/use-laundry";
+import { formatLaundryListingProgress } from "@/lib/api/laundry";
 import type { LaundrySearchDiagnostics } from "@/lib/api";
 
 const STATUS_COLOR: Record<string, string> = {
@@ -63,6 +64,8 @@ export default function LaundryScanDetailPage({
       ((job?.listings_done ?? 0) > 0 && properties.length === 0),
   );
 
+  const showAvailabilityNote = Boolean(summary?.availability_message);
+
   return (
     <div className="space-y-6">
       <PageHeader
@@ -70,7 +73,7 @@ export default function LaundryScanDetailPage({
         title={job ? `Scan ${job.id.slice(0, 8)}` : "Scan"}
         subtitle={
           job
-            ? `Status ${statusLabel(job.status)} · ${Math.round(job.progress_pct)}% · ${job.listings_done ?? 0}/${job.listings_total ?? 0} listings`
+            ? `Status ${statusLabel(job.status)} · ${Math.round(job.progress_pct)}% · ${formatLaundryListingProgress(job, summary)} listings`
             : "Loading…"
         }
         rightSlot={
@@ -85,6 +88,25 @@ export default function LaundryScanDetailPage({
           </div>
         }
       />
+
+      {showAvailabilityNote && (
+        <Card>
+          <CardContent className="flex gap-3 p-4">
+            <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0 text-amber-300" />
+            <div className="space-y-1 text-xs">
+              <p className="font-mono uppercase tracking-widest text-amber-200">
+                Source listing cap
+              </p>
+              <p className="text-muted-foreground">{summary?.availability_message}</p>
+              <p className="font-mono text-[10px] text-muted-foreground">
+                Requested {summary?.requested_limit ?? job?.listing_limit ?? "—"} · discovered{" "}
+                {summary?.discovered_count ?? summary?.listings_found ?? "—"} · source reports{" "}
+                {summary?.source_available_count ?? "—"}
+              </p>
+            </div>
+          </CardContent>
+        </Card>
+      )}
 
       {showMismatchWarning && (
         <Card>
@@ -144,8 +166,10 @@ export default function LaundryScanDetailPage({
             <CardTitle>Pipeline diagnostics</CardTitle>
           </CardHeader>
           <CardContent className="grid gap-3 sm:grid-cols-3 lg:grid-cols-6">
-            <DiagStat label="Found" value={summary.listings_found ?? summary.listings_total ?? 0} />
-            <DiagStat label="Queued" value={summary.listings_queued ?? job?.listings_total ?? 0} />
+            <DiagStat label="Requested" value={summary.requested_limit ?? job?.listing_limit ?? 0} />
+            <DiagStat label="Discovered" value={summary.discovered_count ?? summary.listings_found ?? 0} />
+            <DiagStat label="Source total" value={summary.source_available_count ?? "—"} />
+            <DiagStat label="Queued" value={summary.listings_queued ?? 0} />
             <DiagStat label="Processed" value={summary.listings_processed ?? summary.persisted_count ?? 0} />
             <DiagStat label="Failed" value={summary.listings_failed_count ?? summary.listings_failed ?? 0} />
             <DiagStat label="Skipped" value={summary.listings_skipped ?? summary.skipped_count ?? 0} />
@@ -203,7 +227,9 @@ export default function LaundryScanDetailPage({
             <Row k="Property type" v={job?.property_type ?? "—"} />
             <Row k="Acquisition" v={job?.acquisition_type ?? "—"} />
             <Row k="Search URL" v={job?.search_url ?? "—"} mono />
-            <Row k="Limit" v={job?.listing_limit?.toString() ?? "—"} />
+            <Row k="Requested limit" v={String(summary?.requested_limit ?? job?.listing_limit ?? "—")} />
+            <Row k="Discovered" v={String(summary?.discovered_count ?? summary?.listings_found ?? "—")} />
+            <Row k="Source available" v={String(summary?.source_available_count ?? "—")} />
             <Row k="Approved" v={String(summary?.approved_count ?? job?.approved_count ?? 0)} />
             <Row k="Review" v={String(summary?.manual_review_count ?? job?.manual_review_count ?? 0)} />
             <Row k="Rejected" v={String(summary?.rejected_count ?? job?.rejected_count ?? 0)} />

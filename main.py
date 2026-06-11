@@ -317,7 +317,14 @@ def run_full_pipeline(data: dict, source: str = "auto"):
         f"{data.get('address') or data.get('neighbourhood') or data.get('city')}, "
         f"{data.get('city')}, Spain"
     )
-    coordinates = geocode_address(full_address) or {"lat": None, "lng": None}
+    from geocoding import resolve_coordinates
+
+    lat, lng, _geo_source = resolve_coordinates(
+        address=data.get("address") or data.get("neighbourhood"),
+        city=data.get("city") or "Barcelona",
+        neighbourhood=data.get("neighbourhood"),
+    )
+    coordinates = {"lat": lat, "lng": lng}
 
     data["latitude"] = coordinates.get("lat")
     data["longitude"] = coordinates.get("lng")
@@ -723,6 +730,123 @@ def get_rejected_deals(limit: int = 10):
         .execute()
     )
     return {"rejected_deals": results.data or []}
+
+
+def _storage_map_markers(*, limit: int = 500, backfill: bool = True) -> tuple[list, dict]:
+    from geocoding import geocoding_status, resolve_coordinates
+
+    rows = (
+        supabase.table("properties")
+        .select("id, address, city, neighbourhood, latitude, longitude, score, deal_status, verdict")
+        .is_("deleted_at", "null")
+        .order("score", desc=True)
+        .limit(limit)
+        .execute()
+    ).data or []
+
+    markers = []
+    missing = []
+    backfilled = 0
+
+    for row in rows:
+        lat = row.get("latitude")
+        lng = row.get("longitude")
+        if (lat is None or lng is None) and backfill:
+            lat, lng, _src = resolve_coordinates(
+                address=row.get("address"),
+                city=row.get("city") or "Barcelona",
+                neighbourhood=row.get("neighbourhood"),
+            )
+            if lat is not None and lng is not None:
+                supabase.table("properties").update({
+                    "latitude": lat,
+                    "longitude": lng,
+                }).eq("id", row["id"]).execute()
+                backfilled += 1
+
+        if lat is None or lng is None:
+            missing.append({
+                "id": row.get("id"),
+                "address": row.get("address"),
+                "city": row.get("city"),
+                "neighbourhood": row.get("neighbourhood"),
+            })
+            continue
+
+        markers.append({
+            "id": row.get("id"),
+            "vertical": "storage",
+            "lat": float(lat),
+            "lng": float(lng),
+            "latitude": float(lat),
+            "longitude": float(lng),
+            "score": row.get("score"),
+            "deal_status": row.get("deal_status"),
+            "address": row.get("address"),
+            "city": row.get("city"),
+            "neighbourhood": row.get("neighbourhood"),
+            "verdict": row.get("verdict"),
+        })
+
+    diagnostics = {
+        "vertical": "storage",
+        "total_properties": len(rows),
+        "plotted": len(markers),
+        "missing_coordinates": len(missing),
+        "backfilled": backfilled,
+        "missing_samples": missing[:10],
+        **geocoding_status(),
+    }
+    return markers, diagnostics
+
+
+@app.get("/map/markers")
+def unified_map_markers(
+    limit: int = 500,
+    backfill: bool = True,
+    vertical: Optional[str] = None,
+):
+    """Unified tactical map — storage + laundry properties with geocode backfill."""
+    verticals = (vertical or "all").lower().split(",")
+    include_storage = "all" in verticals or "storage" in verticals
+    include_laundry = "all" in verticals or "laundry" in verticals
+
+    markers: list = []
+    diagnostics: dict = {"verticals": {}}
+
+    if include_storage:
+        storage_markers, storage_diag = _storage_map_markers(limit=limit, backfill=backfill)
+        markers.extend(storage_markers)
+        diagnostics["verticals"]["storage"] = storage_diag
+
+    if include_laundry:
+        try:
+            from laundry import store as laundry_store
+            laundry_markers, laundry_diag = laundry_store.list_laundry_map_markers(
+                limit=limit, backfill=backfill,
+            )
+            markers.extend(laundry_markers)
+            diagnostics["verticals"]["laundry"] = laundry_diag
+        except Exception as exc:
+            diagnostics["verticals"]["laundry"] = {"error": str(exc)}
+
+    diagnostics["total_markers"] = len(markers)
+    diagnostics["plotted"] = len(markers)
+    diagnostics["missing_coordinates"] = sum(
+        (d.get("missing_coordinates") or 0)
+        for d in diagnostics["verticals"].values()
+        if isinstance(d, dict)
+    )
+    from geocoding import geocoding_status
+    diagnostics.update(geocoding_status())
+
+    return {"success": True, "markers": markers, "diagnostics": diagnostics}
+
+
+@app.get("/map/diagnostics")
+def unified_map_diagnostics(limit: int = 500):
+    payload = unified_map_markers(limit=limit, backfill=False)
+    return {"success": True, "diagnostics": payload.get("diagnostics")}
 
 
 # ---------------------------------------------------------------------------

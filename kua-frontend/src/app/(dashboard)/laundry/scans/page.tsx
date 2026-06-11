@@ -10,6 +10,7 @@ import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/common/empty-state";
 import { useLaundryScans } from "@/hooks/use-laundry";
 import { laundryApi } from "@/lib/api";
+import { formatLaundryListingProgress } from "@/lib/api/laundry";
 import { timeAgo } from "@/lib/format";
 
 const STATUS_COLOR: Record<string, string> = {
@@ -113,7 +114,7 @@ export default function LaundryScansPage() {
                           </span>
                         </td>
                         <td className="py-2 pr-2 font-mono tabular-nums">
-                          {s.listings_done}/{s.listings_total}
+                          {formatLaundryListingProgress(s, undefined)}
                           {s.listings_failed ? ` (${s.listings_failed} failed)` : ""}
                         </td>
                         <td className="py-2 pr-2 font-mono tabular-nums">

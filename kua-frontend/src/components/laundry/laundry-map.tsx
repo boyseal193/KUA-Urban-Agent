@@ -14,6 +14,8 @@ import type { LaundryMapMarker } from "@/lib/api";
 interface Props {
   markers: LaundryMapMarker[];
   height?: number | string;
+  missingCount?: number;
+  totalCount?: number;
 }
 
 function buildIcon(score: number | null, color: string) {
@@ -35,6 +37,8 @@ function buildIcon(score: number | null, color: string) {
 export default function LaundryMap({
   markers,
   height = "calc(100vh - 220px)",
+  missingCount = 0,
+  totalCount,
 }: Props) {
   const valid = React.useMemo(
     () =>
@@ -108,6 +112,26 @@ export default function LaundryMap({
           })}
         </MarkerClusterGroup>
       </MapContainer>
+
+      <div className="pointer-events-none absolute left-3 top-3 z-[400] flex flex-col gap-1">
+        <div className="rounded-md border border-border/60 bg-card/80 px-3 py-2 backdrop-blur-xl">
+          <div className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+            Laundry sector
+          </div>
+          <div className="font-display text-sm font-semibold text-foreground">
+            {valid.length} plotted
+            {totalCount != null ? ` / ${totalCount} scanned` : ""}
+          </div>
+        </div>
+        {missingCount > 0 && (
+          <div className="rounded-md border border-amber-400/30 bg-amber-400/10 px-3 py-2 backdrop-blur-xl">
+            <div className="font-mono text-[10px] uppercase tracking-widest text-amber-200">
+              Missing coordinates
+            </div>
+            <div className="text-[11px] text-muted-foreground">{missingCount} not shown on map</div>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

@@ -17,6 +17,8 @@ const Map = dynamic(() => import("./property-map"), {
 export function PropertyMap(props: {
   deals: PropertyRecord[];
   height?: number | string;
+  missingCount?: number;
+  totalCount?: number;
 }) {
   return <Map {...props} />;
 }

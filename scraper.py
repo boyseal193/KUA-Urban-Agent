@@ -150,7 +150,8 @@ def scrape_idealista_search_urls(search_url: str, limit: int = 10):
             "success": True,
             "search_url": search_url,
             "count": len(urls),
-            "urls": urls
+            "urls": urls,
+            "html": html[:50000],
         }
 
     except Exception as e:

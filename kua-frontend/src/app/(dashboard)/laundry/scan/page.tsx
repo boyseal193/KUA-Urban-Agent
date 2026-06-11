@@ -21,6 +21,7 @@ import { Switch } from "@/components/ui/switch";
 import { useLaunchLaundryScan } from "@/hooks/use-laundry";
 import {
   LAUNDRY_DEFAULT_MAX_SQM,
+  LAUNDRY_MAX_LISTINGS,
   LAUNDRY_PREFERRED_NEIGHBOURHOODS,
   LAUNDRY_SEARCH_PROVIDERS,
   laundryApi,
@@ -514,10 +515,20 @@ export default function LaundryScanPage() {
                 <Input
                   type="number"
                   min={1}
-                  max={200}
+                  max={LAUNDRY_MAX_LISTINGS}
                   value={listingLimit}
-                  onChange={(e) => setListingLimit(Number(e.target.value) || 20)}
+                  onChange={(e) =>
+                    setListingLimit(
+                      Math.min(
+                        LAUNDRY_MAX_LISTINGS,
+                        Math.max(1, Number(e.target.value) || 20),
+                      ),
+                    )
+                  }
                 />
+                <p className="text-[10px] text-muted-foreground">
+                  Up to {LAUNDRY_MAX_LISTINGS} listings per scan (set LAUNDRY_MAX_LISTINGS on the backend).
+                </p>
               </div>
               <div className="space-y-2">
                 <Label className="tactical-mono">Max size (m²)</Label>

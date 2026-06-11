@@ -113,7 +113,7 @@ export function useLaundryDetail(id: string | undefined) {
 export function useLaundryMapMarkers(limit = 500) {
   return useQuery({
     queryKey: LAUNDRY_KEYS.markers(limit),
-    queryFn: () => laundryApi.markers(limit).then((r) => r.markers),
+    queryFn: () => laundryApi.markers(limit, true),
     staleTime: 30_000,
   });
 }

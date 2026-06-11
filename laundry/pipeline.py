@@ -250,9 +250,11 @@ def analyse_listing(
         extracted["acquisition_type"] = extracted.get("acquisition_type") or filters["acquisition_type"]
 
     coords = None
-    if extracted.get("address"):
-        coords = loc_mod.geocode(extracted["address"], city=extracted.get("city") or "Barcelona")
-    lat, lng = (coords if coords else (None, None))
+    lat, lng, geo_source = loc_mod.resolve_coordinates(
+        address=extracted.get("address"),
+        city=extracted.get("city") or "Barcelona",
+        neighbourhood=extracted.get("neighbourhood"),
+    )
 
     location = loc_mod.gather_location_intel(
         lat=lat, lng=lng,
@@ -260,6 +262,8 @@ def analyse_listing(
         city=extracted.get("city"),
         neighbourhood=extracted.get("neighbourhood"),
     )
+    location["geocode_source"] = geo_source
+    location["geocode_approximate"] = geo_source in ("city_default", "neighbourhood") and not extracted.get("address")
 
     if not _matches_neighbourhood_filter(extracted, location, filters):
         log.info(

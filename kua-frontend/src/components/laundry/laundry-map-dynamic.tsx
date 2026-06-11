@@ -14,6 +14,8 @@ const LaundryMap = dynamic(() => import("./laundry-map"), {
 export function LaundryMapDynamic(props: {
   markers: LaundryMapMarker[];
   height?: number | string;
+  missingCount?: number;
+  totalCount?: number;
 }) {
   return <LaundryMap {...props} />;
 }

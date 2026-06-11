@@ -353,6 +353,17 @@ def create_partial_property(
         return False, None, schema_err
 
     extracted = dict(extracted or {})
+    lat, lng, geo_source = None, None, "none"
+    try:
+        from laundry import location as loc_mod
+        lat, lng, geo_source = loc_mod.resolve_coordinates(
+            address=extracted.get("address"),
+            city=extracted.get("city") or "Barcelona",
+            neighbourhood=extracted.get("neighbourhood"),
+        )
+    except Exception as exc:
+        log.warning("partial_property geocode failed: %s", exc)
+
     dedupe_key = normalization.make_dedupe_key(
         listing_url=listing_url,
         address=extracted.get("address"),
@@ -375,6 +386,8 @@ def create_partial_property(
         "address": extracted.get("address"),
         "city": extracted.get("city") or "Barcelona",
         "neighbourhood": extracted.get("neighbourhood"),
+        "lat": _finite_float(lat),
+        "lng": _finite_float(lng),
         "property_type": extracted.get("property_type"),
         "acquisition_type": extracted.get("acquisition_type"),
         "floor_area_m2": _finite_float(extracted.get("floor_area_m2")),
@@ -737,6 +750,8 @@ def create_scan_job(*, search_url: str, payload: Dict[str, Any],
     except Exception:
         JOB_QUEUED = "queued"
 
+    from laundry.limits import clamp_listing_limit
+
     job_id = str(uuid.uuid4())
     try:
         row = {
@@ -747,7 +762,7 @@ def create_scan_job(*, search_url: str, payload: Dict[str, Any],
             "search_url": search_url or "",
             "filters": _json_safe(payload.get("filters") or {}),
             "payload": _json_safe(payload),
-            "listing_limit": int(payload.get("listing_limit") or 10),
+            "listing_limit": clamp_listing_limit(payload.get("listing_limit") or 10),
             "generate_excel": bool(payload.get("generate_excel", False)),
             "request_id": request_id or job_id,
         }
@@ -1018,6 +1033,30 @@ def build_scan_summary(
         except Exception:
             job_summary = {}
     diagnostics = job_summary.get("diagnostics") or {}
+    requested_limit = int(
+        job_summary.get("requested_limit")
+        or diagnostics.get("requested_limit")
+        or job.get("listing_limit")
+        or 0
+    )
+    discovered_count = int(
+        job_summary.get("discovered_count")
+        or diagnostics.get("discovered_count")
+        or diagnostics.get("listings_found")
+        or job_summary.get("listings_found")
+        or 0
+    )
+    source_available_count = job_summary.get("source_available_count")
+    if source_available_count is None:
+        source_available_count = diagnostics.get("source_available_count")
+    effective_limit = int(
+        job_summary.get("effective_limit")
+        or diagnostics.get("effective_limit")
+        or discovered_count
+        or requested_limit
+        or 0
+    )
+    availability_message = job_summary.get("availability_message") or diagnostics.get("availability_message")
 
     processed_count = len(scored_rows) + len(extraction_failed_rows)
     failed_count = len(failed_rows)
@@ -1025,17 +1064,23 @@ def build_scan_summary(
     found_count = int(
         diagnostics.get("listings_found")
         or job_summary.get("listings_found")
-        or job.get("listings_total")
+        or discovered_count
         or len(listings)
         or 0
     )
+    listings_total = requested_limit or job.get("listing_limit") or job.get("listings_total") or effective_limit or len(listings)
     accounted = processed_count + failed_count + skipped_count
     invariant_ok = found_count == 0 or found_count == accounted
 
     return {
         "scanned_count": job.get("listings_done") or len(listings),
-        "listings_total": job.get("listings_total") or len(listings),
+        "listings_total": listings_total,
         "listings_done": job.get("listings_done") or 0,
+        "requested_limit": requested_limit,
+        "effective_limit": effective_limit,
+        "discovered_count": discovered_count,
+        "source_available_count": source_available_count,
+        "availability_message": availability_message,
         "listings_failed": job.get("listings_failed") or len(failed_rows),
         "extraction_failed_count": len(extraction_failed_rows) or len(extraction_failed_props),
         "approved_count": job.get("approved_count") or len(approved),
@@ -1598,6 +1643,140 @@ def resolve_pipeline_scope(scope: str) -> Tuple[Optional[str], str]:
         label = key.replace("_", " ").title()
         return PIPELINE_EXPORT_SCOPES[key], label
     return None, key.replace("_", " ").title()
+
+
+def update_property_coordinates(
+    property_id: str,
+    *,
+    lat: float,
+    lng: float,
+) -> bool:
+    if supabase is None or not property_id:
+        return False
+    try:
+        supabase.table("laundry_properties").update({
+            "lat": float(lat),
+            "lng": float(lng),
+            "updated_at": _now(),
+        }).eq("id", property_id).execute()
+        return True
+    except Exception as exc:
+        log.warning("update_property_coordinates failed property_id=%s: %s", property_id, exc)
+        return False
+
+
+def _coords_from_property(prop: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+    lat = _finite_float(prop.get("lat") if prop.get("lat") is not None else prop.get("latitude"))
+    lng = _finite_float(prop.get("lng") if prop.get("lng") is not None else prop.get("longitude"))
+    return lat, lng
+
+
+def ensure_property_coordinates(prop: Dict[str, Any], *, persist: bool = True) -> Dict[str, Any]:
+    """Geocode missing lat/lng from address/city/neighbourhood and optionally persist."""
+    lat, lng = _coords_from_property(prop)
+    if lat is not None and lng is not None:
+        return prop
+
+    from laundry import location as loc_mod
+
+    raw = prop.get("raw_extracted") or {}
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+
+    lat, lng, geo_source = loc_mod.resolve_coordinates(
+        address=prop.get("address") or raw.get("address"),
+        city=prop.get("city") or raw.get("city") or "Barcelona",
+        neighbourhood=prop.get("neighbourhood") or raw.get("neighbourhood"),
+    )
+    if lat is None or lng is None:
+        return prop
+
+    prop = dict(prop)
+    prop["lat"] = lat
+    prop["lng"] = lng
+    prop["latitude"] = lat
+    prop["longitude"] = lng
+    prop["geocode_source"] = geo_source
+
+    if persist and prop.get("id"):
+        update_property_coordinates(prop["id"], lat=lat, lng=lng)
+    return prop
+
+
+def list_laundry_map_markers(*, limit: int = 500, backfill: bool = True) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    props = list_properties(limit=limit, include_deleted=False)
+    markers: List[Dict[str, Any]] = []
+    missing: List[Dict[str, Any]] = []
+    backfilled = 0
+
+    for prop in props:
+        if not prop:
+            continue
+        working = dict(prop)
+        lat, lng = _coords_from_property(working)
+        if (lat is None or lng is None) and backfill:
+            working = ensure_property_coordinates(working, persist=True)
+            lat, lng = _coords_from_property(working)
+            if lat is not None and lng is not None:
+                backfilled += 1
+
+        if lat is None or lng is None:
+            missing.append({
+                "id": working.get("id"),
+                "address": working.get("address"),
+                "city": working.get("city"),
+                "neighbourhood": working.get("neighbourhood"),
+                "deal_status": working.get("deal_status"),
+            })
+            continue
+
+        markers.append({
+            "id": working.get("id"),
+            "vertical": "laundry",
+            "lat": lat,
+            "lng": lng,
+            "latitude": lat,
+            "longitude": lng,
+            "score": working.get("score"),
+            "deal_status": working.get("deal_status"),
+            "address": working.get("address"),
+            "city": working.get("city"),
+            "neighbourhood": working.get("neighbourhood"),
+            "verdict": working.get("verdict"),
+            "geocode_source": working.get("geocode_source"),
+        })
+
+    diagnostics = {
+        "vertical": "laundry",
+        "total_properties": len(props),
+        "plotted": len(markers),
+        "missing_coordinates": len(missing),
+        "backfilled": backfilled,
+        "missing_samples": missing[:10],
+    }
+    return markers, diagnostics
+
+
+def get_laundry_map_diagnostics(*, limit: int = 500) -> Dict[str, Any]:
+    from geocoding import geocoding_status
+
+    _markers, diag = list_laundry_map_markers(limit=limit, backfill=False)
+    status = geocoding_status()
+    return {**diag, **status}
+
+
+def backfill_laundry_coordinates(*, limit: int = 200) -> Dict[str, Any]:
+    markers, diag = list_laundry_map_markers(limit=limit, backfill=True)
+    return {
+        "success": True,
+        "plotted": len(markers),
+        "diagnostics": diag,
+    }
 
 
 def clean_stale_running_jobs(*, max_age_minutes: int = 120) -> int:

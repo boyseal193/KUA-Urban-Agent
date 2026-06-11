@@ -1,8 +1,7 @@
-"""Independent location intelligence using public APIs (Nominatim + Overpass).
+"""Location intelligence for the laundry vertical.
 
-All HTTP is via the ``requests`` library which is already a hard dependency of
-the storage stack. Failures are tolerated — we fall back to the baseline
-assumptions instead of crashing the underwriting pipeline.
+Geocoding delegates to the shared ``geocoding`` module (Google → Nominatim →
+neighbourhood → city default). Live competitor counts use Overpass when coords exist.
 """
 from __future__ import annotations
 
@@ -11,15 +10,14 @@ from typing import Any, Dict, Optional, Tuple
 
 import requests
 
+from geocoding import resolve_coordinates as _resolve_coordinates
 from laundry.assumptions import default_assumptions
 
 log = logging.getLogger("kua.laundry.location")
 
-NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 USER_AGENT = "kua-laundry-acquisition/2.0 (contact: ops@kua.app)"
 TIMEOUT_SEC = 12.0
-
 
 PREFERRED_MARKETS = {
     "raval": "Raval",
@@ -43,22 +41,24 @@ def _match_preferred_market(*, neighbourhood: Optional[str], address: Optional[s
 
 
 def geocode(address: str, *, city: str = "Barcelona") -> Optional[Tuple[float, float]]:
-    if not address:
+    lat, lng, _src = _resolve_coordinates(address=address, city=city)
+    if lat is None or lng is None:
         return None
-    try:
-        r = requests.get(
-            NOMINATIM_URL,
-            params={"q": f"{address}, {city}", "format": "json", "limit": 1, "addressdetails": 0},
-            headers={"User-Agent": USER_AGENT},
-            timeout=TIMEOUT_SEC,
-        )
-        r.raise_for_status()
-        data = r.json()
-        if data:
-            return float(data[0]["lat"]), float(data[0]["lon"])
-    except Exception as exc:  # pragma: no cover — network
-        log.warning("Geocode failed for %s: %s", address, exc)
-    return None
+    return lat, lng
+
+
+def resolve_coordinates(
+    *,
+    address: Optional[str] = None,
+    city: Optional[str] = None,
+    neighbourhood: Optional[str] = None,
+) -> Tuple[Optional[float], Optional[float], str]:
+    return _resolve_coordinates(
+        address=address,
+        city=city or "Barcelona",
+        neighbourhood=neighbourhood,
+        allow_city_default=True,
+    )
 
 
 def _overpass_count(lat: float, lng: float, radius_m: int, filter_str: str) -> int:
@@ -71,16 +71,22 @@ def _overpass_count(lat: float, lng: float, radius_m: int, filter_str: str) -> i
 out count;
 """.strip()
     try:
-        r = requests.post(OVERPASS_URL, data={"data": query},
-                          headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT_SEC)
+        r = requests.post(
+            OVERPASS_URL,
+            data={"data": query},
+            headers={"User-Agent": USER_AGENT},
+            timeout=TIMEOUT_SEC,
+        )
         r.raise_for_status()
         data = r.json()
         elements = data.get("elements") or []
         if elements and "tags" in elements[0]:
             total = elements[0]["tags"].get("total")
-            try: return int(total)
-            except (TypeError, ValueError): return 0
-    except Exception as exc:  # pragma: no cover — network
+            try:
+                return int(total)
+            except (TypeError, ValueError):
+                return 0
+    except Exception as exc:
         log.warning("Overpass query failed: %s", exc)
     return 0
 
@@ -125,7 +131,7 @@ def gather_location_intel(*, lat: Optional[float], lng: Optional[float],
         intel["hotels_within_500m"] = _overpass_count(lat, lng, 500, "tourism=hotel")
         intel["universities_within_2km"] = _overpass_count(lat, lng, 2000, "amenity=university")
         intel["data_source"] = "overpass"
-    except Exception as exc:  # pragma: no cover
+    except Exception as exc:
         log.warning("Live location intel failed: %s", exc)
         intel["data_source"] = "baseline_only"
 

@@ -1,28 +1,6 @@
-import os
-import requests
-from dotenv import load_dotenv
+"""Storage vertical geocoding — delegates to shared ``geocoding`` module."""
+from __future__ import annotations
 
-load_dotenv()
+from geocoding import geocode_address, geocoding_status, resolve_coordinates
 
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-
-
-def geocode_address(address: str):
-    url = "https://maps.googleapis.com/maps/api/geocode/json"
-
-    params = {
-        "address": address,
-        "key": GOOGLE_API_KEY
-    }
-
-    response = requests.get(url, params=params).json()
-
-    if response["status"] != "OK":
-        return {"lat": None, "lng": None}
-
-    location = response["results"][0]["geometry"]["location"]
-
-    return {
-        "lat": location["lat"],
-        "lng": location["lng"]
-    }
+__all__ = ["geocode_address", "geocoding_status", "resolve_coordinates"]

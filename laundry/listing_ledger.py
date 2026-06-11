@@ -57,6 +57,10 @@ class ListingDiagnostics:
     listings_deduped: int = 0
     listings_truncated: int = 0
     listings_resumed: int = 0
+    requested_limit: int = 0
+    effective_limit: int = 0
+    discovered_count: int = 0
+    source_available_count: Optional[int] = None
     invariant_ok: bool = True
     invariant_delta: int = 0
     skip_reasons: Dict[str, int] = field(default_factory=dict)
@@ -72,6 +76,10 @@ class ListingDiagnostics:
             "listings_deduped": self.listings_deduped,
             "listings_truncated": self.listings_truncated,
             "listings_resumed": self.listings_resumed,
+            "requested_limit": self.requested_limit,
+            "effective_limit": self.effective_limit,
+            "discovered_count": self.discovered_count,
+            "source_available_count": self.source_available_count,
             "invariant_ok": self.invariant_ok,
             "invariant_delta": self.invariant_delta,
             "skip_reasons": dict(self.skip_reasons),
@@ -92,6 +100,7 @@ def build_listing_queue(
     completed_indices: Set[int],
     completed_urls: Set[str],
     global_known_urls: Optional[Set[str]] = None,
+    source_available_count: Optional[int] = None,
 ) -> Tuple[List[QueueItem], ListingDiagnostics, List[Tuple[int, str, str]]]:
     """Build the processing queue and immediately account for non-queued URLs.
 
@@ -107,7 +116,12 @@ def build_listing_queue(
     seen_in_batch: Set[str] = set()
     next_index = 0
 
-    diag.listings_found = len(raw_urls)
+    discovered = len(raw_urls)
+    diag.requested_limit = listing_limit
+    diag.discovered_count = discovered
+    diag.source_available_count = source_available_count if source_available_count is not None else discovered
+    diag.listings_found = discovered
+    diag.effective_limit = min(listing_limit, discovered)
     for raw in raw_urls:
         url = (raw or "").strip()
         if not url:

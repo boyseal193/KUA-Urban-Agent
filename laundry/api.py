@@ -13,7 +13,9 @@ Endpoints (prefix ``/laundry``):
 * ``GET    /laundry/jobs/{id}``               — job row
 * ``DELETE /laundry/jobs/{id}``               — cancel a job
 * ``POST   /laundry/analyse``                 — synchronous one-shot underwriting
-* ``GET    /laundry/properties``              — list scored properties
+* ``GET    /laundry/map/markers``              — geocoded map pins
+* ``GET    /laundry/map/diagnostics``          — coordinate coverage stats
+* ``POST   /laundry/map/backfill``           — geocode missing laundry rows
 * ``GET    /laundry/properties/{id}``         — property + latest memo
 * ``DELETE /laundry/properties/{id}``         — soft delete
 * ``POST   /laundry/properties/{id}/restore``
@@ -43,6 +45,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from laundry import exports, pipeline, store, url_builder
+from laundry.limits import MAX_LISTINGS, clamp_listing_limit
 
 log = logging.getLogger("kua.laundry.api")
 
@@ -62,7 +65,7 @@ class ScanPayload(BaseModel):
     raw_listing_text: Optional[str] = None
     seed_text: Optional[str] = None
 
-    listing_limit: int = Field(default=20, ge=1, le=100)
+    listing_limit: int = Field(default=20, ge=1, le=MAX_LISTINGS)
     run_in_background: bool = True
     async_mode: Optional[bool] = None
 
@@ -138,7 +141,7 @@ class ScanPayload(BaseModel):
             "max_price_eur": float(self.max_price_eur) if self.max_price_eur else None,
             "max_rent_month_eur": float(self.max_rent_month_eur) if self.max_rent_month_eur else None,
             "ground_floor_only": bool(self.ground_floor_only),
-            "listing_limit": int(self.listing_limit or 20),
+            "listing_limit": clamp_listing_limit(self.listing_limit or 20),
             "extra_filters": dict(self.search_provider_extras or {}),
         }
 
@@ -167,7 +170,7 @@ class SearchUrlPayload(BaseModel):
     max_price_eur: Optional[float] = None
     max_rent_month_eur: Optional[float] = None
     ground_floor_only: bool = True
-    listing_limit: int = 20
+    listing_limit: int = Field(default=20, ge=1, le=MAX_LISTINGS)
     provider: Optional[str] = "idealista"
     extra_filters: Dict[str, str] = Field(default_factory=dict)
     validate_listing_count: bool = True
@@ -209,13 +212,17 @@ def laundry_health() -> Dict[str, Any]:
     except Exception:
         sb_ok = False
     schema_ok, schema_err = store.check_laundry_schema() if sb_ok else (False, "supabase_missing")
+    from geocoding import geocoding_status
+    geo = geocoding_status()
     return {
         "success": True,
         "service": "kua-laundry",
         "version": "2.2.0",
+        "max_listings": MAX_LISTINGS,
         "supabase": "configured" if sb_ok else "missing",
         "laundry_schema": "ready" if schema_ok else "missing",
         "laundry_schema_error": None if schema_ok else schema_err,
+        "geocoding": geo,
     }
 
 
@@ -319,7 +326,7 @@ def launch_scan(payload: ScanPayload, request: Request) -> JSONResponse:
         "filters": filters, "overrides": overrides,
         "use_llm_extraction": payload.use_llm_extraction,
         "llm_memo_polish": payload.llm_memo_polish or bool(payload.polish_with_llm),
-        "listing_limit": payload.listing_limit,
+        "listing_limit": clamp_listing_limit(payload.listing_limit),
         "search_type": payload.search_type or ("area_search" if filters.get("search_type") == "area_search" else "manual_url"),
         "search_provider": payload.search_provider or "idealista",
         "auto_generated_url": auto_generated,
@@ -451,6 +458,25 @@ def analyse_inline(payload: AnalysePayload) -> Dict[str, Any]:
         source="inline", overrides=payload.overrides, filters=payload.filters,
         use_llm=payload.use_llm, persist=payload.persist,
     )
+
+
+# ---------------------------------------------------------------------------
+# Map
+# ---------------------------------------------------------------------------
+@router.get("/map/markers")
+def laundry_map_markers(limit: int = 500, backfill: bool = True) -> Dict[str, Any]:
+    markers, diagnostics = store.list_laundry_map_markers(limit=limit, backfill=backfill)
+    return {"success": True, "markers": markers, "diagnostics": diagnostics}
+
+
+@router.get("/map/diagnostics")
+def laundry_map_diagnostics(limit: int = 500) -> Dict[str, Any]:
+    return {"success": True, "diagnostics": store.get_laundry_map_diagnostics(limit=limit)}
+
+
+@router.post("/map/backfill")
+def laundry_map_backfill(limit: int = 200) -> Dict[str, Any]:
+    return store.backfill_laundry_coordinates(limit=limit)
 
 
 # ---------------------------------------------------------------------------
