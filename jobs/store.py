@@ -8,7 +8,9 @@ worker loop. Callers receive either a typed result or a typed exception
 
 from __future__ import annotations
 
+import logging
 import os
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, List, Optional, TypeVar
@@ -40,9 +42,41 @@ from jobs.logging_util import get_logger, safe_json
 
 T = TypeVar("T")
 
+_perf_log = logging.getLogger("kua.perf")
+
+# Slow-query thresholds (Phase 14 — production hardening). Never silently degrade.
+_SLOW_WARN_MS = 3000.0
+_SLOW_CRIT_MS = 10000.0
+
 # Job-level steps use listing_index = -1 (NULL would break the UNIQUE
 # (job_id, listing_index, step_key) constraint in PostgreSQL).
 JOB_LEVEL_INDEX = -1
+
+# History (GET /jobs) is a SUMMARY view. It must never pull the heavy JSONB
+# columns (filters / payload / result / result_summary) — those belong to the
+# detail endpoint (GET /jobs/{id}). Keeping the projection tight bounds the
+# payload regardless of how many rows exist and keeps serialization trivial.
+JOB_SUMMARY_COLUMNS = (
+    "id,job_type,status,created_by,search_url,listing_limit,generate_excel,"
+    "progress_pct,current_step,listings_total,listings_done,listings_failed,"
+    "approved_count,manual_review_count,rejected_count,excel_path,error_message,"
+    "retry_count,worker_id,started_at,finished_at,created_at,updated_at"
+)
+
+
+def _timed(label: str, fn: Callable[[], T]) -> T:
+    """Run ``fn`` and emit a structured timing log, escalating on slow calls."""
+    started = time.perf_counter()
+    try:
+        return fn()
+    finally:
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        if elapsed_ms >= _SLOW_CRIT_MS:
+            _perf_log.critical("CRITICAL slow query %s took %.0fms", label, elapsed_ms)
+        elif elapsed_ms >= _SLOW_WARN_MS:
+            _perf_log.warning("slow query %s took %.0fms", label, elapsed_ms)
+        else:
+            _perf_log.info("%s %.0fms", label, elapsed_ms)
 
 
 # ---------------------------------------------------------------------------
@@ -228,13 +262,41 @@ def get_job(job_id: str) -> dict:
     return res.data[0]
 
 
-def list_jobs(limit: int = 20, status: Optional[str] = None) -> List[dict]:
-    assert_pipeline_ready()
-    query = supabase.table("scan_jobs").select("*").order("created_at", desc=True).limit(limit)
-    if status:
-        query = query.eq("status", status)
-    res = _execute(lambda: query.execute(), table="scan_jobs", operation="select")
-    return res.data or []
+def list_jobs(
+    limit: int = 20,
+    status: Optional[str] = None,
+    offset: int = 0,
+) -> List[dict]:
+    """Lightweight history feed for GET /jobs.
+
+    Design notes (performance):
+      * NO per-request schema probe. The previous ``assert_pipeline_ready()``
+        call fanned out into ~112 serial column-existence round trips whenever
+        the 30 s health cache expired, which is what made this endpoint take
+        ~31 s while GET /jobs/{id} (which skips the probe) stayed ~2 s. Reads
+        self-validate: if a table/column is genuinely missing the SELECT below
+        raises and ``_raise_from_api_error`` converts it into the same
+        DatabaseSetupError, so the setup UX is preserved without the probe.
+      * SUMMARY columns only (JOB_SUMMARY_COLUMNS) — never the heavy JSONB.
+      * Keyset-friendly ordering on the indexed ``created_at`` column plus
+        ``range`` for pagination, so we never scan the whole history.
+    """
+    limit = max(1, min(int(limit or 20), 100))
+    offset = max(0, int(offset or 0))
+
+    def _run() -> List[dict]:
+        query = (
+            supabase.table("scan_jobs")
+            .select(JOB_SUMMARY_COLUMNS)
+            .order("created_at", desc=True)
+            .range(offset, offset + limit - 1)
+        )
+        if status:
+            query = query.eq("status", status)
+        res = _execute(lambda: query.execute(), table="scan_jobs", operation="select")
+        return res.data or []
+
+    return _timed(f"list_jobs(limit={limit},offset={offset},status={status})", _run)
 
 
 def queue_size() -> int:

@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 import { jobsApi } from "@/lib/api";
+import { describeApiError } from "@/lib/api/client";
 import type { ScanJobRecord } from "@/lib/api/types";
 import { ExportButtons } from "./export-buttons";
 
@@ -106,7 +107,7 @@ export function ScanHistory({ limit = 8 }: { limit?: number }) {
         </div>
       ) : query.isError ? (
         <div className="rounded-md border border-destructive/30 bg-destructive/[0.06] px-3 py-2 text-xs text-destructive">
-          Could not load scan history: {(query.error as Error)?.message}
+          Could not load scan history: {describeApiError(query.error, "scan history request")}
         </div>
       ) : jobs.length === 0 ? (
         <div className="rounded-md border border-border/60 bg-card/30 px-3 py-6 text-center text-xs text-muted-foreground">

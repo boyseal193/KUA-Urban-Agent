@@ -11,11 +11,14 @@ and must stay in sync with `jobs/store.py`.
 
 from __future__ import annotations
 
+import logging
 import re
 import time
 from typing import Dict, List, Optional, Tuple
 
 from database import supabase
+
+log = logging.getLogger("kua.db_health")
 
 # ---------------------------------------------------------------------------
 # Canonical expected schema — every column the backend reads/writes.
@@ -148,7 +151,11 @@ EXPECTED_SCHEMA: Dict[str, List[str]] = {
 
 REQUIRED_TABLES: Tuple[str, ...] = tuple(EXPECTED_SCHEMA.keys())
 
-_CACHE_TTL_SEC = 30.0
+# A healthy schema does not change at runtime, so once every column is present
+# we can trust that snapshot for a long time. When the schema is INCOMPLETE we
+# re-probe far more often so an operator running schema.sql sees the fix quickly.
+_CACHE_TTL_OK_SEC = 300.0   # 5 min — schema verified healthy
+_CACHE_TTL_BAD_SEC = 15.0   # 15 s — schema incomplete, watch for repair
 _cache: Optional[Tuple[float, Dict[str, object]]] = None
 
 _MISSING_TABLE_RE = re.compile(
@@ -239,29 +246,71 @@ def _column_exists(table: str, column: str) -> bool:
         return True
 
 
+def _probe_table(table: str, expected_cols: List[str]) -> Tuple[bool, List[str]]:
+    """Verify a table and ALL its expected columns in a single round trip.
+
+    Returns ``(table_exists, missing_columns)``.
+
+    PostgREST resolves every requested column server-side, so
+    ``select("col_a,col_b,...")`` succeeds only when every column exists. This
+    replaces the previous behaviour of one network round trip PER COLUMN
+    (~105 serial requests across all tables ≈ 30 s on Railway→Supabase) with
+    one round trip per table (7 total). The expensive per-column fallback runs
+    only for a table that actually reports a missing column, which happens once
+    during initial setup rather than on every request.
+    """
+    projection = ",".join(expected_cols)
+    try:
+        supabase.table(table).select(projection).limit(1).execute()
+        return True, []
+    except Exception as exc:
+        if _is_missing_table_error(exc):
+            return False, []
+        if _is_missing_column_error(exc):
+            # One or more columns missing — identify exactly which, per column.
+            missing = [c for c in expected_cols if not _column_exists(table, c)]
+            return True, missing
+        # Transient/permission error: assume present so we never false-alarm
+        # (a genuinely broken table surfaces when the real query runs).
+        log.debug("schema probe for %s inconclusive: %s", table, exc)
+        return True, []
+
+
 def check_schema(*, force: bool = False) -> Dict[str, object]:
-    """Return a full snapshot: which tables and columns are missing."""
+    """Return a full snapshot: which tables and columns are missing.
+
+    Happy path issues exactly one Supabase round trip per table (7 total) and
+    caches the healthy result for several minutes, so this is safe to call from
+    write paths and the worker loop without adding meaningful latency.
+    """
     global _cache
     now = time.time()
 
     if not force and _cache is not None:
         ts, payload = _cache
-        if now - ts < _CACHE_TTL_SEC:
+        ttl = _CACHE_TTL_OK_SEC if payload.get("success") else _CACHE_TTL_BAD_SEC
+        if now - ts < ttl:
             return dict(payload)  # type: ignore[arg-type]
 
+    started = time.perf_counter()
     missing_tables: List[str] = []
     missing_columns: Dict[str, List[str]] = {}
 
     for table, expected_cols in EXPECTED_SCHEMA.items():
-        if not _table_exists(table):
+        exists, missing_for_table = _probe_table(table, expected_cols)
+        if not exists:
             missing_tables.append(table)
             continue
-        # Probe each column individually so we get the complete list at once.
-        missing_for_table = [c for c in expected_cols if not _column_exists(table, c)]
         if missing_for_table:
             missing_columns[table] = missing_for_table
 
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
     success = not missing_tables and not missing_columns
+    if elapsed_ms >= 3000.0:
+        log.warning("check_schema completed in %.0fms (probed %d tables)", elapsed_ms, len(EXPECTED_SCHEMA))
+    else:
+        log.info("check_schema completed in %.0fms (success=%s)", elapsed_ms, success)
+
     snapshot = {
         "success": success,
         "missing_tables": missing_tables,
@@ -314,6 +363,19 @@ def database_health(*, force: bool = False) -> Dict[str, object]:
         "expected_schema": EXPECTED_SCHEMA,
         "message": snapshot.get("message"),
     }
+
+
+def warm_schema_cache() -> None:
+    """Best-effort schema probe to prime the cache at startup.
+
+    Called once from the FastAPI startup hook so the first write / worker claim
+    does not pay the probe cost inline. Never raises — startup must not fail if
+    Supabase is briefly unreachable.
+    """
+    try:
+        check_schema(force=True)
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("warm_schema_cache failed (non-fatal): %s", exc)
 
 
 def assert_pipeline_ready(*, force: bool = False) -> None:

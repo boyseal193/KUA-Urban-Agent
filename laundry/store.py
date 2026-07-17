@@ -1221,16 +1221,33 @@ def list_pipeline_steps(job_id: str) -> List[Dict[str, Any]]:
         return []
 
 
-def list_laundry_jobs(*, limit: int = 50, status: Optional[str] = None) -> List[Dict[str, Any]]:
+# Laundry history needs payload + filters (normalize_job_row lifts search
+# config off them) but never the heavy `result` / `result_summary` blobs (full
+# pipeline output + listing arrays). Excluding those keeps the history payload
+# small without regressing the list UI.
+_LAUNDRY_HISTORY_COLUMNS = (
+    "id,job_type,status,created_by,search_url,filters,payload,listing_limit,"
+    "generate_excel,progress_pct,current_step,listings_total,listings_done,"
+    "listings_failed,approved_count,manual_review_count,rejected_count,"
+    "excel_path,error_message,retry_count,max_retries,request_id,worker_id,"
+    "last_heartbeat_at,started_at,finished_at,created_at,updated_at"
+)
+
+
+def list_laundry_jobs(
+    *, limit: int = 50, status: Optional[str] = None, offset: int = 0
+) -> List[Dict[str, Any]]:
     if supabase is None:
         return []
+    limit = max(1, min(int(limit or 50), 100))
+    offset = max(0, int(offset or 0))
     try:
         q = (
             supabase.table("scan_jobs")
-            .select("*")
+            .select(_LAUNDRY_HISTORY_COLUMNS)
             .eq("job_type", LAUNDRY_JOB_TYPE)
             .order("created_at", desc=True)
-            .limit(limit)
+            .range(offset, offset + limit - 1)
         )
         if status:
             q = q.eq("status", status)

@@ -411,8 +411,18 @@ def resume_scan(job_id: str) -> Dict[str, Any]:
 
 
 @router.get("/jobs")
-def list_jobs(limit: int = 50, status: Optional[str] = None) -> Dict[str, Any]:
-    return {"success": True, "jobs": store.list_laundry_jobs(limit=limit, status=status)}
+def list_jobs(limit: int = 50, status: Optional[str] = None, offset: int = 0) -> Dict[str, Any]:
+    jobs = store.list_laundry_jobs(limit=limit, status=status, offset=offset)
+    eff_limit = max(1, min(int(limit or 50), 100))
+    eff_offset = max(0, int(offset or 0))
+    return {
+        "success": True,
+        "jobs": jobs,
+        "count": len(jobs),
+        "limit": eff_limit,
+        "offset": eff_offset,
+        "next_offset": eff_offset + len(jobs) if len(jobs) >= eff_limit else None,
+    }
 
 
 @router.get("/jobs/{job_id}")

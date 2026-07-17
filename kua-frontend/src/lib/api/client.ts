@@ -152,6 +152,34 @@ export function formatApiErrorMessage(
   return fallback;
 }
 
+/**
+ * Human-readable, cause-specific message for a failed request. Distinguishes
+ * timeout vs. connection failure vs. server error vs. auth so the UI never
+ * shows a misleading "backend unreachable" when the backend is merely slow or
+ * returned a 5xx. Falls back to the error's own message for anything else.
+ */
+export function describeApiError(
+  err: unknown,
+  context = "request"
+): string {
+  if (err instanceof ApiError) {
+    if (err.isAborted) return `The ${context} was cancelled.`;
+    if (err.isTimeout || err.status === 504) {
+      return `The backend is taking too long to respond (${context} timed out). It may be under load — retry shortly.`;
+    }
+    if (err.isNetwork || err.status === 0) {
+      return `Cannot reach the backend (connection failed). Check your network or whether the service is deploying.`;
+    }
+    if (err.status === 401) return "Your session expired. Please sign in again.";
+    if (err.status === 503) return "Backend is starting up or unavailable (503). Retry in a moment.";
+    if (err.status === 502) return "Backend reported a downstream failure (502). Retry shortly.";
+    if (err.status >= 500) return `Backend error (${err.status}). ${err.message}`;
+    return err.message;
+  }
+  if (err instanceof Error && err.message) return err.message;
+  return `Failed to complete the ${context}.`;
+}
+
 function handleUnauthorized() {
   if (typeof window === "undefined") return;
   const here =

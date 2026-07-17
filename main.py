@@ -38,6 +38,9 @@ from jobs.logging_util import configure_logging, get_logger
 
 configure_logging(os.getenv("LOG_LEVEL", "INFO"))
 
+# Module-level logger for endpoint-level performance diagnostics (Phase 12/14).
+log = get_logger("main", "app")
+
 app = FastAPI(
     title="TruTrastero AI Backend / K.U.A.",
     description=(
@@ -45,6 +48,18 @@ app = FastAPI(
     ),
     version="1.1.0",
 )
+
+
+@app.on_event("startup")
+def _warm_schema_cache_on_startup() -> None:
+    """Prime the schema-health cache once at boot so the first write / worker
+    claim does not pay the probe cost inline. Best-effort; never fails boot."""
+    try:
+        from jobs.db_health import warm_schema_cache
+
+        warm_schema_cache()
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("schema cache warm failed (non-fatal): %s", exc)
 
 # ---------------------------------------------------------------------------
 # CORS
@@ -1073,13 +1088,34 @@ def health_pipeline():
 # Async job API — frontend polls these
 # ---------------------------------------------------------------------------
 @app.get("/jobs")
-def list_scan_jobs(limit: int = 20, status: Optional[str] = None):
+def list_scan_jobs(limit: int = 20, status: Optional[str] = None, offset: int = 0):
+    """Lightweight scan history. Summary fields only — details live at
+    GET /jobs/{id}. Supports offset pagination so history scales to 10k+ jobs.
+    """
     from jobs import store
     from jobs.errors import DatabaseSetupError, StoreError
 
+    t0 = time.perf_counter()
     try:
-        jobs = store.list_jobs(limit=limit, status=status)
-        return {"success": True, "jobs": jobs}
+        jobs = store.list_jobs(limit=limit, status=status, offset=offset)
+        total_ms = (time.perf_counter() - t0) * 1000.0
+        if total_ms >= 10000.0:
+            log.critical("GET /jobs total=%.0fms limit=%s offset=%s", total_ms, limit, offset)
+        elif total_ms >= 3000.0:
+            log.warning("GET /jobs total=%.0fms limit=%s offset=%s", total_ms, limit, offset)
+        else:
+            log.info("GET /jobs total=%.0fms rows=%d", total_ms, len(jobs))
+        return {
+            "success": True,
+            "jobs": jobs,
+            "count": len(jobs),
+            "limit": max(1, min(int(limit or 20), 100)),
+            "offset": max(0, int(offset or 0)),
+            "next_offset": (
+                max(0, int(offset or 0)) + len(jobs) if len(jobs) >= max(1, min(int(limit or 20), 100)) else None
+            ),
+            "elapsed_ms": round(total_ms, 1),
+        }
     except DatabaseSetupError as exc:
         return _setup_error_response(exc)
     except StoreError as exc:

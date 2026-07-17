@@ -10,6 +10,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { ExportButtons } from "@/components/scan/export-buttons";
 import { jobsApi } from "@/lib/api";
+import { describeApiError } from "@/lib/api/client";
 import type { ScanJobRecord } from "@/lib/api/types";
 import { cn } from "@/lib/utils";
 
@@ -160,7 +161,7 @@ export default function ScansPage() {
           </div>
         ) : query.isError ? (
           <div className="m-4 rounded-md border border-destructive/30 bg-destructive/[0.06] px-3 py-2 text-xs text-destructive">
-            Failed to load scans: {(query.error as Error)?.message}
+            Failed to load scans: {describeApiError(query.error, "scan history request")}
           </div>
         ) : jobs.length === 0 ? (
           <div className="px-4 py-10 text-center text-xs text-muted-foreground">
