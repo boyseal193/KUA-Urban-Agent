@@ -126,26 +126,118 @@ class OpexAssumptions:
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class ScoringWeights:
-    location: float = 0.30
-    economics: float = 0.28
-    physical_fit: float = 0.18
-    competition: float = 0.12
-    risk: float = 0.08
-    secondary_revenue: float = 0.04
+    """Financial-return-led weighting (v3 recalibration).
+
+    Rationale: the previous split (economics 0.28, location 0.30) let a strong
+    location/physical grade carry a financially weak deal to Approved. The
+    acquisitions mandate is that *financial return* dominates. Economics now
+    leads at 40% (within the 35–45% target band); location/physical are demoted
+    so a good *building* or good *operating location* can no longer, on its own,
+    manufacture an Approved verdict — that requires the financial gates too.
+    ``economics`` is the financial-return sub-score.
+    """
+    location: float = 0.18
+    economics: float = 0.40
+    physical_fit: float = 0.12
+    competition: float = 0.10
+    risk: float = 0.12
+    secondary_revenue: float = 0.08
 
 
 @dataclass(frozen=True)
 class ScoringThresholds:
     """
-    * ``>= 75``   approved_candidate (EXCELLENT)
+    * ``>= 75``   potential approval (gated — see UnderwritingGates)
     * ``40-74``   manual_review (real-world good deals belong here)
     * ``<  40``   rejected
+
+    NOTE: a score >= approved_min is necessary but NOT sufficient for
+    ``approved_candidate``. The deterministic hard gates in
+    ``UnderwritingGates`` must also all pass and confidence must be adequate.
     """
     approved_min: int = 75
     manual_review_min: int = 40
 
     high_confidence_min_fields: int = 9
     low_confidence_max_fields: int = 4
+
+
+@dataclass(frozen=True)
+class ConfidenceCaps:
+    """Caps applied to the FINAL score when input data is missing/uncertain.
+
+    Confidence is a *ceiling*, never additive points. High-conviction approval
+    is impossible without adequately evidenced economics + feasibility.
+    """
+    # Any critical financial field missing (price/rent, floor area) -> hard cap.
+    critical_missing_max_score: int = 59
+    # Several operational/location fields missing -> softer cap.
+    operational_missing_max_score: int = 69
+    # Minimum confidence % required to allow an APPROVED verdict.
+    min_confidence_pct_for_approval: float = 60.0
+    # Field-count band that counts as "several operational fields missing".
+    operational_missing_field_threshold: int = 6
+
+
+@dataclass(frozen=True)
+class UnderwritingGates:
+    """Deterministic financial gates. A deal that fails a mandatory gate cannot
+    be Approved regardless of its weighted score — it is demoted to manual
+    review (soft fail) or rejected (severe fail).
+
+    Sources (see ASSUMPTIONS_SOURCES for full citations):
+      * Laundromat EBITDA margin 20–35% typical; <15% weak — BusinessDojo /
+        VantaInsights / The Deal Sheet, 2026.
+      * Base-case payback 34–50 months (2.8–4.2y); bear >60 months (>5y) —
+        BusinessDojo laundromat statistics, 2026.
+      * Rent 15–25% of sales sustainable — BusinessDojo cost structure, 2026.
+      * Business IRR 15–30%; commercial property yields lower, so a property-
+        inclusive EBITDA yield hurdle of ~8% is conservative — derived.
+    """
+
+    # --- BUY gates -------------------------------------------------------
+    buy_min_stabilised_ebitda_eur: float = 0.0          # must be positive
+    buy_min_downside_ebitda_eur: float = 0.0            # downside must survive
+    buy_min_ebitda_yield_on_total: float = 0.08        # 8% on total investment
+    buy_review_ebitda_yield_on_total: float = 0.05     # below -> review floor
+    buy_max_payback_years: float = 6.0                  # approve <= 6y
+    buy_review_max_payback_years: float = 9.0           # review <= 9y, else weak
+    buy_max_price_per_m2_eur: float = 6000.0           # Barcelona commercial ceiling
+    buy_overpriced_requires_yield: float = 0.10        # if >ceiling need >=10% yield
+
+    # --- RENT gates ------------------------------------------------------
+    rent_max_rent_to_revenue: float = 0.25             # <=25% sustainable
+    rent_hardfail_rent_to_revenue: float = 0.35        # >35% -> reject
+    rent_min_stabilised_ebitda_eur: float = 0.0
+    rent_min_downside_ebitda_eur: float = 0.0
+    rent_min_ebitda_margin: float = 0.12               # <12% weak
+    rent_max_payback_years: float = 4.0                # fit-out/equip payback
+    rent_review_max_payback_years: float = 6.0
+
+    # --- Shared ----------------------------------------------------------
+    min_ebitda_margin_for_approval: float = 0.15       # 15% floor for approval
+
+
+@dataclass(frozen=True)
+class TransactionCosts:
+    """Catalonia commercial resale acquisition costs (buy only).
+
+    ITP (Impuesto de Transmisiones Patrimoniales) is progressive from
+    27 Jun 2025 (Decret llei 5/2025). Notary/registry/legal/gestoria add
+    ~1.6% combined. New-build (IVA 10% + AJD) is not modelled here; ITP resale
+    is the conservative default and is override-able.
+    """
+    # Progressive ITP brackets: (upper_bound_eur, rate). Last bound = inf.
+    itp_brackets: Tuple[Tuple[float, float], ...] = (
+        (600_000.0, 0.10),
+        (900_000.0, 0.11),
+        (1_500_000.0, 0.12),
+        (float("inf"), 0.13),
+    )
+    notary_pct: float = 0.004      # ~0.2–0.5% regulated
+    registry_pct: float = 0.002    # ~0.1–0.25%
+    legal_pct: float = 0.010       # ~1% + IVA independent lawyer
+    gestoria_eur: float = 500.0    # fixed admin
 
 
 @dataclass(frozen=True)
@@ -193,6 +285,65 @@ class BusinessProfile:
     franchise_initial_fee_eur: float = 18_000.0
 
 
+# Bump this whenever scoring logic or calibration constants change. Persisted
+# with every analysis so historical scores stay attributable + rescoreable.
+SCORING_VERSION = "kua-laundry-3.0"
+
+# External calibration provenance (source, date, unit, note). Kept here as the
+# single documented reference — do NOT hardcode market numbers elsewhere.
+ASSUMPTIONS_SOURCES: Dict[str, Dict[str, str]] = {
+    "itp_catalonia_progressive": {
+        "value": "10% / 11% / 12% / 13% by price bracket",
+        "unit": "% of purchase price (progressive)",
+        "date": "2026 (Decret llei 5/2025, in force 27 Jun 2025)",
+        "source": "camiacasa.cat, barleighellis.com, casaconnecta.com (Catalonia ITP 2026)",
+        "note": "Resale commercial/residential transfer tax; new-build uses IVA 10% + AJD instead.",
+    },
+    "transaction_costs_total": {
+        "value": "11–13%",
+        "unit": "% of purchase price",
+        "date": "2026",
+        "source": "camiacasa.cat, barleighellis.com, spainora.com",
+        "note": "ITP + notary (0.2–0.5%) + registry (0.1–0.25%) + legal (~1%).",
+    },
+    "laundromat_ebitda_margin": {
+        "value": "20–35% typical; <15% weak; 28–45% top quartile",
+        "unit": "% EBITDA margin",
+        "date": "2026",
+        "source": "BusinessDojo, VantaInsights, The Deal Sheet; COREView (coin-op net ~8.5%)",
+        "note": "Conservative approval floor set at 15%.",
+    },
+    "laundromat_payback": {
+        "value": "34–50 months base (2.8–4.2y); bear >60 months (>5y)",
+        "unit": "years",
+        "date": "2026",
+        "source": "BusinessDojo laundromat statistics 2026",
+        "note": "Buy approval payback <=6y; rent fit-out payback <=4y.",
+    },
+    "laundromat_revenue_per_machine": {
+        "value": "€6k–8k/machine/yr (top 10–12k); 4–6 turns/day",
+        "unit": "EUR/machine/year",
+        "date": "2026",
+        "source": "The Deal Sheet 2026",
+        "note": "Sanity bound for fleet-driven revenue model.",
+    },
+    "barcelona_commercial_rent": {
+        "value": "Eixample avg ~20–31 €/m²/mo; prime axes 88–343",
+        "unit": "EUR/m²/month",
+        "date": "Jul 2026",
+        "source": "idealista commercial listings (Sagrada Família 20.11, Sant Antoni 30.58)",
+        "note": "Used for rent affordability sanity, not a hard gate.",
+    },
+    "barcelona_commercial_sale": {
+        "value": "used ~4,500–6,000 €/m² (Eixample/Consell de Cent)",
+        "unit": "EUR/m²",
+        "date": "Jul 2026",
+        "source": "El Periódico / Laborde Marcet–Grupo ST, Jul 2026",
+        "note": "Price-per-m² ceiling for buy affordability set at 6,000.",
+    },
+}
+
+
 @dataclass(frozen=True)
 class LaundryAssumptions:
     machine: MachineAssumptions = field(default_factory=MachineAssumptions)
@@ -202,12 +353,16 @@ class LaundryAssumptions:
     opex: OpexAssumptions = field(default_factory=OpexAssumptions)
     scoring_weights: ScoringWeights = field(default_factory=ScoringWeights)
     thresholds: ScoringThresholds = field(default_factory=ScoringThresholds)
+    confidence_caps: ConfidenceCaps = field(default_factory=ConfidenceCaps)
+    gates: UnderwritingGates = field(default_factory=UnderwritingGates)
+    transaction_costs: TransactionCosts = field(default_factory=TransactionCosts)
     location_baseline: LocationBaseline = field(default_factory=LocationBaseline)
     business_profile: BusinessProfile = field(default_factory=BusinessProfile)
 
     rent_capex_discount_pct: float = 0.0
     franchise_royalty_pct_of_revenue: float = 0.06
     franchise_initial_fee_eur: float = 18_000.0
+    scoring_version: str = SCORING_VERSION
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

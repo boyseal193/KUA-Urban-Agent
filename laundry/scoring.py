@@ -105,36 +105,87 @@ def _score_density_signal(apartment_pct, students, hotels):
 
 
 def _score_economics(economics: Dict[str, Any]) -> Dict[str, Any]:
+    """Financial-return sub-score (0–100), underwriting-grade and conservative.
+
+    Anchored on EBITDA yield ON TOTAL INVESTMENT (which includes acquisition
+    price, transaction taxes, capex and working capital) — NOT on margin, which
+    for a BUY is misleadingly high because there is no rent line. Payback,
+    margin and downside survivability adjust around that anchor. Negative or
+    unknown EBITDA collapses the score; a good yield only reaches the
+    manual-review band and needs supporting evidence to approach approval.
+    """
+    ebitda = _safe_float(economics.get("ebitda_eur"))
     payback = economics.get("payback_years")
-    margin = economics.get("operating_margin") or 0.0
-    yield_pct = economics.get("yield_pct")
-    ebitda = economics.get("ebitda_eur") or 0.0
-    irr = economics.get("irr_estimate_pct")
+    margin = _safe_float(economics.get("operating_margin"))
+    # Prefer yield on TOTAL investment; fall back to legacy yield_pct.
+    yld = economics.get("ebitda_yield_on_total_pct")
+    if yld is None:
+        yld = economics.get("yield_pct")
+    yld = _safe_float(yld)
+    downside_ebitda = economics.get("downside_ebitda_eur")
 
     if ebitda <= 0 or payback is None:
-        return {"score": 25.0, "drivers": ["ebitda_negative_or_unknown"]}
+        return {"score": 12.0, "drivers": ["ebitda_negative_or_unknown"]}
 
-    payback_score = 100.0
-    if payback >= 12: payback_score = 20.0
-    elif payback >= 9: payback_score = 40.0
-    elif payback >= 7: payback_score = 60.0
-    elif payback >= 5: payback_score = 78.0
-    elif payback >= 3.5: payback_score = 90.0
+    # --- yield anchor (conservative; 8% -> ~60, 15% -> ~85) --------------
+    if yld >= 0.15:
+        anchor = 86.0
+    elif yld >= 0.12:
+        anchor = 76.0
+    elif yld >= 0.10:
+        anchor = 66.0
+    elif yld >= 0.08:
+        anchor = 58.0
+    elif yld >= 0.065:
+        anchor = 48.0
+    elif yld >= 0.05:
+        anchor = 40.0
+    elif yld >= 0.035:
+        anchor = 30.0
+    elif yld >= 0.02:
+        anchor = 22.0
+    else:
+        anchor = 15.0
 
-    margin_score = _clamp(margin * 220.0)
-    yield_score = _clamp((yield_pct or 0.0) * 350.0)
-    irr_score = _clamp((irr or 0.0) * 4.0)
+    # --- payback modifier ------------------------------------------------
+    if payback <= 4:
+        anchor += 8
+    elif payback <= 6:
+        anchor += 3
+    elif payback <= 9:
+        anchor += 0
+    elif payback <= 12:
+        anchor -= 8
+    else:
+        anchor -= 16
 
-    blended = payback_score * 0.40 + margin_score * 0.25 + yield_score * 0.25 + irr_score * 0.10
+    # --- margin modifier (health, not primary) ---------------------------
+    if margin >= 0.30:
+        anchor += 4
+    elif margin >= 0.20:
+        anchor += 1
+    elif margin >= 0.12:
+        anchor += 0
+    elif margin >= 0.05:
+        anchor -= 6
+    else:
+        anchor -= 12
 
-    drivers = []
-    if payback <= 5: drivers.append("fast_payback")
-    if margin >= 0.30: drivers.append("healthy_margin")
-    if (yield_pct or 0) >= 0.18: drivers.append("strong_yield")
-    if (irr or 0) >= 15: drivers.append("attractive_irr")
-    if not drivers: drivers.append("economics_mid_band")
+    # --- downside survivability -----------------------------------------
+    if downside_ebitda is not None and _safe_float(downside_ebitda) <= 0:
+        anchor -= 12
 
-    return {"score": round(blended, 2), "drivers": drivers}
+    drivers: List[str] = []
+    if yld >= 0.12: drivers.append("strong_yield_on_total")
+    elif yld >= 0.08: drivers.append("acceptable_yield_on_total")
+    else: drivers.append("thin_yield_on_total")
+    if payback is not None and payback <= 5: drivers.append("fast_payback")
+    if payback is not None and payback > 9: drivers.append("long_payback")
+    if margin >= 0.25: drivers.append("healthy_margin")
+    if downside_ebitda is not None and _safe_float(downside_ebitda) <= 0:
+        drivers.append("downside_ebitda_negative")
+
+    return {"score": round(_clamp(anchor), 2), "drivers": drivers}
 
 
 def _score_physical_fit(*, floor_area_m2, ceiling_height, has_water, has_gas,
@@ -266,6 +317,144 @@ def _classification(score, economics, location, physical_block, competition):
 
 
 # ---------------------------------------------------------------------------
+# Deterministic hard financial gates
+# ---------------------------------------------------------------------------
+def _gate(name: str, passed: bool, *, actual, threshold, message: str,
+          severity: str = "review", mandatory: bool = True) -> Dict[str, Any]:
+    return {
+        "name": name,
+        "passed": bool(passed),
+        "mandatory": bool(mandatory),
+        "severity": severity,          # "review" (soft) | "reject" (severe)
+        "actual": actual,
+        "threshold": threshold,
+        "message": message,
+    }
+
+
+def _evaluate_gates(economics: Dict[str, Any], gates, *,
+                    acquisition_type: str) -> List[Dict[str, Any]]:
+    """Return the full gate list (passed + failed). Deterministic; no AI.
+
+    Only fails on CONFIRMED bad economics. Missing values are handled by the
+    confidence cap, not by gates, so we never reject purely for absent data.
+    """
+    out: List[Dict[str, Any]] = []
+    ebitda = economics.get("ebitda_eur")
+    downside = economics.get("downside_ebitda_eur")
+    payback = economics.get("payback_years")
+    margin = _safe_float(economics.get("operating_margin"))
+    yld = economics.get("ebitda_yield_on_total_pct")
+    if yld is None:
+        yld = economics.get("yield_pct")
+
+    if acquisition_type == "rent":
+        rtr = economics.get("rent_to_revenue_pct")
+        if rtr is not None:
+            out.append(_gate(
+                "rent_to_revenue", _safe_float(rtr) <= gates.rent_hardfail_rent_to_revenue,
+                actual=rtr, threshold=gates.rent_hardfail_rent_to_revenue,
+                message="Rent exceeds 35% of revenue — unsustainable",
+                severity="reject",
+            ))
+            out.append(_gate(
+                "rent_to_revenue_sustainable", _safe_float(rtr) <= gates.rent_max_rent_to_revenue,
+                actual=rtr, threshold=gates.rent_max_rent_to_revenue,
+                message="Rent above 25% of revenue — margin pressure",
+                severity="review",
+            ))
+        if ebitda is not None:
+            out.append(_gate(
+                "positive_ebitda", _safe_float(ebitda) > gates.rent_min_stabilised_ebitda_eur,
+                actual=ebitda, threshold=gates.rent_min_stabilised_ebitda_eur,
+                message="Stabilised EBITDA is not positive after rent",
+                severity="reject",
+            ))
+        if downside is not None:
+            out.append(_gate(
+                "downside_ebitda", _safe_float(downside) > gates.rent_min_downside_ebitda_eur,
+                actual=downside, threshold=gates.rent_min_downside_ebitda_eur,
+                message="Downside case goes EBITDA-negative",
+                severity="review",
+            ))
+        if margin:
+            out.append(_gate(
+                "min_margin", margin >= gates.rent_min_ebitda_margin,
+                actual=margin, threshold=gates.rent_min_ebitda_margin,
+                message="EBITDA margin below 12%",
+                severity="review",
+            ))
+        if payback is not None:
+            out.append(_gate(
+                "fitout_payback", payback <= gates.rent_review_max_payback_years,
+                actual=payback, threshold=gates.rent_review_max_payback_years,
+                message="Payback on fit-out/equipment too long for a lease",
+                severity="review",
+            ))
+    else:  # buy
+        price_per_m2 = economics.get("price_per_m2_eur")
+        if ebitda is not None:
+            out.append(_gate(
+                "positive_ebitda", _safe_float(ebitda) > gates.buy_min_stabilised_ebitda_eur,
+                actual=ebitda, threshold=gates.buy_min_stabilised_ebitda_eur,
+                message="Stabilised EBITDA is not positive",
+                severity="reject",
+            ))
+        if downside is not None:
+            out.append(_gate(
+                "downside_ebitda", _safe_float(downside) > gates.buy_min_downside_ebitda_eur,
+                actual=downside, threshold=gates.buy_min_downside_ebitda_eur,
+                message="Downside case goes EBITDA-negative",
+                severity="review",
+            ))
+        if yld is not None:
+            out.append(_gate(
+                "ebitda_yield_on_total", _safe_float(yld) >= gates.buy_min_ebitda_yield_on_total,
+                actual=yld, threshold=gates.buy_min_ebitda_yield_on_total,
+                message="EBITDA yield on total investment below 8% hurdle",
+                severity="review",
+            ))
+        if payback is not None:
+            out.append(_gate(
+                "payback", payback <= gates.buy_max_payback_years,
+                actual=payback, threshold=gates.buy_max_payback_years,
+                message="Payback exceeds 6 years",
+                severity="review",
+            ))
+        # Affordability: overpriced per m² is allowed ONLY with stronger yield.
+        if price_per_m2 is not None and _safe_float(price_per_m2) > gates.buy_max_price_per_m2_eur:
+            out.append(_gate(
+                "affordability_price_per_m2",
+                _safe_float(yld or 0) >= gates.buy_overpriced_requires_yield,
+                actual={"price_per_m2": price_per_m2, "yield": yld},
+                threshold={"max_price_per_m2": gates.buy_max_price_per_m2_eur,
+                           "required_yield_if_over": gates.buy_overpriced_requires_yield},
+                message="Price/m² above market ceiling and yield does not justify the premium",
+                severity="review",
+            ))
+
+    # Shared approval-margin floor.
+    if margin:
+        out.append(_gate(
+            "approval_margin_floor", margin >= gates.min_ebitda_margin_for_approval,
+            actual=margin, threshold=gates.min_ebitda_margin_for_approval,
+            message="EBITDA margin below 15% approval floor",
+            severity="review",
+        ))
+    return out
+
+
+def _critical_financial_fields_present(economics: Dict[str, Any], acquisition_type: str) -> bool:
+    if _safe_float(economics.get("floor_area_m2")) <= 0:
+        return False
+    if _safe_float(economics.get("ebitda_eur")) == 0 and economics.get("payback_years") is None:
+        return False
+    if acquisition_type == "rent":
+        return _safe_float(economics.get("rent_cost_eur")) > 0
+    return _safe_float(economics.get("acquisition_cost_eur")) > 0
+
+
+# ---------------------------------------------------------------------------
 # Main entrypoint
 # ---------------------------------------------------------------------------
 def score_property(payload: Dict[str, Any], *, overrides: Optional[Dict[str, Any]] = None,
@@ -383,19 +572,41 @@ def score_property(payload: Dict[str, Any], *, overrides: Optional[Dict[str, Any
     filled = sum(1 for k in CRITICAL_LOCATION_FIELDS if location.get(k) not in (None, "", 0))
     confidence = _confidence(filled, thresholds)
 
+    acquisition_type = (economics.get("acquisition_type") or "").lower()
+    if acquisition_type not in ("buy", "rent"):
+        acquisition_type = "buy"
+
+    caps = assumptions.confidence_caps
+    gates_cfg = assumptions.gates
+    notes: List[str] = []
+
+    # --- Confidence caps: missing data is a CEILING, never additive ------
+    score_caps: List[Dict[str, Any]] = []
+    if not _critical_financial_fields_present(economics, acquisition_type):
+        if final_score > caps.critical_missing_max_score:
+            score_caps.append({"reason": "critical_financial_fields_missing",
+                               "cap": caps.critical_missing_max_score})
+            final_score = caps.critical_missing_max_score
+        notes.append("critical_financial_fields_missing_score_capped")
+    if filled < caps.operational_missing_field_threshold and final_score > caps.operational_missing_max_score:
+        score_caps.append({"reason": "several_operational_fields_missing",
+                           "cap": caps.operational_missing_max_score})
+        final_score = caps.operational_missing_max_score
+        notes.append("operational_fields_missing_score_capped")
+
+    # --- Deterministic hard financial gates -----------------------------
+    gates = _evaluate_gates(economics, gates_cfg, acquisition_type=acquisition_type)
+    gate_failures = [g for g in gates if g["mandatory"] and not g["passed"]]
+    reject_failures = [g for g in gate_failures if g["severity"] == "reject"]
+
     verdict = _verdict_from_score(final_score, thresholds)
     deal_status = _deal_status_from_score(final_score, thresholds)
-    notes: List[str] = []
 
     max_size = _safe_float(filters.get("max_size_sqm"), 0.0)
     if max_size > 0 and floor_area_for_fit > max_size * 1.05:
         if deal_status == "approved_candidate":
             deal_status = "manual_review"; verdict = "MANUAL REVIEW"
         notes.append(f"property_exceeds_max_size_{int(max_size)}m2")
-
-    if confidence["band"] == "low" and deal_status == "rejected":
-        deal_status = "manual_review"; verdict = "MANUAL REVIEW"
-        notes.append("promoted_to_review_due_to_low_confidence")
 
     if ground_floor is None:
         if deal_status == "approved_candidate":
@@ -412,14 +623,87 @@ def score_property(payload: Dict[str, Any], *, overrides: Optional[Dict[str, Any
             verdict = "MANUAL REVIEW"
             notes.append("upper_floor_access_limited_not_auto_rejected")
 
+    # --- Gate-driven demotion — deterministic economics control verdict --
+    if reject_failures:
+        deal_status = "rejected"; verdict = "REJECT"
+        notes.extend(f"gate_failed_{g['name']}" for g in reject_failures)
+    elif gate_failures:
+        if deal_status == "approved_candidate":
+            deal_status = "manual_review"; verdict = "MANUAL REVIEW"
+        notes.extend(f"gate_failed_{g['name']}" for g in gate_failures)
+
+    # Low confidence never auto-rejects — promote to review so a human decides.
+    if confidence["band"] == "low" and deal_status == "rejected" and not reject_failures:
+        deal_status = "manual_review"; verdict = "MANUAL REVIEW"
+        notes.append("promoted_to_review_due_to_low_confidence")
+
+    # --- Approval also requires confidence + surviving downside ----------
+    downside_ebitda = economics.get("downside_ebitda_eur")
+    approval_blockers: List[str] = []
+    if deal_status == "approved_candidate":
+        if confidence["pct"] < caps.min_confidence_pct_for_approval:
+            approval_blockers.append("confidence_below_approval_minimum")
+        if downside_ebitda is not None and _safe_float(downside_ebitda) <= 0:
+            approval_blockers.append("downside_ebitda_not_positive")
+        if approval_blockers:
+            deal_status = "manual_review"; verdict = "MANUAL REVIEW"
+            notes.extend(approval_blockers)
+
+    # --- Four-tier explainable verdict -----------------------------------
+    if deal_status == "approved_candidate":
+        verdict_detail = "APPROVED"
+    elif deal_status == "rejected":
+        verdict_detail = "REJECT"
+    elif final_score >= thresholds.approved_min and not reject_failures:
+        # Score qualifies but a soft gate / confidence / downside condition
+        # blocks unconditional approval — state the conditions.
+        verdict_detail = "CONDITIONAL_APPROVAL"
+    else:
+        verdict_detail = "MANUAL_REVIEW"
+
     classification = _classification(final_score, economics, location, physical_block, competition_component)
+
+    financial_summary = {
+        "acquisition_type": acquisition_type,
+        "asking_price_eur": economics.get("acquisition_cost_eur"),
+        "annual_rent_eur": economics.get("rent_cost_eur"),
+        "price_per_m2_eur": economics.get("price_per_m2_eur"),
+        "rent_per_m2_month_eur": economics.get("rent_per_m2_month_eur"),
+        "transaction_costs_eur": economics.get("acquisition_transaction_cost_eur"),
+        "total_investment_eur": economics.get("total_investment_eur"),
+        "expected_revenue_eur": economics.get("expected_revenue_eur"),
+        "ebitda_eur": economics.get("ebitda_eur"),
+        "downside_ebitda_eur": economics.get("downside_ebitda_eur"),
+        "ebitda_margin": economics.get("operating_margin"),
+        "ebitda_yield_on_total_pct": economics.get("ebitda_yield_on_total_pct"),
+        "ebitda_yield_on_price_pct": economics.get("ebitda_yield_on_price_pct"),
+        "downside_yield_pct": economics.get("downside_yield_pct"),
+        "payback_years": economics.get("payback_years"),
+        "rent_to_revenue_pct": economics.get("rent_to_revenue_pct"),
+    }
+
+    sub_scores = {
+        "financial_return": round(economics_block["score"], 2),
+        "location_demand": round(location_component, 2),
+        "operational_feasibility": round(competition_component, 2),
+        "physical_suitability": round(physical_block["score"], 2),
+        "risk": round(risk_component, 2),
+        "data_confidence": confidence["pct"],
+    }
 
     return {
         "score": final_score,
         "verdict": verdict,
+        "verdict_detail": verdict_detail,
         "classification": classification,
         "deal_status": deal_status,
         "confidence": confidence,
+        "scoring_version": assumptions.scoring_version,
+        "sub_scores": sub_scores,
+        "gates": gates,
+        "gate_failures": [g["name"] for g in gate_failures],
+        "score_caps": score_caps,
+        "financial_summary": financial_summary,
         "auto_scores": {
             "location_score": round(location_component, 2),
             "economics_score": round(economics_block["score"], 2),

@@ -54,6 +54,41 @@ def _safe_div(a: float, b: float) -> Optional[float]:
         return None
 
 
+def _acquisition_transaction_costs(price: float, tx) -> Dict[str, float]:
+    """Catalonia commercial resale transaction costs (progressive ITP + fees).
+
+    See ``laundry.assumptions.TransactionCosts`` / ASSUMPTIONS_SOURCES.
+    Returns a breakdown plus the total; all zero when ``price`` <= 0.
+    """
+    if price <= 0:
+        return {"itp_eur": 0.0, "notary_eur": 0.0, "registry_eur": 0.0,
+                "legal_eur": 0.0, "gestoria_eur": 0.0, "total_eur": 0.0,
+                "effective_pct": 0.0}
+    itp = 0.0
+    lower = 0.0
+    for upper, rate in tx.itp_brackets:
+        if price <= lower:
+            break
+        taxable = min(price, upper) - lower
+        if taxable > 0:
+            itp += taxable * rate
+        lower = upper
+    notary = price * tx.notary_pct
+    registry = price * tx.registry_pct
+    legal = price * tx.legal_pct
+    gestoria = tx.gestoria_eur
+    total = itp + notary + registry + legal + gestoria
+    return {
+        "itp_eur": round(itp, 2),
+        "notary_eur": round(notary, 2),
+        "registry_eur": round(registry, 2),
+        "legal_eur": round(legal, 2),
+        "gestoria_eur": round(gestoria, 2),
+        "total_eur": round(total, 2),
+        "effective_pct": round(total / price, 4),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Fleet sizing
 # ---------------------------------------------------------------------------
@@ -346,9 +381,13 @@ def calculate_economics(
     if acquisition_type == "rent":
         rent_cost = asking_rent_month * 12
         acquisition_cost = 0.0
+        transaction_costs = {"total_eur": 0.0, "effective_pct": 0.0}
     else:
         rent_cost = 0.0
         acquisition_cost = asking_price
+        transaction_costs = _acquisition_transaction_costs(
+            asking_price, assumptions.transaction_costs
+        )
 
     annual_opex = (
         electricity_cost
@@ -371,10 +410,12 @@ def calculate_economics(
     marketing = fit_out.initial_marketing_eur
     initial_staff_setup = (opex_cfg.monthly_part_time_attendant_eur + opex_cfg.monthly_remote_manager_eur) * 1.5
 
+    acquisition_transaction_cost = float(transaction_costs.get("total_eur") or 0.0)
     capex = machine_capex + ancillary_capex + fit_out_total
     total_investment = (
         capex
         + acquisition_cost
+        + acquisition_transaction_cost
         + working_capital
         + legal_costs
         + licensing
@@ -387,6 +428,17 @@ def calculate_economics(
     cashflow = ebitda
     yield_pct = _safe_div(ebitda, total_investment) if total_investment > 0 else None
     payback_years = round(total_investment / ebitda, 2) if ebitda > 0 else None
+
+    # --- Underwriting-grade financial metrics (v3) -----------------------
+    price_per_m2 = _safe_div(asking_price, floor_area) if acquisition_type == "buy" else None
+    rent_per_m2_month = _safe_div(asking_rent_month, floor_area) if acquisition_type == "rent" else None
+    ebitda_yield_on_total = yield_pct
+    ebitda_yield_on_price = (
+        _safe_div(ebitda, acquisition_cost) if acquisition_type == "buy" and acquisition_cost > 0 else None
+    )
+    rent_to_revenue = (
+        _safe_div(rent_cost, expected_revenue) if acquisition_type == "rent" and expected_revenue > 0 else None
+    )
 
     break_even_revenue = annual_opex
     break_even_cycles_per_day = (
@@ -411,6 +463,16 @@ def calculate_economics(
         baseline_revenue=expected_revenue,
         baseline_opex=annual_opex,
         baseline_capex_total=total_investment,
+    )
+    _downside = next(
+        (s for s in sensitivity.get("scenarios", []) if s.get("label") == "downside"),
+        None,
+    )
+    downside_ebitda = float(_downside.get("ebitda_eur")) if _downside else None
+    downside_yield = (
+        _safe_div(downside_ebitda, total_investment)
+        if downside_ebitda is not None and total_investment > 0
+        else None
     )
 
     right_size_flag = _right_size_status(floor_area, biz)
@@ -454,6 +516,8 @@ def calculate_economics(
         "initial_staff_setup_eur": round(initial_staff_setup, 2),
         "working_capital_eur": round(working_capital, 2),
         "acquisition_cost_eur": round(acquisition_cost, 2),
+        "acquisition_transaction_costs": transaction_costs,
+        "acquisition_transaction_cost_eur": round(acquisition_transaction_cost, 2),
         "capex_eur": round(capex, 2),
         "total_investment_eur": round(total_investment, 2),
         "raw_daily_revenue_eur": round(raw_daily_revenue, 2),
@@ -484,12 +548,19 @@ def calculate_economics(
         "operating_margin": round(operating_margin or 0, 4),
         "cashflow_eur": round(cashflow, 2),
         "yield_pct": round(yield_pct, 4) if yield_pct is not None else None,
+        "ebitda_yield_on_total_pct": round(ebitda_yield_on_total, 4) if ebitda_yield_on_total is not None else None,
+        "ebitda_yield_on_price_pct": round(ebitda_yield_on_price, 4) if ebitda_yield_on_price is not None else None,
+        "downside_ebitda_eur": round(downside_ebitda, 2) if downside_ebitda is not None else None,
+        "downside_yield_pct": round(downside_yield, 4) if downside_yield is not None else None,
+        "price_per_m2_eur": round(price_per_m2, 2) if price_per_m2 is not None else None,
+        "rent_per_m2_month_eur": round(rent_per_m2_month, 2) if rent_per_m2_month is not None else None,
+        "rent_to_revenue_pct": round(rent_to_revenue, 4) if rent_to_revenue is not None else None,
         "payback_years": payback_years,
         "irr_estimate_pct": round(irr_estimate * 100, 2) if irr_estimate is not None else None,
         "break_even_revenue_eur": round(break_even_revenue, 2),
         "break_even_cycles_per_day": round(break_even_cycles_per_day, 2) if break_even_cycles_per_day else None,
         "sensitivity": sensitivity,
-        "assumptions_version": "2.0.0",
+        "assumptions_version": "3.0.0",
     }
 
 
