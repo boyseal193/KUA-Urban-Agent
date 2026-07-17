@@ -33,13 +33,49 @@ export interface AutoScoreBreakdown {
   strategic_fit_score: number;
 }
 
+export interface StorageSubScores {
+  financial_return?: number | null;
+  operational_feasibility?: number | null;
+  location_demand?: number | null;
+  physical_suitability?: number | null;
+  risk?: number | null;
+  data_confidence?: number | null;
+}
+
+export interface GateResult {
+  name: string;
+  passed: boolean;
+  mandatory: boolean;
+  severity: "reject" | "review" | string;
+  actual: unknown;
+  threshold: unknown;
+  message: string;
+}
+
+export interface DealConfidence {
+  pct: number;
+  band: "high" | "medium" | "low" | string;
+  certainty?: number;
+  completeness?: number;
+}
+
 export interface DealScore {
   score: number;
   verdict: Verdict;
+  /** v3 four-tier verdict: REJECT | MANUAL_REVIEW | CONDITIONAL_APPROVAL | APPROVED */
+  verdict_detail?: string | null;
   classification: string;
   deal_killer: string | null;
   due_diligence_flags: string[];
   auto_scores: AutoScoreBreakdown;
+  // --- v3 additions (optional; older analyses won't have them) ---
+  scoring_version?: string | null;
+  confidence?: DealConfidence | null;
+  sub_scores?: StorageSubScores | null;
+  gates?: GateResult[] | null;
+  gate_failures?: string[] | null;
+  conditions?: string[] | null;
+  score_caps?: { reason: string; cap: number }[] | null;
 }
 
 export interface DealEconomics {
@@ -62,6 +98,21 @@ export interface DealEconomics {
   true_ebitda_yield: number | null;
   payback_years: number | null;
   true_payback_years: number | null;
+  // --- v3 additions (optional) ---
+  acquisition_type?: "buy" | "rent" | string;
+  gba_m2?: number | null;
+  price_per_m2_eur?: number | null;
+  return_on_cost_pct?: number | null;
+  downside_ebitda_eur?: number | null;
+  severe_downside_ebitda_eur?: number | null;
+  downside_yield_pct?: number | null;
+  year1_ebitda_eur?: number | null;
+  year1_occupancy?: number | null;
+  stabilised_occupancy?: number | null;
+  rent_to_revenue_pct?: number | null;
+  acquisition_transaction_cost_eur?: number | null;
+  working_capital_eur?: number | null;
+  scoring_version?: string | null;
 }
 
 export interface PropertyExtracted {

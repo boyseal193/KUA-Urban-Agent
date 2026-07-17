@@ -279,6 +279,11 @@ def assign_deal_status(score: dict):
     """
     if not isinstance(score, dict):
         return "rejected"
+    # v3: the scorer performs deterministic gate/confidence gating and returns
+    # the authoritative deal_status. Honor it when present.
+    ds = score.get("deal_status")
+    if ds in ("approved_candidate", "manual_review", "rejected"):
+        return ds
     score_value = score.get("score", 0)
     deal_killer = score.get("deal_killer")
     if deal_killer:
@@ -346,6 +351,7 @@ def run_full_pipeline(data: dict, source: str = "auto"):
 
     economics = calculate_economics(
         gba_m2=data.get("gba_m2"),
+        neighbourhood=data.get("neighbourhood"),
         rent_per_m2=data.get("rent_per_m2"),
         price_per_m2_nra=data.get("price_per_m2_nra"),
         nra_efficiency=data.get("nra_efficiency"),

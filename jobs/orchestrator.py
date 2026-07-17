@@ -227,6 +227,7 @@ def _process_listing(job_id: str, listing_index: int, url: str) -> dict:
         data["longitude"] = coordinates.get("lng")
         econ = calculate_economics(
             gba_m2=data.get("gba_m2"),
+            neighbourhood=data.get("neighbourhood"),
             rent_per_m2=data.get("rent_per_m2"),
             price_per_m2_nra=data.get("price_per_m2_nra"),
             nra_efficiency=data.get("nra_efficiency"),

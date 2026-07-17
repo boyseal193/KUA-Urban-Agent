@@ -54,6 +54,9 @@ export function DealCard({
   const flags = enriched?.score?.due_diligence_flags ?? [];
   const dealKiller =
     enriched?.score?.deal_killer ?? null;
+  const failedGates = enriched?.score?.gate_failures ?? [];
+  const confidencePct = enriched?.score?.confidence?.pct ?? null;
+  const verdictDetail = enriched?.score?.verdict_detail ?? null;
 
   return (
     <motion.div
@@ -146,6 +149,41 @@ export function DealCard({
             />
           )}
         </div>
+
+        {/* v3 gate/confidence strip — only for enriched (fresh) results */}
+        {!compact && (failedGates.length > 0 || confidencePct != null || verdictDetail) && (
+          <div className="mt-3 flex flex-wrap items-center gap-1.5 border-t border-border/60 pt-3">
+            {verdictDetail && (
+              <Badge className="bg-muted/60 text-[10px] uppercase tracking-wide text-muted-foreground">
+                {verdictDetail.replace(/_/g, " ")}
+              </Badge>
+            )}
+            {confidencePct != null && (
+              <Badge
+                className={cn(
+                  "text-[10px]",
+                  confidencePct >= 70
+                    ? "bg-emerald-500/10 text-emerald-500"
+                    : confidencePct < 45
+                      ? "bg-destructive/10 text-destructive"
+                      : "bg-kua-amber/10 text-kua-amber"
+                )}
+              >
+                Confidence {Math.round(confidencePct)}%
+              </Badge>
+            )}
+            {failedGates.slice(0, 3).map((g) => (
+              <Badge key={g} className="bg-destructive/10 text-[10px] text-destructive">
+                ✕ {g.replace(/_/g, " ")}
+              </Badge>
+            ))}
+            {failedGates.length > 3 && (
+              <span className="text-[10px] text-muted-foreground">
+                +{failedGates.length - 3} more gates
+              </span>
+            )}
+          </div>
+        )}
 
         {/* Flags / killer */}
         {(dealKiller || flags.length > 0) && !compact && (
