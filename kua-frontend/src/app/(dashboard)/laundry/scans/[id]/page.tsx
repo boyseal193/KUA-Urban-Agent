@@ -11,7 +11,7 @@ import { EmptyState } from "@/components/common/empty-state";
 import { LaundryScanListingCard } from "@/components/laundry/laundry-scan-listing-card";
 import { useLaundryScan } from "@/hooks/use-laundry";
 import { formatLaundryListingProgress } from "@/lib/api/laundry";
-import type { LaundryScanListingResult, LaundrySearchDiagnostics } from "@/lib/api";
+import type { LaundryScanListingResult, LaundrySearchDiagnostics, LaundryStepOutput } from "@/lib/api";
 
 const STATUS_COLOR: Record<string, string> = {
   pending: "#94A3B8",
@@ -48,8 +48,6 @@ const STATUS_LABEL: Record<string, string> = {
   export_failed: "EXPORT FAILED",
   skipped: "FAILED",
 };
-
-const LISTING_STEP_KEY = "laundry_process_listing";
 
 function statusLabel(status: string): string {
   return STATUS_LABEL[status] ?? status.replace(/_/g, " ").toUpperCase();
@@ -355,12 +353,11 @@ export default function LaundryScanDetailPage({
                     </tr>
                   )}
                   {listingSteps.map((s) => {
-                    const out = (s.output_data ?? s.result ?? {}) as Record<string, unknown>;
-                    const displayStatus =
-                      typeof out.terminal_status === "string" ? out.terminal_status : s.status;
+                    const out: LaundryStepOutput = s.output_data ?? s.result ?? {};
+                    const displayStatus = out.terminal_status ?? s.status;
                     const reason =
                       s.error_message ??
-                      (typeof out.reason_message === "string" ? out.reason_message : undefined) ??
+                      out.reason_message ??
                       s.listing_url ??
                       "—";
                     return (

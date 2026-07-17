@@ -329,18 +329,107 @@ export interface LaundryScanJob {
   payload?: Record<string, unknown> | null;
 }
 
+/**
+ * Terminal + transient statuses a `scan_steps` row can carry. Job-level steps
+ * use pending/running/success/failed/skipped; per-listing steps additionally use
+ * the structured terminal outcomes emitted by the pipeline sequencer. The
+ * trailing `(string & {})` keeps the union open so a new backend status never
+ * breaks type-checking while still giving autocomplete for the known set.
+ */
+export type LaundryStepStatus =
+  | "pending"
+  | "running"
+  | "retrying"
+  | "success"
+  | "duplicate"
+  | "filtered_out"
+  | "scrape_failed"
+  | "extraction_failed"
+  | "persistence_failed"
+  | "scoring_failed"
+  | "memo_failed"
+  | "export_failed"
+  | "failed"
+  | "skipped"
+  | (string & {});
+
+/**
+ * Payload persisted in a `scan_steps` row under BOTH `output_data` and `result`
+ * (the backend `finish_step` writes the same object to each column for
+ * backwards-compatible readers).
+ *
+ * Contents are heterogeneous: job-level steps (discover / underwrite /
+ * summarize / export) and per-listing `process_listing` steps each write a
+ * different key set, so every field is optional. The index signature is a
+ * deliberate forward-compatibility escape hatch — new backend keys surface as
+ * `unknown` instead of failing the build.
+ */
+export interface LaundryStepOutput {
+  // --- Per-listing terminal accounting (process_listing worker) ---
+  terminal_status?: LaundryStepStatus;
+  reason_code?: string | null;
+  reason_message?: string | null;
+  stage_failed?: string | null;
+  attempt_count?: number | null;
+  deal_status?: LaundryDealStatus | null;
+  score?: number | null;
+  property_id?: string | null;
+  analysis_id?: string | null;
+  duplicate_of_property_id?: string | null;
+  extraction_failed?: boolean;
+
+  // --- Job-level discover step ---
+  discovered_count?: number;
+  queued_count?: number;
+  requested_limit?: number;
+  effective_limit?: number;
+  source_available_count?: number | null;
+  availability_message?: string | null;
+  search_url?: string | null;
+  urls?: string[];
+  diagnostics?: Record<string, unknown>;
+  search_diagnostics?: LaundrySearchDiagnostics | null;
+
+  // --- Job-level underwrite / summarize counters ---
+  success_count?: number;
+  duplicate_count?: number;
+  filtered_out_count?: number;
+  failed_count?: number;
+  exported_count?: number;
+
+  /** Forward-compatible escape hatch for backend keys not yet modelled here. */
+  [key: string]: unknown;
+}
+
+/**
+ * One row of the Supabase `scan_steps` table, returned verbatim by the backend
+ * (`store.list_pipeline_steps` selects `*`). Field names and optionality mirror
+ * `jobs/schema.sql` / `laundry/schema.sql` exactly — do not add fields the
+ * backend does not persist.
+ */
 export interface LaundryScanStep {
   id: string;
+  job_id?: string | null;
   step_key: string;
-  status: string;
   step_order: number;
+  status: LaundryStepStatus;
   listing_index?: number | null;
   listing_url?: string | null;
+  attempt?: number | null;
+  max_attempts?: number | null;
   error_type?: string | null;
   error_message?: string | null;
+  traceback?: string | null;
+  retryable?: boolean | null;
   duration_ms?: number | null;
-  payload?: Record<string, unknown>;
+  payload?: LaundryStepOutput | null;
+  input_data?: LaundryStepOutput | null;
+  output_data?: LaundryStepOutput | null;
+  result?: LaundryStepOutput | null;
+  started_at?: string | null;
+  finished_at?: string | null;
   created_at?: string | null;
+  updated_at?: string | null;
 }
 
 export interface LaundryScanResponse {

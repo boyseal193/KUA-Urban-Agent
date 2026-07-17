@@ -37,6 +37,8 @@ export type {
   LaundryKpis,
   LaundryScanJob,
   LaundryScanStep,
+  LaundryStepOutput,
+  LaundryStepStatus,
   LaundryScanResponse,
   LaundryLaunchScanPayload,
   LaundryAutonomousSettings,
